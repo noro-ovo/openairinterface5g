@@ -11,7 +11,22 @@
 #include <math.h>
 #include <pthread.h>
 #include <execinfo.h>
+#include <stddef.h>
+#include <complex.h>
+#include <immintrin.h>
 
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#define Q15_INV_SQRT2                       ((int16_t)23170)
+#define Q15_INV_SQRT3                       ((int16_t)18919)  
+#define Q15_HALF_SQRT3                      ((int16_t)28378)
+#define Q15_SCALE_1_OVER_SQRT64             ((int16_t)4096)
+
+
+#define SR_MAX_LOG2 17
+#define MAX_N 65536
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -46,6 +61,1494 @@ const static int16_t conjugatedft[32] __attribute__((aligned(32))) = {-1,1,-1,1,
 
 
 const static int16_t reflip[32]  __attribute__((aligned(32))) = {1,-1,1,-1,1,-1,1,-1,1,-1,1,-1,1,-1,1,-1};
+
+
+
+
+
+//============================================================================
+//HELPERS
+//============================================================================
+
+static inline int16_t sat_i16(long v)
+{
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32767;
+    return (int16_t)v;
+}
+
+static inline int log2_int(unsigned int N)
+{
+    return __builtin_ctz(N);
+}
+static void *aligned_malloc64(size_t size)
+{
+    void *ptr = NULL;
+
+    if (posix_memalign(&ptr, 64, size) != 0) {
+        return NULL;
+    }
+
+    return ptr;
+}
+
+static inline __m128i scale_half_q15_128(__m128i x)
+{
+    return _mm_srai_epi16(x, 1);   // divide by 2
+}
+static inline __m256i scale_q15_1_over_sqrt64_256(__m256i x)
+{
+    const __m256i s = _mm256_set1_epi16(Q15_SCALE_1_OVER_SQRT64);
+    return _mm256_mulhrs_epi16(x, s);
+}
+
+
+static inline int is_power_of_two_int(int x)
+{
+    return x > 0 && ((x & (x - 1)) == 0);
+}
+
+static inline simde__m256i c16_mul_q15_simd256(simde__m256i x,
+                                                 simde__m256i w_re_negim,
+                                                 simde__m256i w_im_re)
+{
+    //simde__m256i zero  = simde_mm256_setzero_si256();
+    simde__m256i round = simde_mm256_set1_epi32(1 << 14);
+
+    simde__m256i re32 = simde_mm256_madd_epi16(x, w_re_negim);
+    simde__m256i im32 = simde_mm256_madd_epi16(x, w_im_re);
+
+    re32 = simde_mm256_srai_epi32(simde_mm256_add_epi32(re32, round), 15);
+    im32 = simde_mm256_srai_epi32(simde_mm256_add_epi32(im32, round), 15);
+/*
+    simde__m256i re16 = simde_mm256_packs_epi32(re32, zero);
+    simde__m256i im16 = simde_mm256_packs_epi32(im32, zero);
+
+    return simde_mm256_unpacklo_epi16(re16, im16);
+*/
+
+    simde__m256i packed = simde_mm256_packs_epi32(re32, im32);
+
+    const simde__m256i mask = simde_mm256_set_epi8(
+        15,14, 7, 6, 13,12, 5, 4, 11,10, 3, 2, 9, 8, 1, 0,
+        15,14, 7, 6, 13,12, 5, 4, 11,10, 3, 2, 9, 8, 1, 0
+    );
+
+    return simde_mm256_shuffle_epi8(packed, mask);
+}
+
+
+
+static inline int16_t sat16_i32(int32_t x)
+{
+    if (x > 32767)  return 32767;
+    if (x < -32767) return -32767;
+    return (int16_t)x;
+}
+
+static inline int16_t q15_from_float(float x)
+{
+    return sat16_i32((int32_t)lrintf(32767.0f * x));
+}
+
+
+static inline __m128i swap_complex_pairs_i16_128(__m128i a)
+{
+    const __m128i shuf = _mm_set_epi8(
+        13,12, 15,14,
+         9, 8, 11,10,
+         5, 4,  7, 6,
+         1, 0,  3, 2
+    );
+
+    return _mm_shuffle_epi8(a, shuf);
+}
+
+static inline __m128i complex_mul4_prepack_q15_128(
+    __m128i a,
+    __m128i w_re_re,
+    __m128i w_im_signed
+)
+{
+    const __m128i a_swapped = swap_complex_pairs_i16_128(a);
+
+    const __m128i prod_re = _mm_mulhrs_epi16(a,         w_re_re);
+    const __m128i prod_im = _mm_mulhrs_epi16(a_swapped, w_im_signed);
+
+    return _mm_adds_epi16(prod_re, prod_im);
+}
+
+static inline __m128i mullts_q15_128(__m128i z)
+{
+    /*
+     * j * (r + ji) = -i + jr
+     *
+     * [r i] -> [-i r]
+     */
+    const __m128i swapped = swap_complex_pairs_i16_128(z);
+
+    const __m128i sign = _mm_setr_epi16(
+        -1, 1,
+        -1, 1,
+        -1, 1,
+        -1, 1
+    );
+
+    return _mm_sign_epi16(swapped, sign);
+}
+
+static inline __m128i mul_minuslts_q15_128(__m128i z)
+{
+    /*
+     * -j * (r + ji) = i - jr
+     *
+     * [r i] -> [i -r]
+     */
+    const __m128i swapped = swap_complex_pairs_i16_128(z);
+
+    const __m128i sign = _mm_setr_epi16(
+        1, -1,
+        1, -1,
+        1, -1,
+        1, -1
+    );
+
+    return _mm_sign_epi16(swapped, sign);
+}
+
+static inline __m128i q15_mul_i16_128(__m128i x, int16_t q15)
+{
+    return _mm_mulhrs_epi16(x, _mm_set1_epi16(q15));
+}
+
+
+static inline __m128i add3s_epi16(__m128i a, __m128i b, __m128i c)
+{
+    return _mm_adds_epi16(_mm_adds_epi16(a, b), c);
+}
+
+typedef enum {
+    DFT_DIR_FORWARD = -1,
+    DFT_DIR_INVERSE = 1
+} dft_dir_t;
+#define ALIGNMENT 32
+
+static void *aligned_malloc(size_t size)
+{
+    void *ptr = NULL;
+
+    if (posix_memalign(&ptr, ALIGNMENT, size) != 0)
+        return NULL;
+
+    return ptr;
+}
+//=====================================================================================
+//TWIDDLES START
+//=====================================================================================
+
+typedef struct {
+
+    int N;
+    int initialized;
+
+    float complex *forward;
+    float complex *inverse;
+
+    
+
+    int r3_q15_blocks;
+    __m128i *r3_q15_w1_re;
+    __m128i *r3_q15_w1_im;
+    __m128i *r3_q15_w2_re;
+    __m128i *r3_q15_w2_im;
+    __m128i *r3_q15_w1_re_inv;
+    __m128i *r3_q15_w1_im_inv;
+    __m128i *r3_q15_w2_re_inv;
+    __m128i *r3_q15_w2_im_inv;
+
+    __m256i C64_RE_RE_q15_256[8]           __attribute__((aligned(64)));
+    __m256i C64_IM_SIGNED_q15_256[8]       __attribute__((aligned(64)));
+
+    __m256i W128_RE_RE_q15_256[8]      __attribute__((aligned(64)));
+    __m256i W128_IM_SIGNED_q15_256[8]  __attribute__((aligned(64)));
+
+    __m256i C64_RE_RE_q15_256_inverse[8]     __attribute__((aligned(64)));
+    __m256i C64_IM_SIGNED_q15_256_inverse[8] __attribute__((aligned(64)));
+
+    __m256i W128_RE_RE_q15_256_inverse[8]     __attribute__((aligned(64)));
+    __m256i W128_IM_SIGNED_q15_256_inverse[8] __attribute__((aligned(64)));
+
+
+    int init_done;
+} TwiddleTable;
+
+static TwiddleTable g_tables[MAX_N + 1];
+
+
+
+
+static inline int16_t f32_to_q15(float x)
+{
+    int v = (int)lrintf(x * 32768.0f);
+
+    if (v > 32767)
+        v = 32767;
+    if (v < -32767)
+        v = -32767;
+
+    return (int16_t)v;
+}
+
+
+
+static inline __m128i pack4_twiddle_q15_re_re(const float complex *W,
+                                              int k0,
+                                              int mul,
+                                              int N)
+{
+    int16_t v[8];
+
+    for (int j = 0; j < 4; j++) {
+        const int k = (mul * (k0 + j)) % N;
+        const int16_t wr = q15_from_float(crealf(W[k])) / sqrtf(3);
+
+        v[2 * j + 0] = wr;
+        v[2 * j + 1] = wr;
+    }
+
+    return _mm_loadu_si128((const __m128i *)v);
+}
+
+static inline __m128i pack4_twiddle_q15_im_im(const float complex *W,
+                                              int k0,
+                                              int mul,
+                                              int N)
+{
+    int16_t v[8];
+
+    for (int j = 0; j < 4; j++) {
+        const int k = (mul * (k0 + j)) % N;
+        const int16_t wi = q15_from_float(cimagf(W[k])) / sqrtf(3);
+
+        v[2 * j + 0] = -wi;
+        v[2 * j + 1] = wi;
+    }
+
+    return _mm_loadu_si128((const __m128i *)v);
+}
+
+
+static inline __m256i pack8_twiddle_q15_re_re256i(const float complex *W,
+                                                  int k0,
+                                                  int mul,
+                                                  int N)
+{
+    int16_t v[16] __attribute__((aligned(32)));
+
+    for (int j = 0; j < 8; j++) {
+        const int k = (mul * (k0 + j)) % N;
+        const int16_t wr = (N==64) ? q15_from_float(crealf(W[k]))/8 : q15_from_float(crealf(W[k])) / sqrtf(2.0f);;
+
+        v[2 * j + 0] = wr;
+        v[2 * j + 1] = wr;
+    }
+
+    return _mm256_load_si256((const __m256i *)(const void *)v);
+}
+
+static inline __m256i pack8_twiddle_q15_im_signed256i(const float complex *W,
+                                                      int k0,
+                                                      int mul,
+                                                      int N)
+{
+    int16_t v[16] __attribute__((aligned(32)));
+
+    for (int j = 0; j < 8; j++) {
+        const int k = (mul * (k0 + j)) % N;
+        const int16_t wi = (N==64) ? q15_from_float(cimagf(W[k]))/8 : q15_from_float(cimagf(W[k])) / sqrtf(2.0f);
+
+        v[2 * j + 0] = -wi;
+        v[2 * j + 1] = wi;
+    }
+
+    return _mm256_load_si256((const __m256i *)(const void *)v);
+}
+
+
+
+static int twiddle_table_64_128_create_q15_simd(TwiddleTable *table)
+{
+    const int N = table->N;
+
+    for (int m = 0; m < 8; m++) {
+        if (N==64){
+            table->C64_RE_RE_q15_256[m] =
+                pack8_twiddle_q15_re_re256i(table->forward, 0, m, N);
+
+            table->C64_IM_SIGNED_q15_256[m] =
+                pack8_twiddle_q15_im_signed256i(table->forward, 0, m, N);
+
+            table->C64_RE_RE_q15_256_inverse[m] =
+                pack8_twiddle_q15_re_re256i(table->inverse, 0, m, N);
+
+            table->C64_IM_SIGNED_q15_256_inverse[m] =
+                pack8_twiddle_q15_im_signed256i(table->inverse, 0, m, N);
+        }
+        else {
+            table->W128_RE_RE_q15_256[m] =
+                pack8_twiddle_q15_re_re256i(table->forward, 8 * m, 1, N);
+
+            table->W128_IM_SIGNED_q15_256[m] =
+                pack8_twiddle_q15_im_signed256i(table->forward, 8 * m, 1, N);
+
+            table->W128_RE_RE_q15_256_inverse[m] =
+                pack8_twiddle_q15_re_re256i(table->inverse, 8 * m, 1, N);
+
+            table->W128_IM_SIGNED_q15_256_inverse[m] =
+                pack8_twiddle_q15_im_signed256i(table->inverse, 8 * m, 1, N);
+        }
+    }
+    return 1;
+}
+static int twiddle_table_create_radix3_q15_simd(TwiddleTable *table)
+{
+    const int N = table->N;
+
+    if (N <= 0) {
+        return 0;
+    }
+
+    if (N % 3 != 0) {
+        return 1;
+    }
+
+    const int size   = N / 3;
+    const int blocks = (size + 3) / 4;
+
+    table->r3_q15_blocks = blocks;
+
+    table->r3_q15_w1_re     = aligned_malloc(sizeof(__m128i) * blocks);
+    table->r3_q15_w1_im     = aligned_malloc(sizeof(__m128i) * blocks);
+    table->r3_q15_w2_re     = aligned_malloc(sizeof(__m128i) * blocks);
+    table->r3_q15_w2_im     = aligned_malloc(sizeof(__m128i) * blocks);
+
+    table->r3_q15_w1_re_inv = aligned_malloc(sizeof(__m128i) * blocks);
+    table->r3_q15_w1_im_inv = aligned_malloc(sizeof(__m128i) * blocks);
+    table->r3_q15_w2_re_inv = aligned_malloc(sizeof(__m128i) * blocks);
+    table->r3_q15_w2_im_inv = aligned_malloc(sizeof(__m128i) * blocks);
+
+    if (!table->r3_q15_w1_re     || !table->r3_q15_w1_im ||
+        !table->r3_q15_w2_re     || !table->r3_q15_w2_im ||
+        !table->r3_q15_w1_re_inv || !table->r3_q15_w1_im_inv ||
+        !table->r3_q15_w2_re_inv || !table->r3_q15_w2_im_inv) {
+        return 0;
+    }
+
+
+    for (int b = 0; b < blocks; b++) {
+        const int k0 = 4 * b;
+
+        table->r3_q15_w1_re[b] =
+            pack4_twiddle_q15_re_re(table->forward, k0, 1, N);
+        table->r3_q15_w1_im[b] =
+            pack4_twiddle_q15_im_im(table->forward, k0, 1, N);
+
+        table->r3_q15_w2_re[b] =
+            pack4_twiddle_q15_re_re(table->forward, k0, 2, N);
+        table->r3_q15_w2_im[b] =
+            pack4_twiddle_q15_im_im(table->forward, k0, 2, N);
+
+        table->r3_q15_w1_re_inv[b] =
+            pack4_twiddle_q15_re_re(table->inverse, k0, 1, N);
+        table->r3_q15_w1_im_inv[b] =
+            pack4_twiddle_q15_im_im(table->inverse, k0, 1, N);
+
+        table->r3_q15_w2_re_inv[b] =
+            pack4_twiddle_q15_re_re(table->inverse, k0, 2, N);
+        table->r3_q15_w2_im_inv[b] =
+            pack4_twiddle_q15_im_im(table->inverse, k0, 2, N);
+    }
+
+    return 1;
+}
+
+
+static TwiddleTable *twiddle_table_create(int N)
+{
+
+    TwiddleTable *table = &g_tables[N];
+
+    memset(table, 0, sizeof(*table));
+
+    table->N = N;
+
+    table->forward = aligned_malloc((size_t)N * sizeof(*table->forward));
+    table->inverse = aligned_malloc((size_t)N * sizeof(*table->inverse));
+
+    if (!table->forward || !table->inverse) {
+        fprintf(stderr, "twiddle_table_create: allocation failed for N=%d\n", N);
+        return NULL;
+    }
+
+    for (int k = 0; k < N; k++) {
+        float theta = 2.0f * (float)M_PI * (float)k / (float)N;
+
+        float c = cosf(theta);
+        float s = sinf(theta);
+
+        table->forward[k] = c - I * s;
+        table->inverse[k] = c + I * s;
+    }
+
+    if (N % 3 == 0) {
+        if (!twiddle_table_create_radix3_q15_simd(table)) {
+            return NULL;
+        }
+    }
+
+
+    if (N % 4 == 0) {
+        if (!twiddle_table_64_128_create_q15_simd(table)) {
+            return NULL;
+        }
+    }
+
+    table->initialized = 1;
+    return table;
+}
+const TwiddleTable *twiddle_table_get(int N)
+{
+    if (N <= 0 || N > MAX_N) {
+        fprintf(stderr, "twiddle_table_get: invalid N=%d, MAX_N=%d\n", N, MAX_N);
+        abort();
+    }
+
+    if (!g_tables[N].initialized) {
+        if (!twiddle_table_create(N)) {
+            return NULL;
+        }
+    }
+
+    return &g_tables[N];
+}
+
+
+typedef struct {
+    int N;
+    int blocks;
+    int initialized;
+    simde__m256i *W1_RE_NEGIM;
+    simde__m256i *W1_IM_RE;
+    simde__m256i *W3_RE_NEGIM;
+    simde__m256i *W3_IM_RE;
+} sr_twiddle_simd_t;
+
+static sr_twiddle_simd_t sr_twiddles_fwd[SR_MAX_LOG2 + 1];
+static sr_twiddle_simd_t sr_twiddles_bwd[SR_MAX_LOG2 + 1];
+
+static int init_sr_twiddle_simd(sr_twiddle_simd_t *tw, int N, dft_dir_t dir)
+{
+    int quarter = N / 4;
+    int blocks = quarter / 8;
+
+    tw->N = N;
+    tw->blocks = blocks;
+
+    tw->W1_RE_NEGIM = aligned_alloc(32, sizeof(simde__m256i) * blocks);
+    tw->W1_IM_RE    = aligned_alloc(32, sizeof(simde__m256i) * blocks);
+    tw->W3_RE_NEGIM = aligned_alloc(32, sizeof(simde__m256i) * blocks);
+    tw->W3_IM_RE    = aligned_alloc(32, sizeof(simde__m256i) * blocks);
+
+    for (int b = 0; b < blocks; b++) {
+        int16_t w1_re_negim[16] __attribute__((aligned(64)));
+        int16_t w1_im_re[16]    __attribute__((aligned(64)));
+        int16_t w3_re_negim[16] __attribute__((aligned(64)));
+        int16_t w3_im_re[16]    __attribute__((aligned(64)));
+
+        for (int j = 0; j < 8; j++) {
+            int k = 8 * b + j;
+
+            float theta1 = (float)dir * 2.0f * (float)M_PI * k / (float)N;
+            float theta3 = (float)dir * 6.0f * (float)M_PI * k / (float)N;
+
+            int16_t w1r = sat_i16(lrintf(32767.0f * cosf(theta1))) / 2;
+            int16_t w1i = sat_i16(lrintf(32767.0f * sinf(theta1))) / 2;
+
+            int16_t w3r = sat_i16(lrintf(32767.0f * cosf(theta3))) / 2;
+            int16_t w3i = sat_i16(lrintf(32767.0f * sinf(theta3))) / 2;
+
+            w1_re_negim[2*j]     = w1r;
+            w1_re_negim[2*j + 1] = sat_i16(-(long)w1i);
+            w1_im_re[2*j]        = w1i;
+            w1_im_re[2*j + 1]    = w1r;
+
+            w3_re_negim[2*j]     = w3r;
+            w3_re_negim[2*j + 1] = sat_i16(-(long)w3i);
+            w3_im_re[2*j]        = w3i;
+            w3_im_re[2*j + 1]    = w3r;
+        }
+
+        tw->W1_RE_NEGIM[b] = simde_mm256_load_si256((simde__m256i *)w1_re_negim);
+        tw->W1_IM_RE[b]    = simde_mm256_load_si256((simde__m256i *)w1_im_re);
+        tw->W3_RE_NEGIM[b] = simde_mm256_load_si256((simde__m256i *)w3_re_negim);
+        tw->W3_IM_RE[b]    = simde_mm256_load_si256((simde__m256i *)w3_im_re);
+    }
+    return 1;
+}
+
+
+static sr_twiddle_simd_t *sr_twiddle_table_create(int N, dft_dir_t dir)
+{
+    const int idx = log2_int((unsigned int)N);
+
+    sr_twiddle_simd_t *tw =
+        (dir == DFT_DIR_FORWARD)
+            ? &sr_twiddles_fwd[idx]
+            : &sr_twiddles_bwd[idx];
+
+    memset(tw, 0, sizeof(*tw));
+
+    if (!init_sr_twiddle_simd(tw, N, dir)) {
+        return NULL;
+    }
+
+    tw->initialized = 1;
+    return tw;
+}
+
+const sr_twiddle_simd_t *sr_twiddle_table_get(int N, dft_dir_t dir)
+{
+
+    const int idx = log2_int((unsigned int)N);
+
+    if (idx > SR_MAX_LOG2) {
+        fprintf(stderr, "sr_twiddle_table_get: log2(N)=%d exceeds SR_MAX_LOG2=%d\n",
+                idx, SR_MAX_LOG2);
+        abort();
+    }
+
+    sr_twiddle_simd_t *tw =
+        (dir == DFT_DIR_FORWARD)
+            ? &sr_twiddles_fwd[idx]
+            : &sr_twiddles_bwd[idx];
+
+    if (!tw->initialized) {
+        if (!sr_twiddle_table_create(N, dir)) {
+            return NULL;
+        }
+    }
+
+    return tw;
+}
+//=====================================================================================
+//TWIDDLES FIN
+//=====================================================================================
+
+//===================================================================
+// DFT64 8x8 int
+//===================================================================
+
+static inline __m256i swap_complex_pairs_i16_256(__m256i a)
+{
+    const __m256i shuf = _mm256_setr_epi8(
+         2, 3,  0, 1,
+         6, 7,  4, 5,
+        10,11,  8, 9,
+        14,15, 12,13,
+
+         2, 3,  0, 1,
+         6, 7,  4, 5,
+        10,11,  8, 9,
+        14,15, 12,13
+    );
+
+    return _mm256_shuffle_epi8(a, shuf);
+}
+
+static inline __m256i mul_j_i16_256(__m256i z)
+{
+    const __m256i swapped = swap_complex_pairs_i16_256(z);
+
+    const __m256i sign = _mm256_setr_epi16(
+        -1, +1,
+        -1, +1,
+        -1, +1,
+        -1, +1,
+        -1, +1,
+        -1, +1,
+        -1, +1,
+        -1, +1
+    );
+
+    return _mm256_sign_epi16(swapped, sign);
+}
+
+static inline __m256i mul_minus_j_i16_256(__m256i z)
+{
+    const __m256i swapped = swap_complex_pairs_i16_256(z);
+
+    const __m256i sign = _mm256_setr_epi16(
+        +1, -1,
+        +1, -1,
+        +1, -1,
+        +1, -1,
+        +1, -1,
+        +1, -1,
+        +1, -1,
+        +1, -1
+    );
+
+    return _mm256_sign_epi16(swapped, sign);
+}
+
+static inline __m256i mul_minus_j_dir_i16_256(__m256i z, dft_dir_t dir)
+{
+    return (dir == DFT_DIR_FORWARD)
+        ? mul_minus_j_i16_256(z)
+        : mul_j_i16_256(z);
+}
+
+static inline __m256i mul_plus_j_dir_i16_256(__m256i z, dft_dir_t dir)
+{
+    return (dir == DFT_DIR_FORWARD)
+        ? mul_j_i16_256(z)
+        : mul_minus_j_i16_256(z);
+}
+
+static inline void transpose8_complex_i16_256(
+    __m256i *r0,
+    __m256i *r1,
+    __m256i *r2,
+    __m256i *r3,
+    __m256i *r4,
+    __m256i *r5,
+    __m256i *r6,
+    __m256i *r7)
+{
+
+    const __m256i a = *r0;
+    const __m256i b = *r1;
+    const __m256i c = *r2;
+    const __m256i d = *r3;
+    const __m256i e = *r4;
+    const __m256i f = *r5;
+    const __m256i g = *r6;
+    const __m256i h = *r7;
+
+
+    const __m256i t0 = _mm256_unpacklo_epi32(a, b);
+    const __m256i t1 = _mm256_unpackhi_epi32(a, b);
+    const __m256i t2 = _mm256_unpacklo_epi32(c, d);
+    const __m256i t3 = _mm256_unpackhi_epi32(c, d);
+    const __m256i t4 = _mm256_unpacklo_epi32(e, f);
+    const __m256i t5 = _mm256_unpackhi_epi32(e, f);
+    const __m256i t6 = _mm256_unpacklo_epi32(g, h);
+    const __m256i t7 = _mm256_unpackhi_epi32(g, h);
+
+
+    const __m256i s0 = _mm256_unpacklo_epi64(t0, t2);
+    const __m256i s1 = _mm256_unpackhi_epi64(t0, t2);
+    const __m256i s2 = _mm256_unpacklo_epi64(t1, t3);
+    const __m256i s3 = _mm256_unpackhi_epi64(t1, t3);
+
+    const __m256i s4 = _mm256_unpacklo_epi64(t4, t6);
+    const __m256i s5 = _mm256_unpackhi_epi64(t4, t6);
+    const __m256i s6 = _mm256_unpacklo_epi64(t5, t7);
+    const __m256i s7 = _mm256_unpackhi_epi64(t5, t7);
+
+ 
+    *r0 = _mm256_permute2x128_si256(s0, s4, 0x20);
+    *r1 = _mm256_permute2x128_si256(s1, s5, 0x20);
+    *r2 = _mm256_permute2x128_si256(s2, s6, 0x20);
+    *r3 = _mm256_permute2x128_si256(s3, s7, 0x20);
+
+    *r4 = _mm256_permute2x128_si256(s0, s4, 0x31);
+    *r5 = _mm256_permute2x128_si256(s1, s5, 0x31);
+    *r6 = _mm256_permute2x128_si256(s2, s6, 0x31);
+    *r7 = _mm256_permute2x128_si256(s3, s7, 0x31);
+}
+
+static inline __m256i complex_mul8_prepack_q15_256(
+    __m256i a,
+    __m256i w_re_re,
+    __m256i w_im_signed)
+{
+    const __m256i a_swapped = swap_complex_pairs_i16_256(a);
+
+    const __m256i prod_re = _mm256_mulhrs_epi16(a,         w_re_re);
+    const __m256i prod_im = _mm256_mulhrs_epi16(a_swapped, w_im_signed);
+
+    return _mm256_adds_epi16(prod_re, prod_im);
+}
+
+
+
+static inline void dft8x8lts_q15_256_dir(
+    const __m256i x0,
+    const __m256i x1,
+    const __m256i x2,
+    const __m256i x3,
+    const __m256i x4,
+    const __m256i x5,
+    const __m256i x6,
+    const __m256i x7,
+    __m256i *Y0,
+    __m256i *Y1,
+    __m256i *Y2,
+    __m256i *Y3,
+    __m256i *Y4,
+    __m256i *Y5,
+    __m256i *Y6,
+    __m256i *Y7,
+    dft_dir_t dir)
+{
+    const __m256i c = _mm256_set1_epi16(Q15_INV_SQRT2);
+
+    const __m256i s04 = _mm256_adds_epi16(x0, x4);
+    const __m256i d04 = _mm256_subs_epi16(x0, x4);
+
+    const __m256i s15 = _mm256_adds_epi16(x1, x5);
+    const __m256i d15 = _mm256_subs_epi16(x1, x5);
+
+    const __m256i s26 = _mm256_adds_epi16(x2, x6);
+    const __m256i d26 = _mm256_subs_epi16(x2, x6);
+
+    const __m256i s37 = _mm256_adds_epi16(x3, x7);
+    const __m256i d37 = _mm256_subs_epi16(x3, x7);
+
+    const __m256i s02 = _mm256_adds_epi16(s04, s26);
+    const __m256i d02 = _mm256_subs_epi16(s04, s26);
+
+    const __m256i s13 = _mm256_adds_epi16(s15, s37);
+    const __m256i d13 = _mm256_subs_epi16(s15, s37);
+
+    *Y0 = _mm256_adds_epi16(s02, s13);
+    *Y4 = _mm256_subs_epi16(s02, s13);
+
+    *Y2 = _mm256_adds_epi16(d02, mul_minus_j_dir_i16_256(d13, dir));
+    *Y6 = _mm256_adds_epi16(d02, mul_plus_j_dir_i16_256(d13, dir));
+
+    const __m256i p = _mm256_adds_epi16(d15, d37);
+    const __m256i q = _mm256_subs_epi16(d15, d37);
+
+    const __m256i d26_mj = mul_minus_j_dir_i16_256(d26, dir);
+    const __m256i d26_pj = mul_plus_j_dir_i16_256(d26, dir);
+
+    const __m256i base_mj = _mm256_adds_epi16(d04, d26_mj);
+    const __m256i base_pj = _mm256_adds_epi16(d04, d26_pj);
+
+    const __m256i t1_arg = _mm256_adds_epi16(q, mul_minus_j_dir_i16_256(p, dir));
+    const __m256i t3_arg = _mm256_adds_epi16(q, mul_plus_j_dir_i16_256(p, dir));
+
+    const __m256i t1 = _mm256_mulhrs_epi16(c, t1_arg);
+    const __m256i t3 = _mm256_mulhrs_epi16(c, t3_arg);
+
+    *Y1 = _mm256_adds_epi16(base_mj, t1);
+    *Y5 = _mm256_subs_epi16(base_mj, t1);
+
+    *Y7 = _mm256_adds_epi16(base_pj, t3);
+    *Y3 = _mm256_subs_epi16(base_pj, t3);
+}
+
+static inline void dft64ltslts(
+    const c16_t *src,
+    c16_t *dst,
+    dft_dir_t dir)
+{
+    const __m256i x0 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 0));
+    const __m256i x1 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 8));
+    const __m256i x2 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 16));
+    const __m256i x3 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 24));
+    const __m256i x4 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 32));
+    const __m256i x5 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 40));
+    const __m256i x6 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 48));
+    const __m256i x7 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 56));
+
+    __m256i H0, H1, H2, H3;
+    __m256i H4, H5, H6, H7;
+
+    dft8x8lts_q15_256_dir(
+        x0, x1, x2, x3,
+        x4, x5, x6, x7,
+        &H0, &H1, &H2, &H3,
+        &H4, &H5, &H6, &H7,
+        dir
+    );
+    const TwiddleTable *tw = twiddle_table_get(64);
+    const __m256i *C64_RE =
+        (dir == DFT_DIR_FORWARD)
+            ? tw->C64_RE_RE_q15_256
+            : tw->C64_RE_RE_q15_256_inverse;
+
+    const __m256i *C64_IM =
+        (dir == DFT_DIR_FORWARD)
+            ? tw->C64_IM_SIGNED_q15_256
+            : tw->C64_IM_SIGNED_q15_256_inverse;
+    H0 = _mm256_srai_epi16(H0, 3);
+
+    H1 = complex_mul8_prepack_q15_256(H1, C64_RE[1], C64_IM[1]);
+    H2 = complex_mul8_prepack_q15_256(H2, C64_RE[2], C64_IM[2]);
+    H3 = complex_mul8_prepack_q15_256(H3, C64_RE[3], C64_IM[3]);
+    H4 = complex_mul8_prepack_q15_256(H4, C64_RE[4], C64_IM[4]);
+    H5 = complex_mul8_prepack_q15_256(H5, C64_RE[5], C64_IM[5]);
+    H6 = complex_mul8_prepack_q15_256(H6, C64_RE[6], C64_IM[6]);
+    H7 = complex_mul8_prepack_q15_256(H7, C64_RE[7], C64_IM[7]);
+
+    /*
+     * Transpose complex 8x8.
+     */
+    transpose8_complex_i16_256(
+        &H0, &H1, &H2, &H3,
+        &H4, &H5, &H6, &H7
+    );
+
+    __m256i Y0, Y1, Y2, Y3;
+    __m256i Y4, Y5, Y6, Y7;
+
+    /*
+     * Second stage.
+     */
+    dft8x8lts_q15_256_dir(
+        H0, H1, H2, H3,
+        H4, H5, H6, H7,
+        &Y0, &Y1, &Y2, &Y3,
+        &Y4, &Y5, &Y6, &Y7,
+        dir
+    );
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 0),  Y0);
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 8),  Y1);
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 16), Y2);
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 24), Y3);
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 32), Y4);
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 40), Y5);
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 48), Y6);
+    _mm256_storeu_si256((__m256i *)(void *)(dst + 56), Y7);
+}
+
+//===================================================================
+// DFT128 int
+//===================================================================
+static inline __m256i scale_q15_inv_sqrt2_256(__m256i x)
+{
+    const __m256i s = _mm256_set1_epi16(Q15_INV_SQRT2);
+    return _mm256_mulhrs_epi16(x, s);
+}
+
+static inline void dft128_stage0_blk_q15_256_dir(
+    const c16_t *src,
+    c16_t *a,
+    c16_t *b,
+    int blk,
+    dft_dir_t dir)
+{
+    const __m256i x0 = _mm256_loadu_si256(
+        (const __m256i *)(const void *)(src + 8 * blk)
+    );
+
+    const __m256i x1 = _mm256_loadu_si256(
+        (const __m256i *)(const void *)(src + 64 + 8 * blk)
+    );
+
+    __m256i sum  = _mm256_adds_epi16(x0, x1);
+    __m256i diff = _mm256_subs_epi16(x0, x1);
+
+    sum = scale_q15_inv_sqrt2_256(sum);
+    const TwiddleTable *tw = twiddle_table_get(128);
+    const __m256i *W128_RE =
+        (dir == DFT_DIR_FORWARD)
+            ? tw->W128_RE_RE_q15_256
+            : tw->W128_RE_RE_q15_256_inverse;
+
+    const __m256i *W128_IM =
+        (dir == DFT_DIR_FORWARD)
+            ? tw->W128_IM_SIGNED_q15_256
+            : tw->W128_IM_SIGNED_q15_256_inverse;
+
+    diff = complex_mul8_prepack_q15_256(
+        diff,
+        W128_RE[blk],
+        W128_IM[blk]
+    );
+
+    _mm256_store_si256(
+        (__m256i *)(void *)(a + 8 * blk),
+        sum
+    );
+
+    _mm256_store_si256(
+        (__m256i *)(void *)(b + 8 * blk),
+        diff
+    );
+}
+
+static inline void interleave64_complex_q15_256(
+    const c16_t *A,
+    const c16_t *B,
+    c16_t *dst)
+{
+    for (int blk = 0; blk < 8; blk++) {
+        const __m256i va = _mm256_load_si256(
+            (const __m256i *)(const void *)(A + 8 * blk)
+        );
+
+        const __m256i vb = _mm256_load_si256(
+            (const __m256i *)(const void *)(B + 8 * blk)
+        );
+
+        /*
+         * va = [A0 A1 A2 A3 | A4 A5 A6 A7]
+         * vb = [B0 B1 B2 B3 | B4 B5 B6 B7]
+         *
+         * Each A0/B0 is one c16_t = 32 bits.
+         */
+        const __m256i lo = _mm256_unpacklo_epi32(va, vb);
+        const __m256i hi = _mm256_unpackhi_epi32(va, vb);
+
+        /*
+         * out0 = [A0 B0 A1 B1 A2 B2 A3 B3]
+         * out1 = [A4 B4 A5 B5 A6 B6 A7 B7]
+         */
+        const __m256i out0 = _mm256_permute2x128_si256(lo, hi, 0x20);
+        const __m256i out1 = _mm256_permute2x128_si256(lo, hi, 0x31);
+
+        _mm256_storeu_si256(
+            (__m256i *)(void *)(dst + 16 * blk),
+            out0
+        );
+
+        _mm256_storeu_si256(
+            (__m256i *)(void *)(dst + 16 * blk + 8),
+            out1
+        );
+    }
+}
+
+static inline void dft128lts_dir(
+    const c16_t *src,
+    c16_t *dst,
+    dft_dir_t dir)
+{
+    c16_t a[64] __attribute__((aligned(32)));
+    c16_t b[64] __attribute__((aligned(32)));
+
+    c16_t A[64] __attribute__((aligned(32)));
+    c16_t B[64] __attribute__((aligned(32)));
+
+    for (int blk = 0; blk < 8; blk++) {
+        dft128_stage0_blk_q15_256_dir(src, a, b, blk, dir);
+    }
+
+    dft64ltslts(a, A, dir);
+    dft64ltslts(b, B, dir);
+
+    interleave64_complex_q15_256(A, B, dst);
+}
+
+
+
+//===================================================================
+// DFT SPLIT
+//===================================================================
+static inline void sr_combine_simd(c16_t *E,
+                                   c16_t *O1,
+                                   c16_t *O3,
+                                   c16_t *y,
+                                   int N,
+                                   const sr_twiddle_simd_t *tw,
+                                   dft_dir_t dir)
+{
+    int half = N / 2;
+    int quarter = N / 4;
+
+    const simde__m256i swap_mask =
+        simde_mm256_setr_epi8(
+             2,  3,  0,  1,  6,  7,  4,  5,
+            10, 11,  8,  9, 14, 15, 12, 13,
+             2,  3,  0,  1,  6,  7,  4,  5,
+            10, 11,  8,  9, 14, 15, 12, 13
+        );
+
+    simde__m256i sign_mask;
+
+    if (dir == DFT_DIR_FORWARD) {
+
+        sign_mask = simde_mm256_setr_epi16(
+             1, -1,  1, -1,  1, -1,  1, -1,
+             1, -1,  1, -1,  1, -1,  1, -1
+        );
+    } else {
+        sign_mask = simde_mm256_setr_epi16(
+            -1,  1, -1,  1, -1,  1, -1,  1,
+            -1,  1, -1,  1, -1,  1, -1,  1
+        );
+    }
+
+    const simde__m256i sqrt2_inv =
+        simde_mm256_set1_epi16(Q15_INV_SQRT2);
+
+    for (int b = 0; b < tw->blocks; b++) {
+        int k = 8 * b;
+
+        simde__m256i O1v = simde_mm256_load_si256((simde__m256i *)&O1[k]);
+        simde__m256i O3v = simde_mm256_load_si256((simde__m256i *)&O3[k]);
+
+        simde__m256i t1 = c16_mul_q15_simd256(O1v,
+                                               tw->W1_RE_NEGIM[b],
+                                               tw->W1_IM_RE[b]);
+
+        simde__m256i t2 = c16_mul_q15_simd256(O3v,
+                                               tw->W3_RE_NEGIM[b],
+                                               tw->W3_IM_RE[b]);
+
+        simde__m256i a = simde_mm256_add_epi16(t1, t2);
+        simde__m256i d = simde_mm256_sub_epi16(t1, t2);
+
+        simde__m256i bval = simde_mm256_shuffle_epi8(d, swap_mask);
+        bval = simde_mm256_sign_epi16(bval, sign_mask);
+
+        simde__m256i E0 = simde_mm256_load_si256((simde__m256i *)&E[k]);
+        simde__m256i E1 = simde_mm256_load_si256((simde__m256i *)&E[k + quarter]);
+
+        E0 = simde_mm256_mulhrs_epi16(E0, sqrt2_inv);
+        E1 = simde_mm256_mulhrs_epi16(E1, sqrt2_inv);
+        /*
+        a    = simde_mm256_srai_epi16(a, 1);
+        bval = simde_mm256_srai_epi16(bval, 1);
+        */
+        simde__m256i Y0 = simde_mm256_add_epi16(E0, a);
+        simde__m256i Y2 = simde_mm256_sub_epi16(E0, a);
+        simde__m256i Y1 = simde_mm256_add_epi16(E1, bval);
+        simde__m256i Y3 = simde_mm256_sub_epi16(E1, bval);
+
+        simde_mm256_store_si256((simde__m256i *)&y[k],               Y0);
+        simde_mm256_store_si256((simde__m256i *)&y[k + quarter],     Y1);
+        simde_mm256_store_si256((simde__m256i *)&y[k + half],        Y2);
+        simde_mm256_store_si256((simde__m256i *)&y[k + 3 * quarter], Y3);
+    }
+}
+
+static inline void pack_split_radix_input_avx2_fused(const c16_t *__restrict x,
+                                                       c16_t *__restrict sub_in,
+                                                       int N)
+{
+    _Static_assert(sizeof(c16_t) == 4, "c16_t must be 32-bit");
+
+    const int half    = N >> 1;
+    const int quarter = N >> 2;
+
+    c16_t *__restrict E_in  = sub_in;
+    c16_t *__restrict O1_in = sub_in + half;
+    c16_t *__restrict O3_in = sub_in + half + quarter;
+
+    const simde__m256i idx =
+        simde_mm256_setr_epi32(0, 2, 4, 6, 1, 5, 3, 7);
+
+    int in = 0;
+    int e  = 0;
+    int o  = 0;
+
+    for (; in + 32 <= N; in += 32, e += 16, o += 8) {
+        simde__m256i v0 =
+            simde_mm256_loadu_si256((const simde__m256i *)&x[in + 0]);
+
+        simde__m256i v1 =
+            simde_mm256_loadu_si256((const simde__m256i *)&x[in + 8]);
+
+        simde__m256i v2 =
+            simde_mm256_loadu_si256((const simde__m256i *)&x[in + 16]);
+
+        simde__m256i v3 =
+            simde_mm256_loadu_si256((const simde__m256i *)&x[in + 24]);
+
+        /*
+         * p0 = [x0,  x2,  x4,  x6,  x1,  x5,  x3,  x7]
+         * p1 = [x8,  x10, x12, x14, x9,  x13, x11, x15]
+         * p2 = [x16, x18, x20, x22, x17, x21, x19, x23]
+         * p3 = [x24, x26, x28, x30, x25, x29, x27, x31]
+         */
+        simde__m256i p0 = simde_mm256_permutevar8x32_epi32(v0, idx);
+        simde__m256i p1 = simde_mm256_permutevar8x32_epi32(v1, idx);
+        simde__m256i p2 = simde_mm256_permutevar8x32_epi32(v2, idx);
+        simde__m256i p3 = simde_mm256_permutevar8x32_epi32(v3, idx);
+
+        /*
+         * E output:
+         *
+         * low128(p0) = x0,  x2,  x4,  x6
+         * low128(p1) = x8,  x10, x12, x14
+         * low128(p2) = x16, x18, x20, x22
+         * low128(p3) = x24, x26, x28, x30
+         *
+         * On stocke en 128-bit pour éviter vinserti64x2 / vinserti128.
+         */
+        simde_mm_store_si128((simde__m128i *)&E_in[e + 0],
+                             simde_mm256_castsi256_si128(p0));
+
+        simde_mm_store_si128((simde__m128i *)&E_in[e + 4],
+                             simde_mm256_castsi256_si128(p1));
+
+        simde_mm_store_si128((simde__m128i *)&E_in[e + 8],
+                             simde_mm256_castsi256_si128(p2));
+
+        simde_mm_store_si128((simde__m128i *)&E_in[e + 12],
+                             simde_mm256_castsi256_si128(p3));
+
+        /*
+         * high128(p0) = x1,  x5,  x3,  x7
+         * high128(p1) = x9,  x13, x11, x15
+         * high128(p2) = x17, x21, x19, x23
+         * high128(p3) = x25, x29, x27, x31
+         */
+        simde__m128i h0 = simde_mm256_extracti128_si256(p0, 1);
+        simde__m128i h1 = simde_mm256_extracti128_si256(p1, 1);
+        simde__m128i h2 = simde_mm256_extracti128_si256(p2, 1);
+        simde__m128i h3 = simde_mm256_extracti128_si256(p3, 1);
+
+        /*
+         * O1:
+         * unpacklo_epi64(h0,h1) = x1,  x5,  x9,  x13
+         * unpacklo_epi64(h2,h3) = x17, x21, x25, x29
+         *
+         * O3:
+         * unpackhi_epi64(h0,h1) = x3,  x7,  x11, x15
+         * unpackhi_epi64(h2,h3) = x19, x23, x27, x31
+         */
+        simde__m128i o1_0 = simde_mm_unpacklo_epi64(h0, h1);
+        simde__m128i o3_0 = simde_mm_unpackhi_epi64(h0, h1);
+
+        simde__m128i o1_1 = simde_mm_unpacklo_epi64(h2, h3);
+        simde__m128i o3_1 = simde_mm_unpackhi_epi64(h2, h3);
+
+        simde_mm_store_si128((simde__m128i *)&O1_in[o + 0], o1_0);
+        simde_mm_store_si128((simde__m128i *)&O1_in[o + 4], o1_1);
+
+        simde_mm_store_si128((simde__m128i *)&O3_in[o + 0], o3_0);
+        simde_mm_store_si128((simde__m128i *)&O3_in[o + 4], o3_1);
+    }
+}
+
+
+
+static void dft_split_radix_pure_simd_core(c16_t *__restrict x,
+                                           c16_t *__restrict y,
+                                           c16_t *__restrict work,
+                                           int N,
+                                           dft_dir_t dir)
+{
+    if (N == 64) {
+        dft64ltslts(x, y, dir);
+        return;
+    }
+
+    if (N == 128) {
+        dft128lts_dir(x, y, dir);
+        return;
+    }
+    
+
+    const int half    = N >> 1;
+    const int quarter = N >> 2;
+
+    c16_t *sub_in  = work;
+    c16_t *sub_out = work + N;
+
+    c16_t *E  = sub_out;
+    c16_t *O1 = sub_out + half;
+    c16_t *O3 = sub_out + half + quarter;
+
+    pack_split_radix_input_avx2_fused(x, sub_in, N);
+
+    dft_split_radix_pure_simd_core(sub_in,
+                                   E,
+                                   work + 2 * N,
+                                   half,
+                                   dir);
+
+    dft_split_radix_pure_simd_core(sub_in + half,
+                                   O1,
+                                   work + 2 * N,
+                                   quarter,
+                                   dir);
+
+    dft_split_radix_pure_simd_core(sub_in + half + quarter,
+                                   O3,
+                                   work + 2 * N,
+                                   quarter,
+                                   dir);
+    const sr_twiddle_simd_t *table = sr_twiddle_table_get(N, dir);
+
+    if (!table) {
+        return;
+    }
+
+    sr_combine_simd(E, O1, O3, y, N, table, dir);
+}
+
+
+static void dft_split_radix_pure_simd(c16_t *x, c16_t *y, int N, dft_dir_t dir)
+{
+    c16_t work[262144] __attribute__((aligned(64)));
+
+    if (!work) {
+        printf("work allocation failed\n");
+        return;
+    }
+
+    dft_split_radix_pure_simd_core(x, y, work, N, dir);
+
+}
+
+//===================================================================
+// RADIX_3
+//===================================================================
+static inline void radix3_combine4_q15_128_fast(__m128i A,
+                                                __m128i X1,
+                                                __m128i X2,
+                                                __m128i w1_re_re,
+                                                __m128i w1_im_im,
+                                                __m128i w2_re_re,
+                                                __m128i w2_im_im,
+                                                __m128i *Y0,
+                                                __m128i *Y1,
+                                                __m128i *Y2,
+                                                dft_dir_t dir)
+{
+    /*
+     * B = W1 * X1
+     * C = W2 * X2
+     */
+    const __m128i Bs = complex_mul4_prepack_q15_128(X1, w1_re_re, w1_im_im);
+    const __m128i Cs = complex_mul4_prepack_q15_128(X2, w2_re_re, w2_im_im);
+
+    /*
+     * Correct scaling for N = 3 * size when sub-FFTs are already scaled:
+     *
+     * final scale = 1 / sqrt(3)
+     *
+     * Y0 = (A + B + C) / sqrt(3)
+     */
+    const __m128i As = q15_mul_i16_128(A, Q15_INV_SQRT3);
+    //const __m128i Bs = q15_mul_i16_128(B, Q15_INV_SQRT3);
+    //const __m128i Cs = q15_mul_i16_128(C, Q15_INV_SQRT3);
+
+    *Y0 = add3s_epi16(As, Bs, Cs);
+
+    /*
+     * base = A/sqrt(3) - B/(2*sqrt(3)) - C/(2*sqrt(3))
+     */
+    const __m128i Bh = _mm_srai_epi16(Bs,1);
+    const __m128i Ch = _mm_srai_epi16(Cs,1);
+
+    const __m128i base = _mm_subs_epi16(_mm_subs_epi16(As, Bh), Ch);
+
+    /*
+     * Z = c3 * (B - C) / sqrt(3)
+     *   = 0.5 * (B - C)
+     */
+
+    const __m128i Z = q15_mul_i16_128(_mm_subs_epi16(Bs, Cs),Q15_HALF_SQRT3);
+
+    /*
+     * Y1 = base - j*Z
+     * Y2 = base + j*Z
+     */
+    *Y1 = _mm_adds_epi16(base, (dir == DFT_DIR_FORWARD) ? mul_minuslts_q15_128(Z) : mullts_q15_128(Z));
+    *Y2 = _mm_adds_epi16(base, (dir == DFT_DIR_FORWARD) ? mullts_q15_128(Z) : mul_minuslts_q15_128(Z));
+}
+
+
+static void radix_3_fft_c16_scaled(const c16_t *src,
+                                           c16_t *dst,
+                                           int N,
+                                           dft_dir_t dir)
+{
+    if ((N % 3) != 0) {
+        printf("radix_3_fft_forward_c16_scaled: N must be divisible by 3\n");
+        return;
+    }
+
+    const int size = N / 3;
+
+    if (!is_power_of_two_int(size)) {
+        printf("radix_3_fft_forward_c16_scaled: N/3 must be power of two\n");
+        return;
+    }
+
+    const TwiddleTable *tw = twiddle_table_get(N);
+
+    if (!tw ||
+        !tw->r3_q15_w1_re ||
+        !tw->r3_q15_w1_im ||
+        !tw->r3_q15_w2_re ||
+        !tw->r3_q15_w2_im ||
+        !tw->r3_q15_w1_re_inv ||
+        !tw->r3_q15_w1_im_inv ||
+        !tw->r3_q15_w2_re_inv ||
+        !tw->r3_q15_w2_im_inv) {
+        printf("radix_3_fft_c16_scaled: missing radix-3 Q15 twiddles\n");
+        return;
+    }
+
+    c16_t *work = aligned_malloc64(sizeof(c16_t) * 6 * (size_t)N);
+
+    if (!work) {
+        printf("radix_3_fft_forward_c16_scaled: work allocation failed\n");
+        return;
+    }
+
+    c16_t *in       = work;
+    c16_t *tmp      = work + N;
+    c16_t *sub_work = work + 2 * N;
+
+    for (int n = 0; n < size; n++) {
+        in[0 * size + n] = src[3 * n + 0];
+        in[1 * size + n] = src[3 * n + 1];
+        in[2 * size + n] = src[3 * n + 2];
+    }
+
+    dft_split_radix_pure_simd_core(in + 0 * size,
+                                   tmp + 0 * size,
+                                   sub_work,
+                                   size,
+                                   dir);
+
+    dft_split_radix_pure_simd_core(in + 1 * size,
+                                   tmp + 1 * size,
+                                   sub_work,
+                                   size,
+                                   dir);
+
+    dft_split_radix_pure_simd_core(in + 2 * size,
+                                   tmp + 2 * size,
+                                   sub_work,
+                                   size,
+                                   dir);
+
+    const __m128i *w1_re_tbl =
+        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w1_re : tw->r3_q15_w1_re_inv;
+
+    const __m128i *w1_im_tbl =
+        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w1_im : tw->r3_q15_w1_im_inv;
+
+    const __m128i *w2_re_tbl =
+        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w2_re : tw->r3_q15_w2_re_inv;
+
+    const __m128i *w2_im_tbl =
+        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w2_im : tw->r3_q15_w2_im_inv;
+
+    int k = 0;
+
+    for (; k + 3 < size; k += 4) {
+        const int b = k >> 2;
+
+        const __m128i A  = _mm_loadu_si128((const __m128i *)(tmp + 0 * size + k));
+        const __m128i X1 = _mm_loadu_si128((const __m128i *)(tmp + 1 * size + k));
+        const __m128i X2 = _mm_loadu_si128((const __m128i *)(tmp + 2 * size + k));
+
+        __m128i Y0;
+        __m128i Y1;
+        __m128i Y2;
+
+        radix3_combine4_q15_128_fast(A,
+                                      X1,
+                                      X2,
+                                      w1_re_tbl[b],
+                                      w1_im_tbl[b],
+                                      w2_re_tbl[b],
+                                      w2_im_tbl[b],
+                                      &Y0,
+                                      &Y1,
+                                      &Y2,
+                                      dir);
+
+        _mm_storeu_si128((__m128i *)(dst + 0 * size + k), Y0);
+        _mm_storeu_si128((__m128i *)(dst + 1 * size + k), Y1);
+        _mm_storeu_si128((__m128i *)(dst + 2 * size + k), Y2);
+    }
+
+    if (k != size) {
+        printf("radix_3_fft_forward_c16_scaled: scalar tail not implemented, size=%d\n", size);
+    }
+
+    free(work);
+}
+
+//===================================================================
+// DFT MIXED RADIX
+//===================================================================
+static void dft_mixed_radix_c16_scaled(c16_t *x, c16_t *y, int N, dft_dir_t dir)
+{
+    
+    if ((N % 3) == 0 && is_power_of_two_int(N / 3)) {
+        radix_3_fft_c16_scaled(x, y, N, dir);
+        return;
+    }
+    if (is_power_of_two_int(N)) {
+        dft_split_radix_pure_simd(x, y, N, dir);
+        return;
+    }
+
+    printf("dft_mixed_radix_c16_scaled: unsupported N = %d\n", N);
+}
+
+#define DEFINE_MIXED_DFT_ONLY(N)                                      \
+void dft##N(int16_t *input, int16_t *output, uint8_t scale_flag)       \
+{                                                                     \
+    (void)scale_flag;                                                 \
+                                                                      \
+                                                                      \
+    dft_mixed_radix_c16_scaled((c16_t *)input,                        \
+                               (c16_t *)output,                       \
+                               N,                                     \
+                               DFT_DIR_FORWARD);                      \
+}
+
+#define DEFINE_MIXED_IDFT_ONLY(N)                                     \
+void idft##N(int16_t *input, int16_t *output, uint8_t scale_flag)      \
+{                                                                     \
+    (void)scale_flag;                                                 \
+                                                                      \
+                                                                      \
+    dft_mixed_radix_c16_scaled((c16_t *)input,                        \
+                               (c16_t *)output,                       \
+                               N,                                     \
+                               DFT_DIR_INVERSE);                      \
+}
+
+
+DEFINE_MIXED_DFT_ONLY(192)
+DEFINE_MIXED_DFT_ONLY(384)
+DEFINE_MIXED_DFT_ONLY(768)
+DEFINE_MIXED_DFT_ONLY(1536)
+DEFINE_MIXED_DFT_ONLY(3072)
+DEFINE_MIXED_DFT_ONLY(6144)
+DEFINE_MIXED_DFT_ONLY(12288)
+DEFINE_MIXED_DFT_ONLY(64)
+DEFINE_MIXED_DFT_ONLY(128)
+DEFINE_MIXED_DFT_ONLY(256)
+DEFINE_MIXED_DFT_ONLY(512)
+DEFINE_MIXED_DFT_ONLY(1024)
+DEFINE_MIXED_DFT_ONLY(2048)
+DEFINE_MIXED_DFT_ONLY(4096)
+DEFINE_MIXED_DFT_ONLY(8192)
+DEFINE_MIXED_DFT_ONLY(16384)
+
+DEFINE_MIXED_IDFT_ONLY(64)
+DEFINE_MIXED_IDFT_ONLY(128)
+DEFINE_MIXED_IDFT_ONLY(256)
+DEFINE_MIXED_IDFT_ONLY(512)
+DEFINE_MIXED_IDFT_ONLY(1024)
+DEFINE_MIXED_IDFT_ONLY(2048)
+DEFINE_MIXED_IDFT_ONLY(4096)
+DEFINE_MIXED_IDFT_ONLY(8192)
+DEFINE_MIXED_IDFT_ONLY(16384)
+DEFINE_MIXED_IDFT_ONLY(192)
+DEFINE_MIXED_IDFT_ONLY(384)
+DEFINE_MIXED_IDFT_ONLY(768)
+DEFINE_MIXED_IDFT_ONLY(1536)
+DEFINE_MIXED_IDFT_ONLY(3072)
+DEFINE_MIXED_IDFT_ONLY(6144)
+DEFINE_MIXED_IDFT_ONLY(12288)
 
 __attribute__((always_inline)) static inline void cmac(simde__m128i a, simde__m128i b, simde__m128i *re32, simde__m128i *im32)
 {
@@ -1437,1472 +2940,12 @@ __attribute__((always_inline)) static inline void idft16_simd256(int16_t *x, int
   y256[3] = simde_mm256_insertf128_si256(ytmp3,simde_mm256_extracti128_si256(ytmp2,1),0);
 
 }
-// 64-point optimized DFT
-
-const static int16_t tw64[96] __attribute__((aligned(32))) = { 
-32767,0,32609,-3212,32137,-6393,31356,-9512,
-30272,-12540,28897,-15447,27244,-18205,25329,-20788,
-23169,-23170,20787,-25330,18204,-27245,15446,-28898,
-12539,-30273,9511,-31357,6392,-32138,3211,-32610,
-32767,0,32137,-6393,30272,-12540,27244,-18205,
-23169,-23170,18204,-27245,12539,-30273,6392,-32138,
-0,-32767,-6393,-32138,-12540,-30273,-18205,-27245,
--23170,-23170,-27245,-18205,-30273,-12540,-32138,-6393,
-32767,0,31356,-9512,27244,-18205,20787,-25330,
-12539,-30273,3211,-32610,-6393,-32138,-15447,-28898,
--23170,-23170,-28898,-15447,-32138,-6393,-32610,3211,
--30273,12539,-25330,20787,-18205,27244,-9512,31356
-                                                };
-const static int16_t tw64a[96] __attribute__((aligned(32))) = { 
-32767,0,32609,3212,32137,6393,31356,9512,
-30272,12540,28897,15447,27244,18205,25329,20788,
-23169,23170,20787,25330,18204,27245,15446,28898,
-12539,30273,9511,31357,6392,32138,3211,32610,
-32767,0,32137,6393,30272,12540,27244,18205,
-23169,23170,18204,27245,12539,30273,6392,32138,
-0,32767,-6393,32138,-12540,30273,-18205,27245,
--23170,23170,-27245,18205,-30273,12540,-32138,6393,
-32767,0,31356,9512,27244,18205,20787,25330,
-12539,30273,3211,32610,-6393,32138,-15447,28898,
--23170,23170,-28898,15447,-32138,6393,-32610,-3211,
--30273,-12539,-25330,-20787,-18205,-27244,-9512,-31356
-                                                 };
-const static int16_t tw64b[96] __attribute__((aligned(32))) = { 
-0,32767,-3212,32609,-6393,32137,-9512,31356,
--12540,30272,-15447,28897,-18205,27244,-20788,25329,
--23170,23169,-25330,20787,-27245,18204,-28898,15446,
--30273,12539,-31357,9511,-32138,6392,-32610,3211,
-0,32767,-6393,32137,-12540,30272,-18205,27244,
--23170,23169,-27245,18204,-30273,12539,-32138,6392,
--32767,0,-32138,-6393,-30273,-12540,-27245,-18205,
--23170,-23170,-18205,-27245,-12540,-30273,-6393,-32138,
-0,32767,-9512,31356,-18205,27244,-25330,20787,
--30273,12539,-32610,3211,-32138,-6393,-28898,-15447,
--23170,-23170,-15447,-28898,-6393,-32138,3211,-32610,
-12539,-30273,20787,-25330,27244,-18205,31356,-9512
-                                                 };
-const static int16_t tw64c[96] __attribute__((aligned(32))) = { 
-0,32767,3212,32609,6393,32137,9512,31356,
-12540,30272,15447,28897,18205,27244,20788,25329,
-23170,23169,25330,20787,27245,18204,28898,15446,
-30273,12539,31357,9511,32138,6392,32610,3211,
-0,32767,6393,32137,12540,30272,18205,27244,
-23170,23169,27245,18204,30273,12539,32138,6392,
-32767,0,32138,-6393,30273,-12540,27245,-18205,
-23170,-23170,18205,-27245,12540,-30273,6393,-32138,
-0,32767,9512,31356,18205,27244,25330,20787,
-30273,12539,32610,3211,32138,-6393,28898,-15447,
-23170,-23170,15447,-28898,6393,-32138,-3211,-32610,
--12539,-30273,-20787,-25330,-27244,-18205,-31356,-9512
-                                                 };
 
 #define simd256_q15_t simde__m256i
 #define shiftright_int16_simd256(a,shift) simde_mm256_srai_epi16(a,shift)
 #define set1_int16_simd256(a) simde_mm256_set1_epi16(a);
-#define mulhi_int16_simd256(a,b) simde_mm256_mulhrs_epi16(a,b); //simde_mm256_slli_epi16(simde_mm256_mulhi_epi16(a,b),1);
+#define mulhi_int16_simd256(a,b) simde_mm256_mulhrs_epi16(a,b);
 
-void dft64(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[16],ytmp[16],*tw64a_256=(simd256_q15_t *)tw64a,*tw64b_256=(simd256_q15_t *)tw64b,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y;
-  simd256_q15_t xintl0,xintl1,xintl2,xintl3,xintl4,xintl5,xintl6,xintl7;
-  simd256_q15_t const perm_mask = simde_mm256_set_epi32(7, 3, 5, 1, 6, 2, 4, 0);
-
-
-#ifdef D64STATS
-  time_stats_t ts_t,ts_d,ts_b;
-
-  reset_meas(&ts_t);
-  reset_meas(&ts_d);
-  reset_meas(&ts_b);
-  start_meas(&ts_t);
-#endif
-
-#ifdef D64STATS
-  stop_meas(&ts_t);
-  start_meas(&ts_d);
-#endif
-  /*  
-  print_shorts256("x2560",(int16_t*)x256);
-  print_shorts256("x2561",(int16_t*)(x256+1));
-  print_shorts256("x2562",(int16_t*)(x256+2));
-  print_shorts256("x2563",(int16_t*)(x256+3));
-  print_shorts256("x2564",(int16_t*)(x256+4));
-  print_shorts256("x2565",(int16_t*)(x256+5));
-  print_shorts256("x2566",(int16_t*)(x256+6));
-  print_shorts256("x2567",(int16_t*)(x256+7));
-  */
-  xintl0 = simde_mm256_permutevar8x32_epi32(x256[0],perm_mask);  // x0  x4  x1  x5  x2  x6  x3  x7
-  xintl1 = simde_mm256_permutevar8x32_epi32(x256[1],perm_mask);  // x8  x12 x9  x13 x10 x14 x11 x15
-  xintl2 = simde_mm256_permutevar8x32_epi32(x256[2],perm_mask);  // x16 x20 x17 x21 x18 x22 x19 x23
-  xintl3 = simde_mm256_permutevar8x32_epi32(x256[3],perm_mask);  // x24 x28 x25 x29 x26 x30 x27 x31
-  xintl4 = simde_mm256_permutevar8x32_epi32(x256[4],perm_mask);  // x32 x28 x25 x29 x26 x30 x27 x31
-  xintl5 = simde_mm256_permutevar8x32_epi32(x256[5],perm_mask);  // x40 x28 x25 x29 x26 x30 x27 x31
-  xintl6 = simde_mm256_permutevar8x32_epi32(x256[6],perm_mask);  // x48 x28 x25 x29 x26 x30 x27 x31
-  xintl7 = simde_mm256_permutevar8x32_epi32(x256[7],perm_mask);  // x56 x28 x25 x29 x26 x30 x27 x31
-  /*
-  print_shorts256("xintl0",(int16_t*)&xintl0);
-  print_shorts256("xintl1",(int16_t*)&xintl1);
-  print_shorts256("xintl2",(int16_t*)&xintl2);
-  print_shorts256("xintl3",(int16_t*)&xintl3);
-  print_shorts256("xintl4",(int16_t*)&xintl4);
-  print_shorts256("xintl5",(int16_t*)&xintl5);
-  print_shorts256("xintl6",(int16_t*)&xintl6);
-  print_shorts256("xintl7",(int16_t*)&xintl7);
-  */
-  xtmp[0] = simde_mm256_unpacklo_epi64(xintl0,xintl1);        // x0  x4  x8  x12 x1  x5  x9  x13
-  xtmp[4] = simde_mm256_unpackhi_epi64(xintl0,xintl1);        // x2  x6  x10 x14 x3  x7  x11 x15
-  xtmp[1] = simde_mm256_unpacklo_epi64(xintl2,xintl3);        // x16 x20 x24 x28 x17 x21 x25 x29
-  xtmp[5] = simde_mm256_unpackhi_epi64(xintl2,xintl3);        // x18 x22 x26 x30 x19 x23 x27 x31
-  xtmp[2] = simde_mm256_unpacklo_epi64(xintl4,xintl5);        // x32 x36 x40 x44 x33 x37 x41 x45
-  xtmp[6] = simde_mm256_unpackhi_epi64(xintl4,xintl5);        // x34 x38 x42 x46 x35 x39 x43 x47
-  xtmp[3] = simde_mm256_unpacklo_epi64(xintl6,xintl7);        // x48 x52 x56 x60 x49 x53 x57 x61
-  xtmp[7] = simde_mm256_unpackhi_epi64(xintl6,xintl7);        // x50 x54 x58 x62 x51 x55 x59 x63
-  /*
-  print_shorts256("xtmp0",(int16_t*)xtmp);
-  print_shorts256("xtmp1",(int16_t*)(xtmp+1));
-  print_shorts256("xtmp2",(int16_t*)(xtmp+2));
-  print_shorts256("xtmp3",(int16_t*)(xtmp+3));
-  print_shorts256("xtmp4",(int16_t*)(xtmp+4));
-  print_shorts256("xtmp5",(int16_t*)(xtmp+5));
-  print_shorts256("xtmp6",(int16_t*)(xtmp+6));
-  print_shorts256("xtmp7",(int16_t*)(xtmp+7));
-  */
-  dft16_simd256((int16_t*)(xtmp),(int16_t*)ytmp);
-  // [y0  y1  y2  y3  y4  y5  y6  y7]
-  // [y8  y9  y10 y11 y12 y13 y14 y15]
-  // [y16 y17 y18 y19 y20 y21 y22 y23]
-  // [y24 y25 y26 y27 y28 y29 y30 y31]
-  /*
-  print_shorts256("ytmp0",(int16_t*)ytmp);
-  print_shorts256("ytmp1",(int16_t*)(ytmp+1));
-  print_shorts256("ytmp2",(int16_t*)(ytmp+2));
-  print_shorts256("ytmp3",(int16_t*)(ytmp+3));
-  */
-  dft16_simd256((int16_t*)(xtmp+4),(int16_t*)(ytmp+4));
-  // [y32 y33 y34 y35 y36 y37 y38 y39]
-  // [y40 y41 y42 y43 y44 y45 y46 y47]
-  // [y48 y49 y50 y51 y52 y53 y54 y55]
-  // [y56 y57 y58 y59 y60 y61 y62 y63]
-  /*
-  print_shorts256("ytmp4",(int16_t*)(ytmp+4));
-  print_shorts256("ytmp5",(int16_t*)(ytmp+5));
-  print_shorts256("ytmp6",(int16_t*)(ytmp+6));
-  print_shorts256("ytmp7",(int16_t*)(ytmp+7));
-  */
-#ifdef D64STATS
-  stop_meas(&ts_d);
-  start_meas(&ts_b);
-#endif
-
-
-  bfly4_16_256(ytmp,ytmp+2,ytmp+4,ytmp+6,
-	       y256,y256+2,y256+4,y256+6,
-	       tw64a_256,tw64a_256+2,tw64a_256+4,
-	       tw64b_256,tw64b_256+2,tw64b_256+4);
-  // [y0  y1  y2  y3  y4  y5  y6  y7]
-  // [y16 y17 y18 y19 y20 y21 y22 y23]
-  // [y32 y33 y34 y35 y36 y37 y38 y39]
-  // [y48 y49 y50 y51 y52 y53 y54 y55]
-
-  bfly4_16_256(ytmp+1,ytmp+3,ytmp+5,ytmp+7,
-	       y256+1,y256+3,y256+5,y256+7,
-	       tw64a_256+1,tw64a_256+3,tw64a_256+5,
-	       tw64b_256+1,tw64b_256+3,tw64b_256+5);
-  // [y8  y9  y10 y11 y12 y13 y14 y15]
-  // [y24 y25 y26 y27 y28 y29 y30 y31]
-  // [y40 y41 y42 y43 y44 y45 y46 y47]
-  // [y56 y57 y58 y59 y60 y61 y62 y63]
-  /*  
-  print_shorts256("y256_0",(int16_t*)&y256[0]);
-  print_shorts256("y256_1",(int16_t*)&y256[1]);
-  print_shorts256("y256_2",(int16_t*)&y256[2]);
-  print_shorts256("y256_3",(int16_t*)&y256[3]);
-  print_shorts256("y256_4",(int16_t*)&y256[4]);
-  print_shorts256("y256_5",(int16_t*)&y256[5]);
-  print_shorts256("y256_6",(int16_t*)&y256[6]);
-  print_shorts256("y256_7",(int16_t*)&y256[7]);
-  */
-
-#ifdef D64STATS
-  stop_meas(&ts_b);
-  printf("t: %lld cycles, d: %lld cycles, b: %lld cycles\n",ts_t.diff, ts_d.diff, ts_b.diff);
-#endif
-
-
-  if (scale>0) {
-    y256[0] = shiftright_int16_simd256(y256[0], 1);
-    y256[1] = shiftright_int16_simd256(y256[1], 1);
-    y256[2] = shiftright_int16_simd256(y256[2], 1);
-    y256[3] = shiftright_int16_simd256(y256[3], 1);
-    y256[4] = shiftright_int16_simd256(y256[4], 1);
-    y256[5] = shiftright_int16_simd256(y256[5], 1);
-    y256[6] = shiftright_int16_simd256(y256[6], 1);
-    y256[7] = shiftright_int16_simd256(y256[7], 1);
-  }
-
-}
-
-void idft64(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[16],ytmp[16],*tw64a_256=(simd256_q15_t *)tw64,*tw64b_256=(simd256_q15_t *)tw64c,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y;
-  register simd256_q15_t xintl0,xintl1,xintl2,xintl3,xintl4,xintl5,xintl6,xintl7;
-  simd256_q15_t const perm_mask = simde_mm256_set_epi32(7, 3, 5, 1, 6, 2, 4, 0);
-
-
-#ifdef D64STATS
-  time_stats_t ts_t,ts_d,ts_b;
-
-  reset_meas(&ts_t);
-  reset_meas(&ts_d);
-  reset_meas(&ts_b);
-  start_meas(&ts_t);
-#endif
-
-#ifdef D64STATS
-  stop_meas(&ts_t);
-  start_meas(&ts_d);
-#endif
-
-  xintl0 = simde_mm256_permutevar8x32_epi32(x256[0],perm_mask);  // x0  x4  x1  x5  x2  x6  x3  x7
-  xintl1 = simde_mm256_permutevar8x32_epi32(x256[1],perm_mask);  // x8  x12 x9  x13 x10 x14 x11 x15
-  xintl2 = simde_mm256_permutevar8x32_epi32(x256[2],perm_mask);  // x16 x20 x17 x21 x18 x22 x19 x23
-  xintl3 = simde_mm256_permutevar8x32_epi32(x256[3],perm_mask);  // x24 x28 x25 x29 x26 x30 x27 x31
-  xintl4 = simde_mm256_permutevar8x32_epi32(x256[4],perm_mask);  // x24 x28 x25 x29 x26 x30 x27 x31
-  xintl5 = simde_mm256_permutevar8x32_epi32(x256[5],perm_mask);  // x24 x28 x25 x29 x26 x30 x27 x31
-  xintl6 = simde_mm256_permutevar8x32_epi32(x256[6],perm_mask);  // x24 x28 x25 x29 x26 x30 x27 x31
-  xintl7 = simde_mm256_permutevar8x32_epi32(x256[7],perm_mask);  // x24 x28 x25 x29 x26 x30 x27 x31
-
-  xtmp[0] = simde_mm256_unpacklo_epi64(xintl0,xintl1);        // x0  x4  x8  x12 x1  x5  x9  x13
-  xtmp[4] = simde_mm256_unpackhi_epi64(xintl0,xintl1);        // x2  x6  x10 x14 x3  x7  x11 x15
-  xtmp[1] = simde_mm256_unpacklo_epi64(xintl2,xintl3);        // x16 x20 x24 x28 x17 x21 x25 x29
-  xtmp[5] = simde_mm256_unpackhi_epi64(xintl2,xintl3);        // x18 x22 x26 x30 x19 x23 x27 x31
-  xtmp[2] = simde_mm256_unpacklo_epi64(xintl4,xintl5);        // x32 x36 x40 x44 x33 x37 x41 x45
-  xtmp[6] = simde_mm256_unpackhi_epi64(xintl4,xintl5);        // x34 x38 x42 x46 x35 x39 x43 x47
-  xtmp[3] = simde_mm256_unpacklo_epi64(xintl6,xintl7);        // x48 x52 x56 x60 x49 x53 x57 x61
-  xtmp[7] = simde_mm256_unpackhi_epi64(xintl6,xintl7);        // x50 x54 x58 x62 x51 x55 x59 x63
-
-
-  idft16_simd256((int16_t*)(xtmp),(int16_t*)ytmp);
-  // [y0  y1  y2  y3  y16 y17 y18 y19]
-  // [y4  y5  y6  y7  y20 y21 y22 y23]
-  // [y8  y9  y10 y11 y24 y25 y26 y27]
-  // [y12 y13 y14 y15 y28 y29 y30 y31]
-
-  idft16_simd256((int16_t*)(xtmp+4),(int16_t*)(ytmp+4));
-  // [y32 y33 y34 y35 y48 y49 y50 y51]
-  // [y36 y37 y38 y39 y52 y53 y54 y55]
-  // [y40 y41 y42 y43 y56 y57 y58 y59]
-  // [y44 y45 y46 y47 y60 y61 y62 y63]
-
-#ifdef D64STATS
-  stop_meas(&ts_d);
-  start_meas(&ts_b);
-#endif
-
-
-  ibfly4_16_256(ytmp,ytmp+2,ytmp+4,ytmp+6,
-		y256,y256+2,y256+4,y256+6,
-		tw64a_256,tw64a_256+2,tw64a_256+4,
-		tw64b_256,tw64b_256+2,tw64b_256+4);
-  // [y0  y1  y2  y3  y4  y5  y6  y7]
-  // [y16 y17 y18 y19 y20 y21 y22 y23]
-  // [y32 y33 y34 y35 y36 y37 y38 y39]
-  // [y48 y49 y50 y51 y52 y53 y54 y55]
-
-  ibfly4_16_256(ytmp+1,ytmp+3,ytmp+5,ytmp+7,
-		y256+1,y256+3,y256+5,y256+7,
-		tw64a_256+1,tw64a_256+3,tw64a_256+5,
-		tw64b_256+1,tw64b_256+3,tw64b_256+5);
-  // [y8  y9  y10 y11 y12 y13 y14 y15]
-  // [y24 y25 y26 y27 y28 y29 y30 y31]
-  // [y40 y41 y42 y43 y44 y45 y46 y47]
-  // [y56 y57 y58 y59 y60 y61 y62 y63]
-
-
-#ifdef D64STATS
-  stop_meas(&ts_b);
-  printf("t: %lld cycles, d: %lld cycles, b: %lld cycles\n", ts_t.diff, ts_d.diff, ts_b.diff);
-#endif
-
-
-  if (scale>0) {
-    y256[0]  = shiftright_int16_simd256(y256[0],3);
-    y256[1]  = shiftright_int16_simd256(y256[1],3);
-    y256[2]  = shiftright_int16_simd256(y256[2],3);
-    y256[3]  = shiftright_int16_simd256(y256[3],3);
-    y256[4]  = shiftright_int16_simd256(y256[4],3);
-    y256[5]  = shiftright_int16_simd256(y256[5],3);
-    y256[6]  = shiftright_int16_simd256(y256[6],3);
-    y256[7]  = shiftright_int16_simd256(y256[7],3);
-  }
-
-}
-
-static const int16_t tw128[128] __attribute__((aligned(32))) = {  32767,0,32727,-1608,32609,-3212,32412,-4808,32137,-6393,31785,-7962,31356,-9512,30851,-11039,30272,-12540,29621,-14010,28897,-15447,28105,-16846,27244,-18205,26318,-19520,25329,-20788,24278,-22005,23169,-23170,22004,-24279,20787,-25330,19519,-26319,18204,-27245,16845,-28106,15446,-28898,14009,-29622,12539,-30273,11038,-30852,9511,-31357,7961,-31786,6392,-32138,4807,-32413,3211,-32610,1607,-32728,0,-32767,-1608,-32728,-3212,-32610,-4808,-32413,-6393,-32138,-7962,-31786,-9512,-31357,-11039,-30852,-12540,-30273,-14010,-29622,-15447,-28898,-16846,-28106,-18205,-27245,-19520,-26319,-20788,-25330,-22005,-24279,-23170,-23170,-24279,-22005,-25330,-20788,-26319,-19520,-27245,-18205,-28106,-16846,-28898,-15447,-29622,-14010,-30273,-12540,-30852,-11039,-31357,-9512,-31786,-7962,-32138,-6393,-32413,-4808,-32610,-3212,-32728,-1608};
-
-static const int16_t tw128a[128] __attribute__((aligned(32))) = { 32767,0,32727,1608,32609,3212,32412,4808,32137,6393,31785,7962,31356,9512,30851,11039,30272,12540,29621,14010,28897,15447,28105,16846,27244,18205,26318,19520,25329,20788,24278,22005,23169,23170,22004,24279,20787,25330,19519,26319,18204,27245,16845,28106,15446,28898,14009,29622,12539,30273,11038,30852,9511,31357,7961,31786,6392,32138,4807,32413,3211,32610,1607,32728,0,32767,-1608,32728,-3212,32610,-4808,32413,-6393,32138,-7962,31786,-9512,31357,-11039,30852,-12540,30273,-14010,29622,-15447,28898,-16846,28106,-18205,27245,-19520,26319,-20788,25330,-22005,24279,-23170,23170,-24279,22005,-25330,20788,-26319,19520,-27245,18205,-28106,16846,-28898,15447,-29622,14010,-30273,12540,-30852,11039,-31357,9512,-31786,7962,-32138,6393,-32413,4808,-32610,3212,-32728,1608};
-
-static const int16_t tw128b[128] __attribute__((aligned(32))) = {0,32767,-1608,32727,-3212,32609,-4808,32412,-6393,32137,-7962,31785,-9512,31356,-11039,30851,-12540,30272,-14010,29621,-15447,28897,-16846,28105,-18205,27244,-19520,26318,-20788,25329,-22005,24278,-23170,23169,-24279,22004,-25330,20787,-26319,19519,-27245,18204,-28106,16845,-28898,15446,-29622,14009,-30273,12539,-30852,11038,-31357,9511,-31786,7961,-32138,6392,-32413,4807,-32610,3211,-32728,1607,-32767,0,-32728,-1608,-32610,-3212,-32413,-4808,-32138,-6393,-31786,-7962,-31357,-9512,-30852,-11039,-30273,-12540,-29622,-14010,-28898,-15447,-28106,-16846,-27245,-18205,-26319,-19520,-25330,-20788,-24279,-22005,-23170,-23170,-22005,-24279,-20788,-25330,-19520,-26319,-18205,-27245,-16846,-28106,-15447,-28898,-14010,-29622,-12540,-30273,-11039,-30852,-9512,-31357,-7962,-31786,-6393,-32138,-4808,-32413,-3212,-32610,-1608,-32728};
-
-void dft128(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[16],*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[16],*y256=(simd256_q15_t*)y;
-  simd256_q15_t *tw128a_256p=(simd256_q15_t *)tw128a,*tw128b_256p=(simd256_q15_t *)tw128b,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_256 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-
-  transpose4_ooff_simd256(x256  ,xtmp,8);
-  transpose4_ooff_simd256(x256+2,xtmp+1,8);
-  transpose4_ooff_simd256(x256+4,xtmp+2,8);
-  transpose4_ooff_simd256(x256+6,xtmp+3,8);
-  transpose4_ooff_simd256(x256+8,xtmp+4,8);
-  transpose4_ooff_simd256(x256+10,xtmp+5,8);
-  transpose4_ooff_simd256(x256+12,xtmp+6,8);
-  transpose4_ooff_simd256(x256+14,xtmp+7,8);
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {  
-     LOG_M("dft128ina_256.m","dftina",xtmp,64,1,1);
-     LOG_M("dft128inb_256.m","dftinb",xtmp+8,64,1,1);
-  }
-#endif
-  dft64((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  dft64((int16_t*)(xtmp+8),(int16_t*)(ytmp+8),1);
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {  
-    LOG_M("dft128outa_256.m","dftouta",ytmp,64,1,1);
-    LOG_M("dft128outb_256.m","dftoutb",ytmp+8,64,1,1);
-  }
-#endif
-  for (i=0; i<8; i++) {
-    bfly2_16_256(ytmpp,ytmpp+8,
-		 y256p,y256p+8,
-		 tw128a_256p,
-		 tw128b_256p);
-    tw128a_256p++;
-    tw128b_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    y256[0] = mulhi_int16_simd256(y256[0],ONE_OVER_SQRT2_Q15_256);
-    y256[1] = mulhi_int16_simd256(y256[1],ONE_OVER_SQRT2_Q15_256);
-    y256[2] = mulhi_int16_simd256(y256[2],ONE_OVER_SQRT2_Q15_256);
-    y256[3] = mulhi_int16_simd256(y256[3],ONE_OVER_SQRT2_Q15_256);
-    y256[4] = mulhi_int16_simd256(y256[4],ONE_OVER_SQRT2_Q15_256);
-    y256[5] = mulhi_int16_simd256(y256[5],ONE_OVER_SQRT2_Q15_256);
-    y256[6] = mulhi_int16_simd256(y256[6],ONE_OVER_SQRT2_Q15_256);
-    y256[7] = mulhi_int16_simd256(y256[7],ONE_OVER_SQRT2_Q15_256);
-    y256[8] = mulhi_int16_simd256(y256[8],ONE_OVER_SQRT2_Q15_256);
-    y256[9] = mulhi_int16_simd256(y256[9],ONE_OVER_SQRT2_Q15_256);
-    y256[10] = mulhi_int16_simd256(y256[10],ONE_OVER_SQRT2_Q15_256);
-    y256[11] = mulhi_int16_simd256(y256[11],ONE_OVER_SQRT2_Q15_256);
-    y256[12] = mulhi_int16_simd256(y256[12],ONE_OVER_SQRT2_Q15_256);
-    y256[13] = mulhi_int16_simd256(y256[13],ONE_OVER_SQRT2_Q15_256);
-    y256[14] = mulhi_int16_simd256(y256[14],ONE_OVER_SQRT2_Q15_256);
-    y256[15] = mulhi_int16_simd256(y256[15],ONE_OVER_SQRT2_Q15_256);
-
-  }
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {  
-   LOG_M("dft128.m","dft",y256,128,1,1);
-   exit(-1);
-  }
-#endif
-}
-
-void idft128(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[16],*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[16],*y256=(simd256_q15_t*)y;
-  simd256_q15_t *tw128_256p=(simd256_q15_t *)tw128,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_256 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-
-
-  transpose4_ooff_simd256(x256  ,xtmp,8);
-  transpose4_ooff_simd256(x256+2,xtmp+1,8);
-  transpose4_ooff_simd256(x256+4,xtmp+2,8);
-  transpose4_ooff_simd256(x256+6,xtmp+3,8);
-  transpose4_ooff_simd256(x256+8,xtmp+4,8);
-  transpose4_ooff_simd256(x256+10,xtmp+5,8);
-  transpose4_ooff_simd256(x256+12,xtmp+6,8);
-  transpose4_ooff_simd256(x256+14,xtmp+7,8);
-
-  idft64((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  idft64((int16_t*)(xtmp+8),(int16_t*)(ytmp+8),1);
-
-
-  for (i=0; i<8; i++) {
-    ibfly2_256(ytmpp,ytmpp+8,
-	       y256p,y256p+8,
-	       tw128_256p);
-    tw128_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    y256[0] = mulhi_int16_simd256(y256[0],ONE_OVER_SQRT2_Q15_256);
-    y256[1] = mulhi_int16_simd256(y256[1],ONE_OVER_SQRT2_Q15_256);
-    y256[2] = mulhi_int16_simd256(y256[2],ONE_OVER_SQRT2_Q15_256);
-    y256[3] = mulhi_int16_simd256(y256[3],ONE_OVER_SQRT2_Q15_256);
-    y256[4] = mulhi_int16_simd256(y256[4],ONE_OVER_SQRT2_Q15_256);
-    y256[5] = mulhi_int16_simd256(y256[5],ONE_OVER_SQRT2_Q15_256);
-    y256[6] = mulhi_int16_simd256(y256[6],ONE_OVER_SQRT2_Q15_256);
-    y256[7] = mulhi_int16_simd256(y256[7],ONE_OVER_SQRT2_Q15_256);
-    y256[8] = mulhi_int16_simd256(y256[8],ONE_OVER_SQRT2_Q15_256);
-    y256[9] = mulhi_int16_simd256(y256[9],ONE_OVER_SQRT2_Q15_256);
-    y256[10] = mulhi_int16_simd256(y256[10],ONE_OVER_SQRT2_Q15_256);
-    y256[11] = mulhi_int16_simd256(y256[11],ONE_OVER_SQRT2_Q15_256);
-    y256[12] = mulhi_int16_simd256(y256[12],ONE_OVER_SQRT2_Q15_256);
-    y256[13] = mulhi_int16_simd256(y256[13],ONE_OVER_SQRT2_Q15_256);
-    y256[14] = mulhi_int16_simd256(y256[14],ONE_OVER_SQRT2_Q15_256);
-    y256[15] = mulhi_int16_simd256(y256[15],ONE_OVER_SQRT2_Q15_256);
-
-  }
-
-}
-
-static const int16_t tw256[384] __attribute__((aligned(32))) = {  32767,0,32757,-805,32727,-1608,32678,-2411,32609,-3212,32520,-4012,32412,-4808,32284,-5602,32137,-6393,31970,-7180,31785,-7962,31580,-8740,31356,-9512,31113,-10279,30851,-11039,30571,-11793,30272,-12540,29955,-13279,29621,-14010,29268,-14733,28897,-15447,28510,-16151,28105,-16846,27683,-17531,27244,-18205,26789,-18868,26318,-19520,25831,-20160,25329,-20788,24811,-21403,24278,-22005,23731,-22595,23169,-23170,22594,-23732,22004,-24279,21402,-24812,20787,-25330,20159,-25832,19519,-26319,18867,-26790,18204,-27245,17530,-27684,16845,-28106,16150,-28511,15446,-28898,14732,-29269,14009,-29622,13278,-29956,12539,-30273,11792,-30572,11038,-30852,10278,-31114,9511,-31357,8739,-31581,7961,-31786,7179,-31971,6392,-32138,5601,-32285,4807,-32413,4011,-32521,3211,-32610,2410,-32679,1607,-32728,804,-32758,
-                                                     32767,0,32727,-1608,32609,-3212,32412,-4808,32137,-6393,31785,-7962,31356,-9512,30851,-11039,30272,-12540,29621,-14010,28897,-15447,28105,-16846,27244,-18205,26318,-19520,25329,-20788,24278,-22005,23169,-23170,22004,-24279,20787,-25330,19519,-26319,18204,-27245,16845,-28106,15446,-28898,14009,-29622,12539,-30273,11038,-30852,9511,-31357,7961,-31786,6392,-32138,4807,-32413,3211,-32610,1607,-32728,0,-32767,-1608,-32728,-3212,-32610,-4808,-32413,-6393,-32138,-7962,-31786,-9512,-31357,-11039,-30852,-12540,-30273,-14010,-29622,-15447,-28898,-16846,-28106,-18205,-27245,-19520,-26319,-20788,-25330,-22005,-24279,-23170,-23170,-24279,-22005,-25330,-20788,-26319,-19520,-27245,-18205,-28106,-16846,-28898,-15447,-29622,-14010,-30273,-12540,-30852,-11039,-31357,-9512,-31786,-7962,-32138,-6393,-32413,-4808,-32610,-3212,-32728,-1608,
-                                                     32767,0,32678,-2411,32412,-4808,31970,-7180,31356,-9512,30571,-11793,29621,-14010,28510,-16151,27244,-18205,25831,-20160,24278,-22005,22594,-23732,20787,-25330,18867,-26790,16845,-28106,14732,-29269,12539,-30273,10278,-31114,7961,-31786,5601,-32285,3211,-32610,804,-32758,-1608,-32728,-4012,-32521,-6393,-32138,-8740,-31581,-11039,-30852,-13279,-29956,-15447,-28898,-17531,-27684,-19520,-26319,-21403,-24812,-23170,-23170,-24812,-21403,-26319,-19520,-27684,-17531,-28898,-15447,-29956,-13279,-30852,-11039,-31581,-8740,-32138,-6393,-32521,-4012,-32728,-1608,-32758,804,-32610,3211,-32285,5601,-31786,7961,-31114,10278,-30273,12539,-29269,14732,-28106,16845,-26790,18867,-25330,20787,-23732,22594,-22005,24278,-20160,25831,-18205,27244,-16151,28510,-14010,29621,-11793,30571,-9512,31356,-7180,31970,-4808,32412,-2411,32678
-                                                  };
-
-static const int16_t tw256a[384] __attribute__((aligned(32))) = { 32767,0,32757,804,32727,1607,32678,2410,32609,3211,32520,4011,32412,4807,32284,5601,32137,6392,31970,7179,31785,7961,31580,8739,31356,9511,31113,10278,30851,11038,30571,11792,30272,12539,29955,13278,29621,14009,29268,14732,28897,15446,28510,16150,28105,16845,27683,17530,27244,18204,26789,18867,26318,19519,25831,20159,25329,20787,24811,21402,24278,22004,23731,22594,23169,23169,22594,23731,22004,24278,21402,24811,20787,25329,20159,25831,19519,26318,18867,26789,18204,27244,17530,27683,16845,28105,16150,28510,15446,28897,14732,29268,14009,29621,13278,29955,12539,30272,11792,30571,11038,30851,10278,31113,9511,31356,8739,31580,7961,31785,7179,31970,6392,32137,5601,32284,4807,32412,4011,32520,3211,32609,2410,32678,1607,32727,804,32757,
-                                                     32767,0,32727,1607,32609,3211,32412,4807,32137,6392,31785,7961,31356,9511,30851,11038,30272,12539,29621,14009,28897,15446,28105,16845,27244,18204,26318,19519,25329,20787,24278,22004,23169,23169,22004,24278,20787,25329,19519,26318,18204,27244,16845,28105,15446,28897,14009,29621,12539,30272,11038,30851,9511,31356,7961,31785,6392,32137,4807,32412,3211,32609,1607,32727,0,32767,-1608,32727,-3212,32609,-4808,32412,-6393,32137,-7962,31785,-9512,31356,-11039,30851,-12540,30272,-14010,29621,-15447,28897,-16846,28105,-18205,27244,-19520,26318,-20788,25329,-22005,24278,-23170,23169,-24279,22004,-25330,20787,-26319,19519,-27245,18204,-28106,16845,-28898,15446,-29622,14009,-30273,12539,-30852,11038,-31357,9511,-31786,7961,-32138,6392,-32413,4807,-32610,3211,-32728,1607,
-                                                     32767,0,32678,2410,32412,4807,31970,7179,31356,9511,30571,11792,29621,14009,28510,16150,27244,18204,25831,20159,24278,22004,22594,23731,20787,25329,18867,26789,16845,28105,14732,29268,12539,30272,10278,31113,7961,31785,5601,32284,3211,32609,804,32757,-1608,32727,-4012,32520,-6393,32137,-8740,31580,-11039,30851,-13279,29955,-15447,28897,-17531,27683,-19520,26318,-21403,24811,-23170,23169,-24812,21402,-26319,19519,-27684,17530,-28898,15446,-29956,13278,-30852,11038,-31581,8739,-32138,6392,-32521,4011,-32728,1607,-32758,-805,-32610,-3212,-32285,-5602,-31786,-7962,-31114,-10279,-30273,-12540,-29269,-14733,-28106,-16846,-26790,-18868,-25330,-20788,-23732,-22595,-22005,-24279,-20160,-25832,-18205,-27245,-16151,-28511,-14010,-29622,-11793,-30572,-9512,-31357,-7180,-31971,-4808,-32413,-2411,-32679
-                                                   };
-
-static const int16_t tw256b[384] __attribute__((aligned(32))) = {0,32767,-805,32757,-1608,32727,-2411,32678,-3212,32609,-4012,32520,-4808,32412,-5602,32284,-6393,32137,-7180,31970,-7962,31785,-8740,31580,-9512,31356,-10279,31113,-11039,30851,-11793,30571,-12540,30272,-13279,29955,-14010,29621,-14733,29268,-15447,28897,-16151,28510,-16846,28105,-17531,27683,-18205,27244,-18868,26789,-19520,26318,-20160,25831,-20788,25329,-21403,24811,-22005,24278,-22595,23731,-23170,23169,-23732,22594,-24279,22004,-24812,21402,-25330,20787,-25832,20159,-26319,19519,-26790,18867,-27245,18204,-27684,17530,-28106,16845,-28511,16150,-28898,15446,-29269,14732,-29622,14009,-29956,13278,-30273,12539,-30572,11792,-30852,11038,-31114,10278,-31357,9511,-31581,8739,-31786,7961,-31971,7179,-32138,6392,-32285,5601,-32413,4807,-32521,4011,-32610,3211,-32679,2410,-32728,1607,-32758,804,
-                                                    0,32767,-1608,32727,-3212,32609,-4808,32412,-6393,32137,-7962,31785,-9512,31356,-11039,30851,-12540,30272,-14010,29621,-15447,28897,-16846,28105,-18205,27244,-19520,26318,-20788,25329,-22005,24278,-23170,23169,-24279,22004,-25330,20787,-26319,19519,-27245,18204,-28106,16845,-28898,15446,-29622,14009,-30273,12539,-30852,11038,-31357,9511,-31786,7961,-32138,6392,-32413,4807,-32610,3211,-32728,1607,-32767,0,-32728,-1608,-32610,-3212,-32413,-4808,-32138,-6393,-31786,-7962,-31357,-9512,-30852,-11039,-30273,-12540,-29622,-14010,-28898,-15447,-28106,-16846,-27245,-18205,-26319,-19520,-25330,-20788,-24279,-22005,-23170,-23170,-22005,-24279,-20788,-25330,-19520,-26319,-18205,-27245,-16846,-28106,-15447,-28898,-14010,-29622,-12540,-30273,-11039,-30852,-9512,-31357,-7962,-31786,-6393,-32138,-4808,-32413,-3212,-32610,-1608,-32728,
-                                                    0,32767,-2411,32678,-4808,32412,-7180,31970,-9512,31356,-11793,30571,-14010,29621,-16151,28510,-18205,27244,-20160,25831,-22005,24278,-23732,22594,-25330,20787,-26790,18867,-28106,16845,-29269,14732,-30273,12539,-31114,10278,-31786,7961,-32285,5601,-32610,3211,-32758,804,-32728,-1608,-32521,-4012,-32138,-6393,-31581,-8740,-30852,-11039,-29956,-13279,-28898,-15447,-27684,-17531,-26319,-19520,-24812,-21403,-23170,-23170,-21403,-24812,-19520,-26319,-17531,-27684,-15447,-28898,-13279,-29956,-11039,-30852,-8740,-31581,-6393,-32138,-4012,-32521,-1608,-32728,804,-32758,3211,-32610,5601,-32285,7961,-31786,10278,-31114,12539,-30273,14732,-29269,16845,-28106,18867,-26790,20787,-25330,22594,-23732,24278,-22005,25831,-20160,27244,-18205,28510,-16151,29621,-14010,30571,-11793,31356,-9512,31970,-7180,32412,-4808,32678,-2411
-                                                   };
-void dft256(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[32],ytmp[32],*tw256a_256p=(simd256_q15_t *)tw256a,*tw256b_256p=(simd256_q15_t *)tw256b,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-
-  transpose16_ooff_simd256(x256+0,xtmp+0,8);
-  transpose16_ooff_simd256(x256+4,xtmp+1,8);
-  transpose16_ooff_simd256(x256+8,xtmp+2,8);
-  transpose16_ooff_simd256(x256+12,xtmp+3,8);
-  transpose16_ooff_simd256(x256+16,xtmp+4,8);
-  transpose16_ooff_simd256(x256+20,xtmp+5,8);
-  transpose16_ooff_simd256(x256+24,xtmp+6,8);
-  transpose16_ooff_simd256(x256+28,xtmp+7,8);
-  /*
-  char vname[10];
-  for (i=0;i<32;i++) {
-    sprintf(vname,"xtmp%d",i);
-    print_shorts256(vname,(int16_t*)(xtmp+i));
-  }
-  exit(-1);*/
-
-  dft64((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  dft64((int16_t*)(xtmp+8),(int16_t*)(ytmp+8),1);
-  dft64((int16_t*)(xtmp+16),(int16_t*)(ytmp+16),1);
-  dft64((int16_t*)(xtmp+24),(int16_t*)(ytmp+24),1);
-
-
-  bfly4_16_256(ytmpp,ytmpp+8,ytmpp+16,ytmpp+24,
-	       y256p,y256p+8,y256p+16,y256p+24,
-	       tw256a_256p,tw256a_256p+8,tw256a_256p+16,
-	       tw256b_256p,tw256b_256p+8,tw256b_256p+16);
-  bfly4_16_256(ytmpp+1,ytmpp+9,ytmpp+17,ytmpp+25,
-	       y256p+1,y256p+9,y256p+17,y256p+25,
-	       tw256a_256p+1,tw256a_256p+9,tw256a_256p+17,
-	       tw256b_256p+1,tw256b_256p+9,tw256b_256p+17);
-  bfly4_16_256(ytmpp+2,ytmpp+10,ytmpp+18,ytmpp+26,
-	       y256p+2,y256p+10,y256p+18,y256p+26,
-	       tw256a_256p+2,tw256a_256p+10,tw256a_256p+18,
-	       tw256b_256p+2,tw256b_256p+10,tw256b_256p+18);
-  bfly4_16_256(ytmpp+3,ytmpp+11,ytmpp+19,ytmpp+27,
-	       y256p+3,y256p+11,y256p+19,y256p+27,
-	       tw256a_256p+3,tw256a_256p+11,tw256a_256p+19,
-	       tw256b_256p+3,tw256b_256p+11,tw256b_256p+19);
-  bfly4_16_256(ytmpp+4,ytmpp+12,ytmpp+20,ytmpp+28,
-	       y256p+4,y256p+12,y256p+20,y256p+28,
-	       tw256a_256p+4,tw256a_256p+12,tw256a_256p+20,
-	       tw256b_256p+4,tw256b_256p+12,tw256b_256p+20);
-  bfly4_16_256(ytmpp+5,ytmpp+13,ytmpp+21,ytmpp+29,
-	       y256p+5,y256p+13,y256p+21,y256p+29,
-	       tw256a_256p+5,tw256a_256p+13,tw256a_256p+21,
-	       tw256b_256p+5,tw256b_256p+13,tw256b_256p+21);
-  bfly4_16_256(ytmpp+6,ytmpp+14,ytmpp+22,ytmpp+30,
-	       y256p+6,y256p+14,y256p+22,y256p+30,
-	       tw256a_256p+6,tw256a_256p+14,tw256a_256p+22,
-	       tw256b_256p+6,tw256b_256p+14,tw256b_256p+22);
-  bfly4_16_256(ytmpp+7,ytmpp+15,ytmpp+23,ytmpp+31,
-	       y256p+7,y256p+15,y256p+23,y256p+31,
-	       tw256a_256p+7,tw256a_256p+15,tw256a_256p+23,
-	       tw256b_256p+7,tw256b_256p+15,tw256b_256p+23);
-
-  if (scale>0) {
-
-    for (i=0; i<2; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
-
-void idft256(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[32],ytmp[32],*tw256_256p=(simd256_q15_t *)tw256,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-
-  transpose16_ooff_simd256(x256+0,xtmp+0,8);
-  transpose16_ooff_simd256(x256+4,xtmp+1,8);
-  transpose16_ooff_simd256(x256+8,xtmp+2,8);
-  transpose16_ooff_simd256(x256+12,xtmp+3,8);
-  transpose16_ooff_simd256(x256+16,xtmp+4,8);
-  transpose16_ooff_simd256(x256+20,xtmp+5,8);
-  transpose16_ooff_simd256(x256+24,xtmp+6,8);
-  transpose16_ooff_simd256(x256+28,xtmp+7,8);
-  
-  idft64((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  idft64((int16_t*)(xtmp+8),(int16_t*)(ytmp+8),1);
-  idft64((int16_t*)(xtmp+16),(int16_t*)(ytmp+16),1);
-  idft64((int16_t*)(xtmp+24),(int16_t*)(ytmp+24),1);
-  
-  
-  ibfly4_256(ytmpp,ytmpp+8,ytmpp+16,ytmpp+24,
-	     y256p,y256p+8,y256p+16,y256p+24,
-	     tw256_256p,tw256_256p+8,tw256_256p+16);
-
-  ibfly4_256(ytmpp+1,ytmpp+9,ytmpp+17,ytmpp+25,
-	     y256p+1,y256p+9,y256p+17,y256p+25,
-	     tw256_256p+1,tw256_256p+9,tw256_256p+17);
-
-  ibfly4_256(ytmpp+2,ytmpp+10,ytmpp+18,ytmpp+26,
-	     y256p+2,y256p+10,y256p+18,y256p+26,
-	     tw256_256p+2,tw256_256p+10,tw256_256p+18);
-
-  ibfly4_256(ytmpp+3,ytmpp+11,ytmpp+19,ytmpp+27,
-	     y256p+3,y256p+11,y256p+19,y256p+27,
-	     tw256_256p+3,tw256_256p+11,tw256_256p+19);
-
-  ibfly4_256(ytmpp+4,ytmpp+12,ytmpp+20,ytmpp+28,
-	     y256p+4,y256p+12,y256p+20,y256p+28,
-	     tw256_256p+4,tw256_256p+12,tw256_256p+20);
-
-  ibfly4_256(ytmpp+5,ytmpp+13,ytmpp+21,ytmpp+29,
-	     y256p+5,y256p+13,y256p+21,y256p+29,
-	     tw256_256p+5,tw256_256p+13,tw256_256p+21);
-
-  ibfly4_256(ytmpp+6,ytmpp+14,ytmpp+22,ytmpp+30,
-	     y256p+6,y256p+14,y256p+22,y256p+30,
-	     tw256_256p+6,tw256_256p+14,tw256_256p+22);
-
-  ibfly4_256(ytmpp+7,ytmpp+15,ytmpp+23,ytmpp+31,
-	     y256p+7,y256p+15,y256p+23,y256p+31,
-	     tw256_256p+7,tw256_256p+15,tw256_256p+23);
-
-  
-  if (scale>0) {
-
-    for (i=0; i<2; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
-
-static const int16_t tw512[512] __attribute__((aligned(32))) = {
-  32767,0,32764,-403,32757,-805,32744,-1207,32727,-1608,32705,-2010,32678,-2411,32646,-2812,32609,-3212,32567,-3612,32520,-4012,32468,-4410,32412,-4808,32350,-5206,32284,-5602,32213,-5998,32137,-6393,32056,-6787,31970,-7180,31880,-7572,31785,-7962,31684,-8352,31580,-8740,31470,-9127,31356,-9512,31236,-9896,31113,-10279,30984,-10660,30851,-11039,30713,-11417,30571,-11793,30424,-12167,30272,-12540,30116,-12910,29955,-13279,29790,-13646,29621,-14010,29446,-14373,29268,-14733,29085,-15091,28897,-15447,28706,-15800,28510,-16151,28309,-16500,28105,-16846,27896,-17190,27683,-17531,27466,-17869,27244,-18205,27019,-18538,26789,-18868,26556,-19195,26318,-19520,26077,-19841,25831,-20160,25582,-20475,25329,-20788,25072,-21097,24811,-21403,24546,-21706,24278,-22005,24006,-22302,23731,-22595,23452,-22884,23169,-23170,22883,-23453,22594,-23732,22301,-24007,22004,-24279,21705,-24547,21402,-24812,21096,-25073,20787,-25330,20474,-25583,20159,-25832,19840,-26078,19519,-26319,19194,-26557,18867,-26790,18537,-27020,18204,-27245,17868,-27467,17530,-27684,17189,-27897,16845,-28106,16499,-28310,16150,-28511,15799,-28707,15446,-28898,15090,-29086,14732,-29269,14372,-29447,14009,-29622,13645,-29791,13278,-29956,12909,-30117,12539,-30273,12166,-30425,11792,-30572,11416,-30714,11038,-30852,10659,-30985,10278,-31114,9895,-31237,9511,-31357,9126,-31471,8739,-31581,8351,-31685,7961,-31786,7571,-31881,7179,-31971,6786,-32057,6392,-32138,5997,-32214,5601,-32285,5205,-32351,4807,-32413,4409,-32469,4011,-32521,3611,-32568,3211,-32610,2811,-32647,2410,-32679,2009,-32706,1607,-32728,1206,-32745,804,-32758,402,-32765,0,-32767,-403,-32765,-805,-32758,-1207,-32745,-1608,-32728,-2010,-32706,-2411,-32679,-2812,-32647,-3212,-32610,-3612,-32568,-4012,-32521,-4410,-32469,-4808,-32413,-5206,-32351,-5602,-32285,-5998,-32214,-6393,-32138,-6787,-32057,-7180,-31971,-7572,-31881,-7962,-31786,-8352,-31685,-8740,-31581,-9127,-31471,-9512,-31357,-9896,-31237,-10279,-31114,-10660,-30985,-11039,-30852,-11417,-30714,-11793,-30572,-12167,-30425,-12540,-30273,-12910,-30117,-13279,-29956,-13646,-29791,-14010,-29622,-14373,-29447,-14733,-29269,-15091,-29086,-15447,-28898,-15800,-28707,-16151,-28511,-16500,-28310,-16846,-28106,-17190,-27897,-17531,-27684,-17869,-27467,-18205,-27245,-18538,-27020,-18868,-26790,-19195,-26557,-19520,-26319,-19841,-26078,-20160,-25832,-20475,-25583,-20788,-25330,-21097,-25073,-21403,-24812,-21706,-24547,-22005,-24279,-22302,-24007,-22595,-23732,-22884,-23453,-23170,-23170,-23453,-22884,-23732,-22595,-24007,-22302,-24279,-22005,-24547,-21706,-24812,-21403,-25073,-21097,-25330,-20788,-25583,-20475,-25832,-20160,-26078,-19841,-26319,-19520,-26557,-19195,-26790,-18868,-27020,-18538,-27245,-18205,-27467,-17869,-27684,-17531,-27897,-17190,-28106,-16846,-28310,-16500,-28511,-16151,-28707,-15800,-28898,-15447,-29086,-15091,-29269,-14733,-29447,-14373,-29622,-14010,-29791,-13646,-29956,-13279,-30117,-12910,-30273,-12540,-30425,-12167,-30572,-11793,-30714,-11417,-30852,-11039,-30985,-10660,-31114,-10279,-31237,-9896,-31357,-9512,-31471,-9127,-31581,-8740,-31685,-8352,-31786,-7962,-31881,-7572,-31971,-7180,-32057,-6787,-32138,-6393,-32214,-5998,-32285,-5602,-32351,-5206,-32413,-4808,-32469,-4410,-32521,-4012,-32568,-3612,-32610,-3212,-32647,-2812,-32679,-2411,-32706,-2010,-32728,-1608,-32745,-1207,-32758,-805,-32765,-403
-};
-
-void dft512(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[64],*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[64],*y256=(simd256_q15_t*)y;
-  simd256_q15_t *tw512_256p=(simd256_q15_t*)tw512,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_256 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-
-
-  transpose4_ooff_simd256(x256  ,xtmp,32);
-  transpose4_ooff_simd256(x256+2,xtmp+1,32);
-  transpose4_ooff_simd256(x256+4,xtmp+2,32);
-  transpose4_ooff_simd256(x256+6,xtmp+3,32);
-  transpose4_ooff_simd256(x256+8,xtmp+4,32);
-  transpose4_ooff_simd256(x256+10,xtmp+5,32);
-  transpose4_ooff_simd256(x256+12,xtmp+6,32);
-  transpose4_ooff_simd256(x256+14,xtmp+7,32);
-  transpose4_ooff_simd256(x256+16,xtmp+8,32);
-  transpose4_ooff_simd256(x256+18,xtmp+9,32);
-  transpose4_ooff_simd256(x256+20,xtmp+10,32);
-  transpose4_ooff_simd256(x256+22,xtmp+11,32);
-  transpose4_ooff_simd256(x256+24,xtmp+12,32);
-  transpose4_ooff_simd256(x256+26,xtmp+13,32);
-  transpose4_ooff_simd256(x256+28,xtmp+14,32);
-  transpose4_ooff_simd256(x256+30,xtmp+15,32);
-  transpose4_ooff_simd256(x256+32,xtmp+16,32);
-  transpose4_ooff_simd256(x256+34,xtmp+17,32);
-  transpose4_ooff_simd256(x256+36,xtmp+18,32);
-  transpose4_ooff_simd256(x256+38,xtmp+19,32);
-  transpose4_ooff_simd256(x256+40,xtmp+20,32);
-  transpose4_ooff_simd256(x256+42,xtmp+21,32);
-  transpose4_ooff_simd256(x256+44,xtmp+22,32);
-  transpose4_ooff_simd256(x256+46,xtmp+23,32);
-  transpose4_ooff_simd256(x256+48,xtmp+24,32);
-  transpose4_ooff_simd256(x256+50,xtmp+25,32);
-  transpose4_ooff_simd256(x256+52,xtmp+26,32);
-  transpose4_ooff_simd256(x256+54,xtmp+27,32);
-  transpose4_ooff_simd256(x256+56,xtmp+28,32);
-  transpose4_ooff_simd256(x256+58,xtmp+29,32);
-  transpose4_ooff_simd256(x256+60,xtmp+30,32);
-  transpose4_ooff_simd256(x256+62,xtmp+31,32);
-
-  dft256((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  dft256((int16_t*)(xtmp+32),(int16_t*)(ytmp+32),1);
-
-
-  for (i=0; i<32; i++) {
-    bfly2_256(ytmpp,ytmpp+32,
-	      y256p,y256p+32,
-	      tw512_256p);
-    tw512_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0;i<4;i++) {
-      y256[0] = mulhi_int16_simd256(y256[0],ONE_OVER_SQRT2_Q15_256);
-      y256[1] = mulhi_int16_simd256(y256[1],ONE_OVER_SQRT2_Q15_256);
-      y256[2] = mulhi_int16_simd256(y256[2],ONE_OVER_SQRT2_Q15_256);
-      y256[3] = mulhi_int16_simd256(y256[3],ONE_OVER_SQRT2_Q15_256);
-      y256[4] = mulhi_int16_simd256(y256[4],ONE_OVER_SQRT2_Q15_256);
-      y256[5] = mulhi_int16_simd256(y256[5],ONE_OVER_SQRT2_Q15_256);
-      y256[6] = mulhi_int16_simd256(y256[6],ONE_OVER_SQRT2_Q15_256);
-      y256[7] = mulhi_int16_simd256(y256[7],ONE_OVER_SQRT2_Q15_256);
-      y256[8] = mulhi_int16_simd256(y256[8],ONE_OVER_SQRT2_Q15_256);
-      y256[9] = mulhi_int16_simd256(y256[9],ONE_OVER_SQRT2_Q15_256);
-      y256[10] = mulhi_int16_simd256(y256[10],ONE_OVER_SQRT2_Q15_256);
-      y256[11] = mulhi_int16_simd256(y256[11],ONE_OVER_SQRT2_Q15_256);
-      y256[12] = mulhi_int16_simd256(y256[12],ONE_OVER_SQRT2_Q15_256);
-      y256[13] = mulhi_int16_simd256(y256[13],ONE_OVER_SQRT2_Q15_256);
-      y256[14] = mulhi_int16_simd256(y256[14],ONE_OVER_SQRT2_Q15_256);
-      y256[15] = mulhi_int16_simd256(y256[15],ONE_OVER_SQRT2_Q15_256);
-      y256+=16;
-    }
-  }
-
-}
-
-void idft512(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[64],*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[64],*y256=(simd256_q15_t*)y;
-  simd256_q15_t *tw512_256p=(simd256_q15_t *)tw512,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_256 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-
-
-  transpose4_ooff_simd256(x256  ,xtmp,32);
-  transpose4_ooff_simd256(x256+2,xtmp+1,32);
-  transpose4_ooff_simd256(x256+4,xtmp+2,32);
-  transpose4_ooff_simd256(x256+6,xtmp+3,32);
-  transpose4_ooff_simd256(x256+8,xtmp+4,32);
-  transpose4_ooff_simd256(x256+10,xtmp+5,32);
-  transpose4_ooff_simd256(x256+12,xtmp+6,32);
-  transpose4_ooff_simd256(x256+14,xtmp+7,32);
-  transpose4_ooff_simd256(x256+16,xtmp+8,32);
-  transpose4_ooff_simd256(x256+18,xtmp+9,32);
-  transpose4_ooff_simd256(x256+20,xtmp+10,32);
-  transpose4_ooff_simd256(x256+22,xtmp+11,32);
-  transpose4_ooff_simd256(x256+24,xtmp+12,32);
-  transpose4_ooff_simd256(x256+26,xtmp+13,32);
-  transpose4_ooff_simd256(x256+28,xtmp+14,32);
-  transpose4_ooff_simd256(x256+30,xtmp+15,32);
-  transpose4_ooff_simd256(x256+32,xtmp+16,32);
-  transpose4_ooff_simd256(x256+34,xtmp+17,32);
-  transpose4_ooff_simd256(x256+36,xtmp+18,32);
-  transpose4_ooff_simd256(x256+38,xtmp+19,32);
-  transpose4_ooff_simd256(x256+40,xtmp+20,32);
-  transpose4_ooff_simd256(x256+42,xtmp+21,32);
-  transpose4_ooff_simd256(x256+44,xtmp+22,32);
-  transpose4_ooff_simd256(x256+46,xtmp+23,32);
-  transpose4_ooff_simd256(x256+48,xtmp+24,32);
-  transpose4_ooff_simd256(x256+50,xtmp+25,32);
-  transpose4_ooff_simd256(x256+52,xtmp+26,32);
-  transpose4_ooff_simd256(x256+54,xtmp+27,32);
-  transpose4_ooff_simd256(x256+56,xtmp+28,32);
-  transpose4_ooff_simd256(x256+58,xtmp+29,32);
-  transpose4_ooff_simd256(x256+60,xtmp+30,32);
-  transpose4_ooff_simd256(x256+62,xtmp+31,32);
-
-  idft256((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  idft256((int16_t*)(xtmp+32),(int16_t*)(ytmp+32),1);
-
-
-  for (i=0; i<32; i++) {
-    ibfly2_256(ytmpp,ytmpp+32,
-	       y256p,y256p+32,
-	       tw512_256p);
-    tw512_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0;i<4;i++) {
-      y256[0] = mulhi_int16_simd256(y256[0],ONE_OVER_SQRT2_Q15_256);
-      y256[1] = mulhi_int16_simd256(y256[1],ONE_OVER_SQRT2_Q15_256);
-      y256[2] = mulhi_int16_simd256(y256[2],ONE_OVER_SQRT2_Q15_256);
-      y256[3] = mulhi_int16_simd256(y256[3],ONE_OVER_SQRT2_Q15_256);
-      y256[4] = mulhi_int16_simd256(y256[4],ONE_OVER_SQRT2_Q15_256);
-      y256[5] = mulhi_int16_simd256(y256[5],ONE_OVER_SQRT2_Q15_256);
-      y256[6] = mulhi_int16_simd256(y256[6],ONE_OVER_SQRT2_Q15_256);
-      y256[7] = mulhi_int16_simd256(y256[7],ONE_OVER_SQRT2_Q15_256);
-      y256[8] = mulhi_int16_simd256(y256[8],ONE_OVER_SQRT2_Q15_256);
-      y256[9] = mulhi_int16_simd256(y256[9],ONE_OVER_SQRT2_Q15_256);
-      y256[10] = mulhi_int16_simd256(y256[10],ONE_OVER_SQRT2_Q15_256);
-      y256[11] = mulhi_int16_simd256(y256[11],ONE_OVER_SQRT2_Q15_256);
-      y256[12] = mulhi_int16_simd256(y256[12],ONE_OVER_SQRT2_Q15_256);
-      y256[13] = mulhi_int16_simd256(y256[13],ONE_OVER_SQRT2_Q15_256);
-      y256[14] = mulhi_int16_simd256(y256[14],ONE_OVER_SQRT2_Q15_256);
-      y256[15] = mulhi_int16_simd256(y256[15],ONE_OVER_SQRT2_Q15_256);
-      y256+=16;
-    }
-  }
-
-}
-
-int16_t tw1024[1536] __attribute__((aligned(32)));
-
-void dft1024(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[128],ytmp[128],*tw1024_256p=(simd256_q15_t *)tw1024,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i,j;
-
-  for (i=0,j=0; i<128; i+=4,j++) {
-    transpose16_ooff_simd256(x256+i,xtmp+j,32);
-  }
-
-
-  dft256((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  dft256((int16_t*)(xtmp+32),(int16_t*)(ytmp+32),1);
-  dft256((int16_t*)(xtmp+64),(int16_t*)(ytmp+64),1);
-  dft256((int16_t*)(xtmp+96),(int16_t*)(ytmp+96),1);
-
-  for (i=0; i<32; i++) {
-    bfly4_256(ytmpp,ytmpp+32,ytmpp+64,ytmpp+96,
-	      y256p,y256p+32,y256p+64,y256p+96,
-	      tw1024_256p,tw1024_256p+32,tw1024_256p+64);
-    tw1024_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0; i<8; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
-
-void idft1024(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[128],ytmp[128],*tw1024_256p=(simd256_q15_t *)tw1024,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i,j;
-
-  for (i=0,j=0; i<128; i+=4,j++) {
-    transpose16_ooff_simd256(x256+i,xtmp+j,32);
-  }
-
-
-  idft256((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  idft256((int16_t*)(xtmp+32),(int16_t*)(ytmp+32),1);
-  idft256((int16_t*)(xtmp+64),(int16_t*)(ytmp+64),1);
-  idft256((int16_t*)(xtmp+96),(int16_t*)(ytmp+96),1);
-
-  for (i=0; i<32; i++) {
-    ibfly4_256(ytmpp,ytmpp+32,ytmpp+64,ytmpp+96,
-	       y256p,y256p+32,y256p+64,y256p+96,
-	       tw1024_256p,tw1024_256p+32,tw1024_256p+64);
-    tw1024_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0; i<8; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
-
-int16_t tw2048[2048] __attribute__((aligned(32)));
-
-void dft2048(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[256],*xtmpp,*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[256],*tw2048_256p=(simd256_q15_t *)tw2048,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_128 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-
-
-  xtmpp = xtmp;
-
-  for (i=0; i<4; i++) {
-    transpose4_ooff_simd256(x256  ,xtmpp,128);
-    transpose4_ooff_simd256(x256+2,xtmpp+1,128);
-    transpose4_ooff_simd256(x256+4,xtmpp+2,128);
-    transpose4_ooff_simd256(x256+6,xtmpp+3,128);
-    transpose4_ooff_simd256(x256+8,xtmpp+4,128);
-    transpose4_ooff_simd256(x256+10,xtmpp+5,128);
-    transpose4_ooff_simd256(x256+12,xtmpp+6,128);
-    transpose4_ooff_simd256(x256+14,xtmpp+7,128);
-    transpose4_ooff_simd256(x256+16,xtmpp+8,128);
-    transpose4_ooff_simd256(x256+18,xtmpp+9,128);
-    transpose4_ooff_simd256(x256+20,xtmpp+10,128);
-    transpose4_ooff_simd256(x256+22,xtmpp+11,128);
-    transpose4_ooff_simd256(x256+24,xtmpp+12,128);
-    transpose4_ooff_simd256(x256+26,xtmpp+13,128);
-    transpose4_ooff_simd256(x256+28,xtmpp+14,128);
-    transpose4_ooff_simd256(x256+30,xtmpp+15,128);
-    transpose4_ooff_simd256(x256+32,xtmpp+16,128);
-    transpose4_ooff_simd256(x256+34,xtmpp+17,128);
-    transpose4_ooff_simd256(x256+36,xtmpp+18,128);
-    transpose4_ooff_simd256(x256+38,xtmpp+19,128);
-    transpose4_ooff_simd256(x256+40,xtmpp+20,128);
-    transpose4_ooff_simd256(x256+42,xtmpp+21,128);
-    transpose4_ooff_simd256(x256+44,xtmpp+22,128);
-    transpose4_ooff_simd256(x256+46,xtmpp+23,128);
-    transpose4_ooff_simd256(x256+48,xtmpp+24,128);
-    transpose4_ooff_simd256(x256+50,xtmpp+25,128);
-    transpose4_ooff_simd256(x256+52,xtmpp+26,128);
-    transpose4_ooff_simd256(x256+54,xtmpp+27,128);
-    transpose4_ooff_simd256(x256+56,xtmpp+28,128);
-    transpose4_ooff_simd256(x256+58,xtmpp+29,128);
-    transpose4_ooff_simd256(x256+60,xtmpp+30,128);
-    transpose4_ooff_simd256(x256+62,xtmpp+31,128);
-    x256+=64;
-    xtmpp+=32;
-  }
-
-  dft1024((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  dft1024((int16_t*)(xtmp+128),(int16_t*)(ytmp+128),1);
-
-
-  for (i=0; i<128; i++) {
-    bfly2_256(ytmpp,ytmpp+128,
-	      y256p,y256p+128,
-	      tw2048_256p);
-    tw2048_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-    y256p = y256;
-
-    for (i=0; i<16; i++) {
-      y256p[0]  = mulhi_int16_simd256(y256p[0],ONE_OVER_SQRT2_Q15_128);
-      y256p[1]  = mulhi_int16_simd256(y256p[1],ONE_OVER_SQRT2_Q15_128);
-      y256p[2]  = mulhi_int16_simd256(y256p[2],ONE_OVER_SQRT2_Q15_128);
-      y256p[3]  = mulhi_int16_simd256(y256p[3],ONE_OVER_SQRT2_Q15_128);
-      y256p[4]  = mulhi_int16_simd256(y256p[4],ONE_OVER_SQRT2_Q15_128);
-      y256p[5]  = mulhi_int16_simd256(y256p[5],ONE_OVER_SQRT2_Q15_128);
-      y256p[6]  = mulhi_int16_simd256(y256p[6],ONE_OVER_SQRT2_Q15_128);
-      y256p[7]  = mulhi_int16_simd256(y256p[7],ONE_OVER_SQRT2_Q15_128);
-      y256p[8]  = mulhi_int16_simd256(y256p[8],ONE_OVER_SQRT2_Q15_128);
-      y256p[9]  = mulhi_int16_simd256(y256p[9],ONE_OVER_SQRT2_Q15_128);
-      y256p[10] = mulhi_int16_simd256(y256p[10],ONE_OVER_SQRT2_Q15_128);
-      y256p[11] = mulhi_int16_simd256(y256p[11],ONE_OVER_SQRT2_Q15_128);
-      y256p[12] = mulhi_int16_simd256(y256p[12],ONE_OVER_SQRT2_Q15_128);
-      y256p[13] = mulhi_int16_simd256(y256p[13],ONE_OVER_SQRT2_Q15_128);
-      y256p[14] = mulhi_int16_simd256(y256p[14],ONE_OVER_SQRT2_Q15_128);
-      y256p[15] = mulhi_int16_simd256(y256p[15],ONE_OVER_SQRT2_Q15_128);
-      y256p+=16;
-    }
-  }
-
-}
-
-void idft2048(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[256],*xtmpp,*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[256],*tw2048_256p=(simd256_q15_t *)tw2048,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_128 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-
-  xtmpp = xtmp;
-  
-  for (i=0; i<4; i++) {
-    transpose4_ooff_simd256(x256  ,xtmpp,128);
-    transpose4_ooff_simd256(x256+2,xtmpp+1,128);
-    transpose4_ooff_simd256(x256+4,xtmpp+2,128);
-    transpose4_ooff_simd256(x256+6,xtmpp+3,128);
-    transpose4_ooff_simd256(x256+8,xtmpp+4,128);
-    transpose4_ooff_simd256(x256+10,xtmpp+5,128);
-    transpose4_ooff_simd256(x256+12,xtmpp+6,128);
-    transpose4_ooff_simd256(x256+14,xtmpp+7,128);
-    transpose4_ooff_simd256(x256+16,xtmpp+8,128);
-    transpose4_ooff_simd256(x256+18,xtmpp+9,128);
-    transpose4_ooff_simd256(x256+20,xtmpp+10,128);
-    transpose4_ooff_simd256(x256+22,xtmpp+11,128);
-    transpose4_ooff_simd256(x256+24,xtmpp+12,128);
-    transpose4_ooff_simd256(x256+26,xtmpp+13,128);
-    transpose4_ooff_simd256(x256+28,xtmpp+14,128);
-    transpose4_ooff_simd256(x256+30,xtmpp+15,128);
-    transpose4_ooff_simd256(x256+32,xtmpp+16,128);
-    transpose4_ooff_simd256(x256+34,xtmpp+17,128);
-    transpose4_ooff_simd256(x256+36,xtmpp+18,128);
-    transpose4_ooff_simd256(x256+38,xtmpp+19,128);
-    transpose4_ooff_simd256(x256+40,xtmpp+20,128);
-    transpose4_ooff_simd256(x256+42,xtmpp+21,128);
-    transpose4_ooff_simd256(x256+44,xtmpp+22,128);
-    transpose4_ooff_simd256(x256+46,xtmpp+23,128);
-    transpose4_ooff_simd256(x256+48,xtmpp+24,128);
-    transpose4_ooff_simd256(x256+50,xtmpp+25,128);
-    transpose4_ooff_simd256(x256+52,xtmpp+26,128);
-    transpose4_ooff_simd256(x256+54,xtmpp+27,128);
-    transpose4_ooff_simd256(x256+56,xtmpp+28,128);
-    transpose4_ooff_simd256(x256+58,xtmpp+29,128);
-    transpose4_ooff_simd256(x256+60,xtmpp+30,128);
-    transpose4_ooff_simd256(x256+62,xtmpp+31,128);
-    x256+=64;
-    xtmpp+=32;
-  }
-
-  idft1024((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  idft1024((int16_t*)(xtmp+128),(int16_t*)(ytmp+128),1);
-
-
-  for (i=0; i<128; i++) {
-    ibfly2_256(ytmpp,ytmpp+128,
-	       y256p,y256p+128,
-	       tw2048_256p);
-    tw2048_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-    y256p = y256;
-
-    for (i=0; i<16; i++) {
-      y256p[0]  = mulhi_int16_simd256(y256p[0],ONE_OVER_SQRT2_Q15_128);
-      y256p[1]  = mulhi_int16_simd256(y256p[1],ONE_OVER_SQRT2_Q15_128);
-      y256p[2]  = mulhi_int16_simd256(y256p[2],ONE_OVER_SQRT2_Q15_128);
-      y256p[3]  = mulhi_int16_simd256(y256p[3],ONE_OVER_SQRT2_Q15_128);
-      y256p[4]  = mulhi_int16_simd256(y256p[4],ONE_OVER_SQRT2_Q15_128);
-      y256p[5]  = mulhi_int16_simd256(y256p[5],ONE_OVER_SQRT2_Q15_128);
-      y256p[6]  = mulhi_int16_simd256(y256p[6],ONE_OVER_SQRT2_Q15_128);
-      y256p[7]  = mulhi_int16_simd256(y256p[7],ONE_OVER_SQRT2_Q15_128);
-      y256p[8]  = mulhi_int16_simd256(y256p[8],ONE_OVER_SQRT2_Q15_128);
-      y256p[9]  = mulhi_int16_simd256(y256p[9],ONE_OVER_SQRT2_Q15_128);
-      y256p[10] = mulhi_int16_simd256(y256p[10],ONE_OVER_SQRT2_Q15_128);
-      y256p[11] = mulhi_int16_simd256(y256p[11],ONE_OVER_SQRT2_Q15_128);
-      y256p[12] = mulhi_int16_simd256(y256p[12],ONE_OVER_SQRT2_Q15_128);
-      y256p[13] = mulhi_int16_simd256(y256p[13],ONE_OVER_SQRT2_Q15_128);
-      y256p[14] = mulhi_int16_simd256(y256p[14],ONE_OVER_SQRT2_Q15_128);
-      y256p[15] = mulhi_int16_simd256(y256p[15],ONE_OVER_SQRT2_Q15_128);
-      y256p+=16;
-    }
-  }
-
-}
-
-int16_t tw4096[3*2*1024];
-
-void dft4096(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[512],ytmp[512],*tw4096_256p=(simd256_q15_t *)tw4096,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i,j;
-
-  for (i=0,j=0; i<512; i+=4,j++) {
-    transpose16_ooff_simd256(x256+i,xtmp+j,128);
-  }
-
-
-  dft1024((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  dft1024((int16_t*)(xtmp+128),(int16_t*)(ytmp+128),1);
-  dft1024((int16_t*)(xtmp+256),(int16_t*)(ytmp+256),1);
-  dft1024((int16_t*)(xtmp+384),(int16_t*)(ytmp+384),1);
-
-  for (i=0; i<128; i++) {
-    bfly4_256(ytmpp,ytmpp+128,ytmpp+256,ytmpp+384,
-	      y256p,y256p+128,y256p+256,y256p+384,
-	      tw4096_256p,tw4096_256p+128,tw4096_256p+256);
-    tw4096_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0; i<32; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
-
-void idft4096(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[512],ytmp[512],*tw4096_256p=(simd256_q15_t *)tw4096,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i,j;
-
-  for (i=0,j=0; i<512; i+=4,j++) {
-    transpose16_ooff_simd256(x256+i,xtmp+j,128);
-  }
-
-
-  idft1024((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  idft1024((int16_t*)(xtmp+128),(int16_t*)(ytmp+128),1);
-  idft1024((int16_t*)(xtmp+256),(int16_t*)(ytmp+256),1);
-  idft1024((int16_t*)(xtmp+384),(int16_t*)(ytmp+384),1);
-
-  for (i=0; i<128; i++) {
-    ibfly4_256(ytmpp,ytmpp+128,ytmpp+256,ytmpp+384,
-	       y256p,y256p+128,y256p+256,y256p+384,
-	       tw4096_256p,tw4096_256p+128,tw4096_256p+256);
-    tw4096_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0; i<32; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
-
-int16_t tw8192[2*4096] __attribute__((aligned(32)));
-
-void dft8192(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[1024],*xtmpp,*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[1024],*tw8192_256p=(simd256_q15_t *)tw8192,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_128 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-  
-  xtmpp = xtmp;
-
-  for (i=0; i<16; i++) {
-    transpose4_ooff_simd256(x256  ,xtmpp,512);
-    transpose4_ooff_simd256(x256+2,xtmpp+1,512);
-    transpose4_ooff_simd256(x256+4,xtmpp+2,512);
-    transpose4_ooff_simd256(x256+6,xtmpp+3,512);
-    transpose4_ooff_simd256(x256+8,xtmpp+4,512);
-    transpose4_ooff_simd256(x256+10,xtmpp+5,512);
-    transpose4_ooff_simd256(x256+12,xtmpp+6,512);
-    transpose4_ooff_simd256(x256+14,xtmpp+7,512);
-    transpose4_ooff_simd256(x256+16,xtmpp+8,512);
-    transpose4_ooff_simd256(x256+18,xtmpp+9,512);
-    transpose4_ooff_simd256(x256+20,xtmpp+10,512);
-    transpose4_ooff_simd256(x256+22,xtmpp+11,512);
-    transpose4_ooff_simd256(x256+24,xtmpp+12,512);
-    transpose4_ooff_simd256(x256+26,xtmpp+13,512);
-    transpose4_ooff_simd256(x256+28,xtmpp+14,512);
-    transpose4_ooff_simd256(x256+30,xtmpp+15,512);
-    transpose4_ooff_simd256(x256+32,xtmpp+16,512);
-    transpose4_ooff_simd256(x256+34,xtmpp+17,512);
-    transpose4_ooff_simd256(x256+36,xtmpp+18,512);
-    transpose4_ooff_simd256(x256+38,xtmpp+19,512);
-    transpose4_ooff_simd256(x256+40,xtmpp+20,512);
-    transpose4_ooff_simd256(x256+42,xtmpp+21,512);
-    transpose4_ooff_simd256(x256+44,xtmpp+22,512);
-    transpose4_ooff_simd256(x256+46,xtmpp+23,512);
-    transpose4_ooff_simd256(x256+48,xtmpp+24,512);
-    transpose4_ooff_simd256(x256+50,xtmpp+25,512);
-    transpose4_ooff_simd256(x256+52,xtmpp+26,512);
-    transpose4_ooff_simd256(x256+54,xtmpp+27,512);
-    transpose4_ooff_simd256(x256+56,xtmpp+28,512);
-    transpose4_ooff_simd256(x256+58,xtmpp+29,512);
-    transpose4_ooff_simd256(x256+60,xtmpp+30,512);
-    transpose4_ooff_simd256(x256+62,xtmpp+31,512);
-    x256+=64;
-    xtmpp+=32;
-  }
-
-  dft4096((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  dft4096((int16_t*)(xtmp+512),(int16_t*)(ytmp+512),1);
-
-
-  for (i=0; i<512; i++) {
-    bfly2_256(ytmpp,ytmpp+512,
-	      y256p,y256p+512,
-	      tw8192_256p);
-    tw8192_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-    y256p = y256;
-
-    for (i=0; i<64; i++) {
-      y256p[0]  = mulhi_int16_simd256(y256p[0],ONE_OVER_SQRT2_Q15_128);
-      y256p[1]  = mulhi_int16_simd256(y256p[1],ONE_OVER_SQRT2_Q15_128);
-      y256p[2]  = mulhi_int16_simd256(y256p[2],ONE_OVER_SQRT2_Q15_128);
-      y256p[3]  = mulhi_int16_simd256(y256p[3],ONE_OVER_SQRT2_Q15_128);
-      y256p[4]  = mulhi_int16_simd256(y256p[4],ONE_OVER_SQRT2_Q15_128);
-      y256p[5]  = mulhi_int16_simd256(y256p[5],ONE_OVER_SQRT2_Q15_128);
-      y256p[6]  = mulhi_int16_simd256(y256p[6],ONE_OVER_SQRT2_Q15_128);
-      y256p[7]  = mulhi_int16_simd256(y256p[7],ONE_OVER_SQRT2_Q15_128);
-      y256p[8]  = mulhi_int16_simd256(y256p[8],ONE_OVER_SQRT2_Q15_128);
-      y256p[9]  = mulhi_int16_simd256(y256p[9],ONE_OVER_SQRT2_Q15_128);
-      y256p[10] = mulhi_int16_simd256(y256p[10],ONE_OVER_SQRT2_Q15_128);
-      y256p[11] = mulhi_int16_simd256(y256p[11],ONE_OVER_SQRT2_Q15_128);
-      y256p[12] = mulhi_int16_simd256(y256p[12],ONE_OVER_SQRT2_Q15_128);
-      y256p[13] = mulhi_int16_simd256(y256p[13],ONE_OVER_SQRT2_Q15_128);
-      y256p[14] = mulhi_int16_simd256(y256p[14],ONE_OVER_SQRT2_Q15_128);
-      y256p[15] = mulhi_int16_simd256(y256p[15],ONE_OVER_SQRT2_Q15_128);
-      y256p+=16;
-    }
-  }
-
-}
-
-void idft8192(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[1024],*xtmpp,*x256 = (simd256_q15_t *)x;
-  simd256_q15_t ytmp[1024],*tw8192_256p=(simd256_q15_t *)tw8192,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i;
-  simd256_q15_t ONE_OVER_SQRT2_Q15_128 = set1_int16_simd256(ONE_OVER_SQRT2_Q15);
-  
-  xtmpp = xtmp;
-
-  for (i=0; i<16; i++) {
-    transpose4_ooff_simd256(x256  ,xtmpp,512);
-    transpose4_ooff_simd256(x256+2,xtmpp+1,512);
-    transpose4_ooff_simd256(x256+4,xtmpp+2,512);
-    transpose4_ooff_simd256(x256+6,xtmpp+3,512);
-    transpose4_ooff_simd256(x256+8,xtmpp+4,512);
-    transpose4_ooff_simd256(x256+10,xtmpp+5,512);
-    transpose4_ooff_simd256(x256+12,xtmpp+6,512);
-    transpose4_ooff_simd256(x256+14,xtmpp+7,512);
-    transpose4_ooff_simd256(x256+16,xtmpp+8,512);
-    transpose4_ooff_simd256(x256+18,xtmpp+9,512);
-    transpose4_ooff_simd256(x256+20,xtmpp+10,512);
-    transpose4_ooff_simd256(x256+22,xtmpp+11,512);
-    transpose4_ooff_simd256(x256+24,xtmpp+12,512);
-    transpose4_ooff_simd256(x256+26,xtmpp+13,512);
-    transpose4_ooff_simd256(x256+28,xtmpp+14,512);
-    transpose4_ooff_simd256(x256+30,xtmpp+15,512);
-    transpose4_ooff_simd256(x256+32,xtmpp+16,512);
-    transpose4_ooff_simd256(x256+34,xtmpp+17,512);
-    transpose4_ooff_simd256(x256+36,xtmpp+18,512);
-    transpose4_ooff_simd256(x256+38,xtmpp+19,512);
-    transpose4_ooff_simd256(x256+40,xtmpp+20,512);
-    transpose4_ooff_simd256(x256+42,xtmpp+21,512);
-    transpose4_ooff_simd256(x256+44,xtmpp+22,512);
-    transpose4_ooff_simd256(x256+46,xtmpp+23,512);
-    transpose4_ooff_simd256(x256+48,xtmpp+24,512);
-    transpose4_ooff_simd256(x256+50,xtmpp+25,512);
-    transpose4_ooff_simd256(x256+52,xtmpp+26,512);
-    transpose4_ooff_simd256(x256+54,xtmpp+27,512);
-    transpose4_ooff_simd256(x256+56,xtmpp+28,512);
-    transpose4_ooff_simd256(x256+58,xtmpp+29,512);
-    transpose4_ooff_simd256(x256+60,xtmpp+30,512);
-    transpose4_ooff_simd256(x256+62,xtmpp+31,512);
-    x256+=64;
-    xtmpp+=32;
-  }
-
-  idft4096((int16_t*)(xtmp),(int16_t*)ytmp,1);
-  idft4096((int16_t*)(xtmp+512),(int16_t*)(ytmp+512),1);
-
-
-  for (i=0; i<512; i++) {
-    ibfly2_256(ytmpp,ytmpp+512,
-	       y256p,y256p+512,
-	       tw8192_256p);
-    tw8192_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-    y256p = y256;
-
-    for (i=0; i<64; i++) {
-      y256p[0]  = mulhi_int16_simd256(y256p[0],ONE_OVER_SQRT2_Q15_128);
-      y256p[1]  = mulhi_int16_simd256(y256p[1],ONE_OVER_SQRT2_Q15_128);
-      y256p[2]  = mulhi_int16_simd256(y256p[2],ONE_OVER_SQRT2_Q15_128);
-      y256p[3]  = mulhi_int16_simd256(y256p[3],ONE_OVER_SQRT2_Q15_128);
-      y256p[4]  = mulhi_int16_simd256(y256p[4],ONE_OVER_SQRT2_Q15_128);
-      y256p[5]  = mulhi_int16_simd256(y256p[5],ONE_OVER_SQRT2_Q15_128);
-      y256p[6]  = mulhi_int16_simd256(y256p[6],ONE_OVER_SQRT2_Q15_128);
-      y256p[7]  = mulhi_int16_simd256(y256p[7],ONE_OVER_SQRT2_Q15_128);
-      y256p[8]  = mulhi_int16_simd256(y256p[8],ONE_OVER_SQRT2_Q15_128);
-      y256p[9]  = mulhi_int16_simd256(y256p[9],ONE_OVER_SQRT2_Q15_128);
-      y256p[10] = mulhi_int16_simd256(y256p[10],ONE_OVER_SQRT2_Q15_128);
-      y256p[11] = mulhi_int16_simd256(y256p[11],ONE_OVER_SQRT2_Q15_128);
-      y256p[12] = mulhi_int16_simd256(y256p[12],ONE_OVER_SQRT2_Q15_128);
-      y256p[13] = mulhi_int16_simd256(y256p[13],ONE_OVER_SQRT2_Q15_128);
-      y256p[14] = mulhi_int16_simd256(y256p[14],ONE_OVER_SQRT2_Q15_128);
-      y256p[15] = mulhi_int16_simd256(y256p[15],ONE_OVER_SQRT2_Q15_128);
-      y256p+=16;
-    }
-  }
-
-}
-
-int16_t tw16384[3*2*4096] __attribute__((aligned(32)));
-
-void dft16384(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[2048],ytmp[2048],*tw16384_256p=(simd256_q15_t *)tw16384,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i,j;
-
-  for (i=0,j=0; i<2048; i+=4,j++) {
-    transpose16_ooff_simd256(x256+i,xtmp+j,512);
-  }
-
-
-  dft4096((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  dft4096((int16_t*)(xtmp+512),(int16_t*)(ytmp+512),1);
-  dft4096((int16_t*)(xtmp+1024),(int16_t*)(ytmp+1024),1);
-  dft4096((int16_t*)(xtmp+1536),(int16_t*)(ytmp+1536),1);
-
-  for (i=0; i<512; i++) {
-    bfly4_256(ytmpp,ytmpp+512,ytmpp+1024,ytmpp+1536,
-	      y256p,y256p+512,y256p+1024,y256p+1536,
-	      tw16384_256p,tw16384_256p+512,tw16384_256p+1024);
-    tw16384_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0; i<128; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
-
-void idft16384(int16_t *x,int16_t *y,unsigned char scale)
-{
-
-  simd256_q15_t xtmp[2048],ytmp[2048],*tw16384_256p=(simd256_q15_t *)tw16384,*x256=(simd256_q15_t *)x,*y256=(simd256_q15_t *)y,*y256p=(simd256_q15_t *)y;
-  simd256_q15_t *ytmpp = &ytmp[0];
-  int i,j;
-
-  for (i=0,j=0; i<2048; i+=4,j++) {
-    transpose16_ooff_simd256(x256+i,xtmp+j,512);
-  }
-
-
-  idft4096((int16_t*)(xtmp),(int16_t*)(ytmp),1);
-  idft4096((int16_t*)(xtmp+512),(int16_t*)(ytmp+512),1);
-  idft4096((int16_t*)(xtmp+1024),(int16_t*)(ytmp+1024),1);
-  idft4096((int16_t*)(xtmp+1536),(int16_t*)(ytmp+1536),1);
-
-  for (i=0; i<512; i++) {
-    ibfly4_256(ytmpp,ytmpp+512,ytmpp+1024,ytmpp+1536,
-	       y256p,y256p+512,y256p+1024,y256p+1536,
-	       tw16384_256p,tw16384_256p+512,tw16384_256p+1024);
-    tw16384_256p++;
-    y256p++;
-    ytmpp++;
-  }
-
-  if (scale>0) {
-
-    for (i=0; i<128; i++) {
-      y256[0]  = shiftright_int16_simd256(y256[0],1);
-      y256[1]  = shiftright_int16_simd256(y256[1],1);
-      y256[2]  = shiftright_int16_simd256(y256[2],1);
-      y256[3]  = shiftright_int16_simd256(y256[3],1);
-      y256[4]  = shiftright_int16_simd256(y256[4],1);
-      y256[5]  = shiftright_int16_simd256(y256[5],1);
-      y256[6]  = shiftright_int16_simd256(y256[6],1);
-      y256[7]  = shiftright_int16_simd256(y256[7],1);
-      y256[8]  = shiftright_int16_simd256(y256[8],1);
-      y256[9]  = shiftright_int16_simd256(y256[9],1);
-      y256[10] = shiftright_int16_simd256(y256[10],1);
-      y256[11] = shiftright_int16_simd256(y256[11],1);
-      y256[12] = shiftright_int16_simd256(y256[12],1);
-      y256[13] = shiftright_int16_simd256(y256[13],1);
-      y256[14] = shiftright_int16_simd256(y256[14],1);
-      y256[15] = shiftright_int16_simd256(y256[15],1);
-
-      y256+=16;
-    }
-
-  }
-
-}
 
 int16_t tw32768[2*16384] __attribute__((aligned(32)));
 
@@ -3079,574 +3122,6 @@ void idft32768(int16_t *x,int16_t *y,unsigned char scale)
     }
   }
 
-}
-
-int16_t twa768[512],twb768[512];
-
-// 256 x 3
-void idft768(int16_t *input, int16_t *output, unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][256]__attribute__((aligned(32)));
-  uint32_t tmpo[3][256] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<256; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  idft256((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  idft256((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  idft256((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  for (i=0,i2=0; i<512; i+=8,i2+=4)  {
-    ibfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),((simd_q15_t*)&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+512+i),(simd_q15_t*)(output+1024+i),
-          (simd_q15_t*)(twa768+i),(simd_q15_t*)(twb768+i));
-  }
-
-
-  if (scale==1) {
-    for (i=0; i<12; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-
-void dft768(int16_t *input, int16_t *output, unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][256] __attribute__((aligned(32)));
-  uint32_t tmpo[3][256] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<256; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  dft256((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  dft256((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  dft256((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  /*
-  for (i=1; i<512; i++) {
-    tmpo[0][i] = tmpo[0][i<<1];
-    tmpo[1][i] = tmpo[1][i<<1];
-    tmpo[2][i] = tmpo[2][i<<1];
-    }*/
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {
-    LOG_M("dft768out0.m","o0",tmpo[0],1024,1,1);
-    LOG_M("dft768out1.m","o1",tmpo[1],1024,1,1);
-    LOG_M("dft768out2.m","o2",tmpo[2],1024,1,1);
-  }
-#endif
-  for (i=0,i2=0; i<512; i+=8,i2+=4)  {
-    bfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),(simd_q15_t*)(&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+512+i),(simd_q15_t*)(output+1024+i),
-          (simd_q15_t*)(twa768+i),(simd_q15_t*)(twb768+i));
-  }
-
-  if (scale==1) {
-    for (i=0; i<12; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-int16_t twa1536[1024],twb1536[1024];
-
-// 512 x 3
-void idft1536(int16_t *input, int16_t *output, unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][512 ]__attribute__((aligned(32)));
-  uint32_t tmpo[3][512] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<512; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  idft512((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  idft512((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  idft512((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  for (i=0,i2=0; i<1024; i+=8,i2+=4)  {
-    ibfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),((simd_q15_t*)&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+1024+i),(simd_q15_t*)(output+2048+i),
-          (simd_q15_t*)(twa1536+i),(simd_q15_t*)(twb1536+i));
-  }
-
-
-  if (scale==1) {
-    for (i=0; i<24; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-
-void dft1536(int16_t *input, int16_t *output, unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][512] __attribute__((aligned(32)));
-  uint32_t tmpo[3][512] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<512; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  dft512((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  dft512((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  dft512((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  /*
-  for (i=1; i<512; i++) {
-    tmpo[0][i] = tmpo[0][i<<1];
-    tmpo[1][i] = tmpo[1][i<<1];
-    tmpo[2][i] = tmpo[2][i<<1];
-    }*/
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {
-    LOG_M("dft1536out0.m","o0",tmpo[0],2048,1,1);
-    LOG_M("dft1536out1.m","o1",tmpo[1],2048,1,1);
-    LOG_M("dft1536out2.m","o2",tmpo[2],2048,1,1);
-  }
-#endif
-  for (i=0,i2=0; i<1024; i+=8,i2+=4)  {
-    bfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),(simd_q15_t*)(&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+1024+i),(simd_q15_t*)(output+2048+i),
-          (simd_q15_t*)(twa1536+i),(simd_q15_t*)(twb1536+i));
-  }
-
-  if (scale==1) {
-    for (i=0; i<24; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-
-int16_t twa3072[2048] __attribute__((aligned(32)));
-int16_t twb3072[2048] __attribute__((aligned(32)));
-// 1024 x 3
-void dft3072(int16_t *input, int16_t *output,unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][1024] __attribute__((aligned(32)));
-  uint32_t tmpo[3][1024] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<1024; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  dft1024((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  dft1024((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  dft1024((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  for (i=0,i2=0; i<2048; i+=8,i2+=4)  {
-    bfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),(simd_q15_t*)(&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+2048+i),(simd_q15_t*)(output+4096+i),
-          (simd_q15_t*)(twa3072+i),(simd_q15_t*)(twb3072+i));
-  }
-
-  if (scale==1) {
-    for (i=0; i<48; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-
-void idft3072(int16_t *input, int16_t *output,unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][1024]__attribute__((aligned(32)));
-  uint32_t tmpo[3][1024] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<1024; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-  idft1024((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  idft1024((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  idft1024((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  for (i=0,i2=0; i<2048; i+=8,i2+=4)  {
-    ibfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),((simd_q15_t*)&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+2048+i),(simd_q15_t*)(output+4096+i),
-          (simd_q15_t*)(twa3072+i),(simd_q15_t*)(twb3072+i));
-  }
-
-
-  if (scale==1) {
-    for (i=0; i<48; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-
-
-int16_t twa6144[4096] __attribute__((aligned(32)));
-int16_t twb6144[4096] __attribute__((aligned(32)));
-
-void idft6144(int16_t *input, int16_t *output,unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][2048] __attribute__((aligned(32)));
-  uint32_t tmpo[3][2048] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<2048; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  idft2048((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  idft2048((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  idft2048((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {
-    LOG_M("idft6144in.m","in",input,6144,1,1);
-    LOG_M("idft6144out0.m","o0",tmpo[0],2048,1,1);
-    LOG_M("idft6144out1.m","o1",tmpo[1],2048,1,1);
-    LOG_M("idft6144out2.m","o2",tmpo[2],2048,1,1);
-  }
-#endif
-  for (i=0,i2=0; i<4096; i+=8,i2+=4)  {
-    ibfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),((simd_q15_t*)&tmpo[2][i2]),
-	   (simd_q15_t*)(output+i),(simd_q15_t*)(output+4096+i),(simd_q15_t*)(output+8192+i),
-	   (simd_q15_t*)(twa6144+i),(simd_q15_t*)(twb6144+i));
-  }
-
-
-  if (scale==1) {
-    for (i=0; i<96; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-
-
-void dft6144(int16_t *input, int16_t *output,unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][2048] __attribute__((aligned(32)));
-  uint32_t tmpo[3][2048] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<2048; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  dft2048((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  dft2048((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  dft2048((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  /*
-  for (i=1; i<2048; i++) {
-    tmpo[0][i] = tmpo[0][i<<1];
-    tmpo[1][i] = tmpo[1][i<<1];
-    tmpo[2][i] = tmpo[2][i<<1];
-    }*/
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {
-    LOG_M("ft6144out0.m","o0",tmpo[0],2048,1,1);
-    LOG_M("ft6144out1.m","o1",tmpo[1],2048,1,1);
-    LOG_M("ft6144out2.m","o2",tmpo[2],2048,1,1);
-  }
-#endif
-  for (i=0,i2=0; i<4096; i+=8,i2+=4)  {
-    bfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),(simd_q15_t*)(&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+4096+i),(simd_q15_t*)(output+8192+i),
-          (simd_q15_t*)(twa6144+i),(simd_q15_t*)(twb6144+i));
-  }
-
-  if (scale==1) {
-    for (i=0; i<96; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-}
-
-int16_t twa12288[8192] __attribute__((aligned(32)));
-int16_t twb12288[8192] __attribute__((aligned(32)));
-// 4096 x 3
-void dft12288(int16_t *input, int16_t *output,unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][4096] __attribute__((aligned(32)));
-  uint32_t tmpo[3][4096] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<4096; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  dft4096((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),scale);
-  dft4096((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),scale);
-  dft4096((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),scale);
-  /*
-  for (i=1; i<4096; i++) {
-    tmpo[0][i] = tmpo[0][i<<1];
-    tmpo[1][i] = tmpo[1][i<<1];
-    tmpo[2][i] = tmpo[2][i<<1];
-    }*/
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {
-    LOG_M("dft12288out0.m","o0",tmpo[0],4096,1,1);
-    LOG_M("dft12288out1.m","o1",tmpo[1],4096,1,1);
-    LOG_M("dft12288out2.m","o2",tmpo[2],4096,1,1);
-  }
-#endif
-  for (i=0,i2=0; i<8192; i+=8,i2+=4)  {
-    bfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),(simd_q15_t*)(&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+8192+i),(simd_q15_t*)(output+16384+i),
-          (simd_q15_t*)(twa12288+i),(simd_q15_t*)(twb12288+i));
-  }
-
-  if (scale==1) {
-    for (i=0; i<192; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-}
-
-void idft12288(int16_t *input, int16_t *output,unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][4096] __attribute__((aligned(32)));
-  uint32_t tmpo[3][4096] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<4096; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-
-
-  idft4096((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),scale);
-  idft4096((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),scale);
-  idft4096((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),scale);
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {
-    LOG_M("idft12288in.m","in",input,12288,1,1);
-    LOG_M("idft12288out0.m","o0",tmpo[0],4096,1,1);
-    LOG_M("idft12288out1.m","o1",tmpo[1],4096,1,1);
-    LOG_M("idft12288out2.m","o2",tmpo[2],4096,1,1);
-  }
-#endif
-  for (i=0,i2=0; i<8192; i+=8,i2+=4)  {
-    ibfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),((simd_q15_t*)&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+8192+i),(simd_q15_t*)(output+16384+i),
-          (simd_q15_t*)(twa12288+i),(simd_q15_t*)(twb12288+i));
-  }
-
-  if (scale==1) {
-    for (i=0; i<192; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-#ifndef MR_MAIN
-  if (LOG_DUMPFLAG(DEBUG_DFT)) {
-     LOG_M("idft12288out.m","out",output,6144,1,1);
-  }
-#endif
 }
 
 int16_t twa18432[12288] __attribute__((aligned(32)));
@@ -5367,61 +4842,6 @@ void dft180(int16_t *x,int16_t *y,unsigned char scale_flag)
 
 }
 
-static int16_t twa192[376]__attribute__((aligned(32)));
-static int16_t twb192[376]__attribute__((aligned(32)));
-static int16_t twc192[376]__attribute__((aligned(32)));
-
-void dft192(int16_t *x,int16_t *y,unsigned char scale_flag)
-{
-
-  int i,j;
-  simd_q15_t *x128=(simd_q15_t *)x;
-  simd_q15_t *y128=(simd_q15_t *)y;
-  simd_q15_t *twa128=(simd_q15_t *)&twa192[0];
-  simd_q15_t *twb128=(simd_q15_t *)&twb192[0];
-  simd_q15_t *twc128=(simd_q15_t *)&twc192[0];
-  simd_q15_t x2128[192];// = (simd_q15_t *)&x2128array[0];
-  simd_q15_t ytmp128[192];//=&ytmp128array2[0];
-
-
-
-  for (i=0,j=0; i<48; i++,j+=4) {
-    x2128[i]    = x128[j];
-    x2128[i+48] = x128[j+1];
-    x2128[i+96] = x128[j+2];
-    x2128[i+144] = x128[j+3];
-  }
-
-  dft48((int16_t *)x2128,(int16_t *)ytmp128,1);
-  dft48((int16_t *)(x2128+48),(int16_t *)(ytmp128+48),1);
-  dft48((int16_t *)(x2128+96),(int16_t *)(ytmp128+96),1);
-  dft48((int16_t *)(x2128+144),(int16_t *)(ytmp128+144),1);
-
-  bfly4_tw1(ytmp128,ytmp128+48,ytmp128+96,ytmp128+144,y128,y128+48,y128+96,y128+144);
-
-  for (i=1,j=0; i<48; i++,j++) {
-    bfly4(ytmp128+i,
-          ytmp128+48+i,
-          ytmp128+96+i,
-          ytmp128+144+i,
-          y128+i,
-          y128+48+i,
-          y128+96+i,
-          y128+144+i,
-          twa128+j,
-          twb128+j,
-          twc128+j);
-  }
-
-  if (scale_flag==1) {
-    const simd_q15_t norm128 = set1_int16(dft_norm_table[11]);
-
-    for (i=0; i<192; i++) {
-      y128[i] = mulhi_int16(y128[i],norm128);
-    }
-  }
-
-}
 
 static int16_t twa216[568]__attribute__((aligned(32)));
 static int16_t twb216[568]__attribute__((aligned(32)));
@@ -5730,61 +5150,6 @@ void dft360(int16_t *x,int16_t *y,unsigned char scale_flag)  // 120 x 3
     const simd_q15_t norm128 = set1_int16(dft_norm_table[14]);
 
     for (i=0; i<360; i++) {
-      y128[i] = mulhi_int16(y128[i],norm128);
-    }
-  }
-
-};
-
-static int16_t twa384[95*2*4];
-static int16_t twb384[95*2*4];
-static int16_t twc384[95*2*4];
-
-void dft384(int16_t *x,int16_t *y,unsigned char scale_flag)  // 96 x 4
-{
-  int i,j;
-  simd_q15_t *x128=(simd_q15_t *)x;
-  simd_q15_t *y128=(simd_q15_t *)y;
-  simd_q15_t *twa128=(simd_q15_t *)&twa384[0];
-  simd_q15_t *twb128=(simd_q15_t *)&twb384[0];
-  simd_q15_t *twc128=(simd_q15_t *)&twc384[0];
-  simd_q15_t x2128[384];// = (simd_q15_t *)&x2128array[0];
-  simd_q15_t ytmp128[384];//=&ytmp128array2[0];
-
-
-
-  for (i=0,j=0; i<96; i++,j+=4) {
-    x2128[i]    = x128[j];
-    x2128[i+96] = x128[j+1];
-    x2128[i+192] = x128[j+2];
-    x2128[i+288] = x128[j+3];
-  }
-
-  dft96((int16_t *)x2128,(int16_t *)ytmp128,1);
-  dft96((int16_t *)(x2128+96),(int16_t *)(ytmp128+96),1);
-  dft96((int16_t *)(x2128+192),(int16_t *)(ytmp128+192),1);
-  dft96((int16_t *)(x2128+288),(int16_t *)(ytmp128+288),1);
-
-  bfly4_tw1(ytmp128,ytmp128+96,ytmp128+192,ytmp128+288,y128,y128+96,y128+192,y128+288);
-
-  for (i=1,j=0; i<96; i++,j++) {
-    bfly4(ytmp128+i,
-          ytmp128+96+i,
-          ytmp128+192+i,
-          ytmp128+288+i,
-          y128+i,
-          y128+96+i,
-          y128+192+i,
-          y128+288+i,
-          twa128+j,
-          twb128+j,
-          twc128+j);
-  }
-
-  if (scale_flag==1) {
-    const simd_q15_t norm128 = set1_int16(16384); // dft_norm_table[13]);
-
-    for (i=0; i<384; i++) {
       y128[i] = mulhi_int16(y128[i],norm128);
     }
   }
@@ -6144,114 +5509,6 @@ void dft720(int16_t *x,int16_t *y,unsigned char scale_flag)  // 180 x 4
   }
 
 };
-
-static int16_t twa768p[191*2*4];
-static int16_t twb768p[191*2*4];
-static int16_t twc768p[191*2*4];
-
-void dft768p(int16_t *x,int16_t *y,unsigned char scale_flag) { // 192x 4;
-
-  int i,j;
-  simd_q15_t *x128=(simd_q15_t *)x;
-  simd_q15_t *y128=(simd_q15_t *)y;
-  simd_q15_t *twa128=(simd_q15_t *)&twa768p[0];
-  simd_q15_t *twb128=(simd_q15_t *)&twb768p[0];
-  simd_q15_t *twc128=(simd_q15_t *)&twc768p[0];
-  simd_q15_t x2128[768];// = (simd_q15_t *)&x2128array[0];
-  simd_q15_t ytmp128[768];//=&ytmp128array2[0];
-
-
-
-  for (i=0,j=0; i<192; i++,j+=4) {
-    x2128[i]     = x128[j];
-    x2128[i+192] = x128[j+1];
-    x2128[i+384] = x128[j+2];
-    x2128[i+576] = x128[j+3];
-  }
-
-  dft192((int16_t *)x2128,(int16_t *)ytmp128,1);
-  dft192((int16_t *)(x2128+192),(int16_t *)(ytmp128+192),1);
-  dft192((int16_t *)(x2128+384),(int16_t *)(ytmp128+384),1);
-  dft192((int16_t *)(x2128+576),(int16_t *)(ytmp128+576),1);
-
-  bfly4_tw1(ytmp128,ytmp128+192,ytmp128+384,ytmp128+576,y128,y128+192,y128+384,y128+576);
-
-  for (i=1,j=0; i<192; i++,j++) {
-    bfly4(ytmp128+i,
-          ytmp128+192+i,
-          ytmp128+384+i,
-          ytmp128+576+i,
-          y128+i,
-          y128+192+i,
-          y128+384+i,
-          y128+576+i,
-          twa128+j,
-          twb128+j,
-          twc128+j);
-  }
-
-  if (scale_flag==1) {
-    const simd_q15_t norm128 = set1_int16(16384); // dft_norm_table[13]);
-
-    for (i=0; i<768; i++) {
-      y128[i] = mulhi_int16(y128[i],norm128);
-    }
-  }
-
-}
-
-static int16_t twa384i[256];
-static int16_t twb384i[256];
-// 128 x 3
-void idft384(int16_t *input, int16_t *output, unsigned char scale)
-{
-  int i,i2,j;
-  uint32_t tmp[3][128]__attribute__((aligned(32)));
-  uint32_t tmpo[3][128] __attribute__((aligned(32)));
-  simd_q15_t *y128p=(simd_q15_t*)output;
-  simd_q15_t ONE_OVER_SQRT3_Q15_128 = set1_int16(ONE_OVER_SQRT3_Q15);
-
-  for (i=0,j=0; i<128; i++) {
-    tmp[0][i] = ((uint32_t *)input)[j++];
-    tmp[1][i] = ((uint32_t *)input)[j++];
-    tmp[2][i] = ((uint32_t *)input)[j++];
-  }
-
-  idft128((int16_t*)(tmp[0]),(int16_t*)(tmpo[0]),1);
-  idft128((int16_t*)(tmp[1]),(int16_t*)(tmpo[1]),1);
-  idft128((int16_t*)(tmp[2]),(int16_t*)(tmpo[2]),1);
-
-  for (i=0,i2=0; i<256; i+=8,i2+=4)  {
-    ibfly3((simd_q15_t*)(&tmpo[0][i2]),(simd_q15_t*)(&tmpo[1][i2]),(simd_q15_t*)(&tmpo[2][i2]),
-          (simd_q15_t*)(output+i),(simd_q15_t*)(output+256+i),(simd_q15_t*)(output+512+i),
-          (simd_q15_t*)(twa384+i),(simd_q15_t*)(twb384+i));
-  }
-
-
-  if (scale==1) {
-    for (i=0; i<6; i++) {
-      y128p[0]  = mulhi_int16(y128p[0],ONE_OVER_SQRT3_Q15_128);
-      y128p[1]  = mulhi_int16(y128p[1],ONE_OVER_SQRT3_Q15_128);
-      y128p[2]  = mulhi_int16(y128p[2],ONE_OVER_SQRT3_Q15_128);
-      y128p[3]  = mulhi_int16(y128p[3],ONE_OVER_SQRT3_Q15_128);
-      y128p[4]  = mulhi_int16(y128p[4],ONE_OVER_SQRT3_Q15_128);
-      y128p[5]  = mulhi_int16(y128p[5],ONE_OVER_SQRT3_Q15_128);
-      y128p[6]  = mulhi_int16(y128p[6],ONE_OVER_SQRT3_Q15_128);
-      y128p[7]  = mulhi_int16(y128p[7],ONE_OVER_SQRT3_Q15_128);
-      y128p[8]  = mulhi_int16(y128p[8],ONE_OVER_SQRT3_Q15_128);
-      y128p[9]  = mulhi_int16(y128p[9],ONE_OVER_SQRT3_Q15_128);
-      y128p[10] = mulhi_int16(y128p[10],ONE_OVER_SQRT3_Q15_128);
-      y128p[11] = mulhi_int16(y128p[11],ONE_OVER_SQRT3_Q15_128);
-      y128p[12] = mulhi_int16(y128p[12],ONE_OVER_SQRT3_Q15_128);
-      y128p[13] = mulhi_int16(y128p[13],ONE_OVER_SQRT3_Q15_128);
-      y128p[14] = mulhi_int16(y128p[14],ONE_OVER_SQRT3_Q15_128);
-      y128p[15] = mulhi_int16(y128p[15],ONE_OVER_SQRT3_Q15_128);
-      y128p+=16;
-    }
-  }
-
-}
-
 
 static int16_t twa864[287*2*4];
 static int16_t twb864[287*2*4];
@@ -7599,20 +6856,11 @@ void init_rad5_rep(int N,int16_t *twa,int16_t *twb,int16_t *twc,int16_t *twd) {
 
 int dfts_autoinit(void)
 {
-  init_rad4(1024,tw1024);
-  init_rad2(2048,tw2048);
-  init_rad4(4096,tw4096);
-  init_rad2(8192,tw8192);
-  init_rad4(16384,tw16384);
+
   init_rad2(32768,tw32768);
   init_rad4(65536,tw65536);
 
-  init_rad3(384,twa384i,twb384i);
-  init_rad3(768,twa768,twb768);
-  init_rad3(1536,twa1536,twb1536);
-  init_rad3(3072,twa3072,twb3072);
-  init_rad3(6144,twa6144,twb6144);
-  init_rad3(12288,twa12288,twb12288);
+
   init_rad3(18432,twa18432,twb18432);
   init_rad3(24576,twa24576,twb24576);
   init_rad3(36864,twa36864,twb36864);
@@ -7630,14 +6878,12 @@ int dfts_autoinit(void)
   init_rad2_rep(120,tw120);
   init_rad3_rep(144,twa144,twb144);
   init_rad3_rep(180,twa180,twb180);
-  init_rad4_rep(192,twa192,twb192,twc192);
   init_rad3_rep(216,twa216,twb216);
   init_rad4_rep(240,twa240,twb240,twc240);
   init_rad3_rep(288,twa288,twb288);
   init_rad5_rep(300,twa300,twb300,twc300,twd300);
   init_rad3_rep(324,twa324,twb324);
   init_rad3_rep(360,twa360,twb360);
-  init_rad4_rep(384,twa384,twb384,twc384);
   init_rad4_rep(432,twa432,twb432,twc432);
   init_rad4_rep(480,twa480,twb480,twc480);
   init_rad3_rep(540,twa540,twb540);
@@ -7645,7 +6891,6 @@ int dfts_autoinit(void)
   init_rad2_rep(600,twa600);
   init_rad3_rep(648,twa648,twb648);
   init_rad4_rep(720,twa720,twb720,twc720);
-  init_rad4_rep(768,twa768p,twb768p,twc768p);
   init_rad3_rep(864,twa864,twb864);
   init_rad3_rep(900,twa900,twb900);
   init_rad4_rep(960,twa960,twb960,twc960);
