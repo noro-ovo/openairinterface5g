@@ -1716,8 +1716,8 @@ static inline uint64_t rdtsc_end(void)
     
 static double time_oai256_ns_per_dft(c16_t *in, c16_t *out, int N)
 {
-    const int W = 20000;
-    const int T = 2000000;
+    const int W = 20;
+    const int T = 200;
 
     dft_size_idx_t idx = get_dft(N);
 
@@ -3792,8 +3792,8 @@ static double time_mixed_ns_per_dftlts(float complex *in, float complex *out, in
 
 static double time_splitflt_ns_per_dftlts(float complex *in, float complex *out, int N)
 {
-    const int W = 20000;
-    const int T = 200000;
+    const int W = 20;
+    const int T = 200;
 
     for (int i = 0; i < W; i++)
         dft_split_radix_pure_simdlts(in, out, N);
@@ -4499,8 +4499,8 @@ void fft_recursive_forward(const float complex *src,
 #ifdef USE_FFTW_BACKEND
 static double time_fftw_ns_per_dft(fftwf_plan p)
 {
-    const int W = 20000;
-    const int T = 200000;
+    const int W = 20;
+    const int T = 200;
 
     for (int i = 0; i < W; i++)
         fftwf_execute(p);
@@ -4517,8 +4517,8 @@ static double time_fftw_ns_per_dft(fftwf_plan p)
 #ifdef USE_FFTZ_BACKEND
 static double time_fftz_ns_per_dft(void *handle, float *in, float *out)
 {
-    const int W = 20000;
-    const int T = 200000;
+    const int W = 20;
+    const int T = 200;
 
     for (int i = 0; i < W; i++)
         aoclfftz_execute_io(handle, in, out);
@@ -4608,6 +4608,8 @@ static inline int is_oai_dft_supported_lts(int N)
         case 65536:
 	    case 49152:
 	    case 98304:
+        case 1048576:
+        case 1572864:
         case 4096:
         case 8192:
             return 1;
@@ -4743,7 +4745,7 @@ int main(void)
      * OAI et split-radix seront automatiquement désactivés
      * si la taille n'est pas supportée.
      */
-    const int sizes[] = {16384,
+    const int sizes[] = {1048576, 1572864, 16384,
     18432, 24576, 32768, 36864, 49152, 65536, 98304, 192, 16, 36, 48, 12, 24, 60, 64, 72, 96, 108, 120, 128,
     144, 180, 192, 216, 240, 256, 288, 300, 324, 360,
     384, 432, 480, 512, 540, 576, 600, 648, 720, 768,
@@ -4986,9 +4988,13 @@ int main(void)
             const size_t fft_scratch_bytes = sizeof(float complex) * N;
 
 
-            classic_dft_forward(x, classic_ref, N);
+            //classic_dft_forward(x, classic_ref, N);
 
-            scale_complex(classic_ref, classic_scaled, N, ref_scale);
+            //scale_complex(classic_ref, classic_scaled, N, ref_scale);
+            #ifdef USE_FFTW_BACKEND
+                fftwf_execute(fftw_plan);
+                scale_complex(fftw_out, fftw_scaled_f, N, ref_scale);
+            #endif
 
 
             /*
@@ -5002,7 +5008,7 @@ int main(void)
                 dft(get_dft(N), (int16_t *)x_oai, (int16_t *)oai_out_q, 1);
                 oai_out_to_float_complex(oai_out_q, oai_out_f, N);
 
-                evm_oai_scaled = rms_evm_percent_fc(classic_scaled, oai_out_f, N);
+                evm_oai_scaled = rms_evm_percent_fc(fftw_scaled_f, oai_out_f, N);
                 t_oai = time_oai256_ns_per_dft(x_oai, oai_out_q, N);
             }
 
@@ -5018,7 +5024,7 @@ int main(void)
                 //dft_mixed_radix_c16_scaled(x_oai, split_out_q, N, -1);
                 oai_out_to_float_complex(split_out_q, split_out_f, N);
 
-                evm_split_scaled = 0; rms_evm_percent_fc(classic_scaled, split_out_f, N);
+                evm_split_scaled = 0; //rms_evm_percent_fc(classic_scaled, split_out_f, N);
                 t_split = 0; //time_split256_ns_per_dft(x_oai, split_out_q, N);
             }
 
@@ -5090,8 +5096,8 @@ int main(void)
                 evm_splitflt_scaled =
                     rms_evm_percent_fc(classic_scaled, splitflt_scaled_f, N);
 
-                t_splitflt =
-                    time_splitflt_ns_per_dftlts(x, splitflt_out_f, N);
+                t_splitflt =0;
+                    //time_splitflt_ns_per_dftlts(x, splitflt_out_f, N);
             }
 
             /*

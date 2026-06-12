@@ -6,48 +6,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include <stdint.h>
 #include <math.h>
-#include <pthread.h>
-#include <execinfo.h>
 #include <stddef.h>
 #include <complex.h>
 #include <immintrin.h>
-
+#include "../sse_intrin.h"
+#include "assertions.h"
+#define OAIDFTS_MAIN
+#include "tools_defs.h"
+#include "time_meas.h"
+#include "LOG/log.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
 #define Q15_INV_SQRT2                       ((int16_t)23170)
 #define Q15_INV_SQRT3                       ((int16_t)18919)
 #define Q15_HALF_SQRT3                      ((int16_t)28378)
-#define Q15_SCALE_1_OVER_SQRT64             ((int16_t)4096)
+
+#define Q15_INV_2SQRT3       ((int16_t)9459)  /* 1 / (2 * sqrt(3)) */
+
+#define Q15_HALF            ((int16_t)16384)  /* 1 / 2 */
 
 
-#define SR_MAX_LOG2 17
-#define MAX_N 65536
-#define OAIDFTS_MAIN
-#include "time_meas.h"
-#include "LOG/log.h"
-#define debug_msg
-
-#define ALIGNMENT 32
-#define ONE_OVER_SQRT2_Q15 23170
-
-#define Q15_INV_2SQRT3       9459  /* 1 / (2 * sqrt(3)) */
-
-#define Q15_HALF            16384  /* 1 / 2 */
-
-
-#define Q15_INV_SQRT5       14654  /* 1 / sqrt(5) */
-#ifndef Q15_ONE
 #define Q15_ONE ((int16_t)32767)
-#endif
-#define Q15_C1_INV_SQRT5     4528  /*  0.309016994 / sqrt(5) */
-#define Q15_C2_INV_SQRT5   -11856  /* -0.809016994 / sqrt(5) */
-#define Q15_S1_INV_SQRT5    13937  /*  0.951056516 / sqrt(5) */
-#define Q15_S2_INV_SQRT5     8614  /*  0.587785252 / sqrt(5) */
 
 #define DFT32_Q15_ONE        ((int16_t)32767)
 
@@ -61,34 +45,26 @@
 #define Q15_COS_PI_8 ((int16_t)30274)  /* cos(pi/8) */
 #define Q15_SIN_PI_8 ((int16_t)12540)  /* sin(pi/8) */
 
-#define SPLIT_RADIX_STACK_MAX_C16 16384  /* 64 KB si sizeof(c16_t) = 4 */
+#define Q15_SQRT3_OVER_2 ((int16_t)28378)  /* sqrt(3)/2 */
 
-#define DFT24_Q15_INV_SQRT3    ((int16_t)18919)  /* 1/sqrt(3) */
-#define DFT24_Q15_HALF         ((int16_t)16384)  /* 1/2 */
-#define DFT24_Q15_SQRT3_OVER_2 ((int16_t)28378)  /* sqrt(3)/2 */
+#define Q15_INV_SQRT5 ((int16_t)14654)
 
-#define DFT20_Q15_INV_SQRT5 ((int16_t)14654)
+#define Q15_COS_2PI_5  ((int16_t)10126)   /* cos(2pi/5)  */
+#define Q15_COS_4PI_5  ((int16_t)-26510)  /* cos(4pi/5)  */
+#define Q15_SIN_2PI_5  ((int16_t)31163)   /* sin(2pi/5)  */
+#define Q15_SIN_4PI_5  ((int16_t)19260)   /* sin(4pi/5)  */
 
-/*
- * Radix-5 constants.
- */
-#define DFT20_Q15_COS_2PI_5  ((int16_t)10126)   /* cos(2pi/5)  */
-#define DFT20_Q15_COS_4PI_5  ((int16_t)-26510)  /* cos(4pi/5)  */
-#define DFT20_Q15_SIN_2PI_5  ((int16_t)31163)   /* sin(2pi/5)  */
-#define DFT20_Q15_SIN_4PI_5  ((int16_t)19260)   /* sin(4pi/5)  */
+#define SR_MAX_LOG2 25
+#define MAX_N 1572864
 
-#define RADIX3_STACK_MAX_N 1024
+#define ALIGNMENT 32
+
+
+#define SPLIT_RADIX_STACK_MAX_C16 16384 
 
 #define STACK_MAX_N 1024
 
 
-#define ONE_OVER_SQRT3_Q15 18919
-
-#include "../sse_intrin.h"
-
-#include "assertions.h"
-
-#include "tools_defs.h"
 
 #define print_shorts(s,x) printf("%s %d,%d,%d,%d,%d,%d,%d,%d\n",s,(x)[0],(x)[1],(x)[2],(x)[3],(x)[4],(x)[5],(x)[6],(x)[7])
 #define print_shorts256(s,x) printf("%s %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",s,(x)[0],(x)[1],(x)[2],(x)[3],(x)[4],(x)[5],(x)[6],(x)[7],(x)[8],(x)[9],(x)[10],(x)[11],(x)[12],(x)[13],(x)[14],(x)[15])
@@ -96,15 +72,10 @@
 #define print_ints(s,x) printf("%s %d %d %d %d\n",s,(x)[0],(x)[1],(x)[2],(x)[3])
 
 
-const static int16_t conjugatedft[32] __attribute__((aligned(32))) = {-1,1,-1,1,-1,1,-1,1,-1,1,-1,1,-1,1,-1,1,-1,1};
-
-
-const static int16_t reflip[32]  __attribute__((aligned(32))) = {1,-1,1,-1,1,-1,1,-1,1,-1,1,-1,1,-1,1,-1};
-
-
 //============================================================================
 //HELPERS
 //============================================================================
+
 
 
 static inline __m128i load4_complex_strided_c16(const c16_t *src,
@@ -283,6 +254,26 @@ static inline __m128i q15_mul_i16_128(__m128i x, int16_t q15)
     return _mm_mulhrs_epi16(x, _mm_set1_epi16(q15));
 }
 
+static inline __m128i mul_minus_j_dir_i16_128(__m128i z, dft_dir_t dir)
+{
+    return (dir == DFT_DIR_FORWARD)
+        ? mul_minuslts_q15_128(z)
+        : mullts_q15_128(z);
+}
+
+static inline __m128i mul_plus_j_dir_i16_128(__m128i z, dft_dir_t dir)
+{
+    return (dir == DFT_DIR_FORWARD)
+        ? mullts_q15_128(z)
+        : mul_minuslts_q15_128(z);
+}
+
+static inline __m128i twiddle_im_dir_128(__m128i w_im_signed, dft_dir_t dir)
+{
+    return (dir == DFT_DIR_FORWARD)
+        ? w_im_signed
+        : _mm_sub_epi16(_mm_setzero_si128(), w_im_signed);
+}
 
 typedef enum {
     DFT_DIR_FORWARD = -1,
@@ -495,24 +486,10 @@ typedef struct {
     __m256i W128_RE_RE_q15_256_inverse[8]     __attribute__((aligned(64)));
     __m256i W128_IM_SIGNED_q15_256_inverse[8] __attribute__((aligned(64)));
 
-
-    int init_done;
 } TwiddleTable;
 
 static TwiddleTable g_tables[MAX_N + 1];
 
-
-static inline int16_t f32_to_q15(float x)
-{
-    int v = (int)lrintf(x * 32768.0f);
-
-    if (v > 32767)
-        v = 32767;
-    if (v < -32767)
-        v = -32767;
-
-    return (int16_t)v;
-}
 
 
 static inline __m128i pack4_twiddle_q15_re_re_scaled(
@@ -565,7 +542,7 @@ static inline __m256i pack8_twiddle_q15_re_re256i(const float complex *W,
 
     for (int j = 0; j < 8; j++) {
         const int k = (mul * (k0 + j)) % N;
-        const int16_t wr = (N==64) ? q15_from_float(crealf(W[k]))/8 : (N%4==0  && N != 128) ? q15_from_float(crealf(W[k]))/2  : q15_from_float(crealf(W[k])) / sqrtf(2.0f);;
+        const int16_t wr = (N==64) ? q15_from_float(crealf(W[k]))/8 : (N%4==0  && N != 128) ? q15_from_float(crealf(W[k]))/2  : q15_from_float(crealf(W[k])) / sqrtf(2.0f);
 
         v[2 * j + 0] = wr;
         v[2 * j + 1] = wr;
@@ -1667,13 +1644,10 @@ static void dft_split_radix_pure_simd_strided(const c16_t *x,
 //===================================================================
 // DFT4
 //===================================================================
-static inline __m128i dft4lts(__m128i x)
+static inline __m128i dft4lts(__m128i x, dft_dir_t dir)
 {
-    /*
-     * lo = [x0 x1 x0 x1]
-     * hi = [x2 x3 x2 x3]
-     */
     x = _mm_srai_epi16(x, 1);
+
     const __m128i lo = _mm_shuffle_epi32(x, _MM_SHUFFLE(1, 0, 1, 0));
     const __m128i hi = _mm_shuffle_epi32(x, _MM_SHUFFLE(3, 2, 3, 2));
 
@@ -1686,28 +1660,21 @@ static inline __m128i dft4lts(__m128i x)
     const __m128i y0v = _mm_adds_epi16(s, s_sw);
     const __m128i y2v = _mm_subs_epi16(s, s_sw);
 
-    const __m128i y1v = _mm_adds_epi16(d, mul_minuslts_q15_128(d_sw));
-    const __m128i y3v = _mm_adds_epi16(d, mullts_q15_128(d_sw));
+    const __m128i y1v = _mm_adds_epi16(d, mul_minus_j_dir_i16_128(d_sw, dir));
+    const __m128i y3v = _mm_adds_epi16(d, mul_plus_j_dir_i16_128(d_sw, dir));
 
-    /*
-     * y0v lane0 = Y0
-     * y1v lane0 = Y1
-     * y2v lane0 = Y2
-     * y3v lane0 = Y3
-     */
-    const __m128i y01 = _mm_unpacklo_epi32(y0v, y1v);  // [Y0 Y1 ... ...]
-    const __m128i y23 = _mm_unpacklo_epi32(y2v, y3v);  // [Y2 Y3 ... ...]
+    const __m128i y01 = _mm_unpacklo_epi32(y0v, y1v);
+    const __m128i y23 = _mm_unpacklo_epi32(y2v, y3v);
 
-    return _mm_unpacklo_epi64(y01, y23);               // [Y0 Y1 Y2 Y3]
+    return _mm_unpacklo_epi64(y01, y23);
 }
 
-static inline void dft4(const c16_t *src, c16_t *dst)
+static inline void dft4(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
-
     const __m128i x =
         _mm_loadu_si128((const __m128i *)(const void *)src);
 
-    const __m128i y = dft4lts(x);
+    const __m128i y = dft4lts(x, dir);
 
     _mm_storeu_si128((__m128i *)(void *)dst, y);
 }
@@ -1885,7 +1852,8 @@ static inline void dft4x4_q15_128(
     __m128i *Y0,
     __m128i *Y1,
     __m128i *Y2,
-    __m128i *Y3)
+    __m128i *Y3, 
+    dft_dir_t dir)
 {
     const __m128i x0s = _mm_srai_epi16(x0, 1);
     const __m128i x1s = _mm_srai_epi16(x1, 1);
@@ -1906,8 +1874,8 @@ static inline void dft4x4_q15_128(
      * Y1 = d02 - j*d13
      * Y3 = d02 + j*d13
      */
-    *Y1 = _mm_adds_epi16(d02, mul_minuslts_q15_128(d13));
-    *Y3 = _mm_adds_epi16(d02, mullts_q15_128(d13));
+    *Y1 = _mm_adds_epi16(d02, mul_minus_j_dir_i16_128(d13, dir));
+    *Y3 = _mm_adds_epi16(d02, mul_plus_j_dir_i16_128(d13, dir));
 }
 static inline void transpose4_complex_i16_128(__m128i *Y0,
                                               __m128i *Y1,
@@ -2030,10 +1998,7 @@ void dft16(int16_t *x, int16_t *y, uint8_t scale_flag)
 }
 
 
-#define DFT12_Q15_INV_SQRT3       ((int16_t)18919)  /* 1/sqrt(3) */
-#define DFT12_Q15_HALF            ((int16_t)16384)  /* 1/2 */
-#define DFT12_Q15_INV_2SQRT3      ((int16_t)9459)   /* 1/(2*sqrt(3)) */
-#define DFT12_Q15_SQRT3_OVER_2    ((int16_t)28378)  /* sqrt(3)/2 */
+
 
 /*
  * Format:
@@ -2048,32 +2013,32 @@ void dft16(int16_t *x, int16_t *y, uint8_t scale_flag)
 
 /* W12^k, k = 0..3 */
 static const int16_t W12_R3_W1_RE_RE[8] __attribute__((aligned(16))) = {
-    DFT12_Q15_INV_SQRT3,  DFT12_Q15_INV_SQRT3,   /* 1 / sqrt3 */
-    DFT12_Q15_HALF,       DFT12_Q15_HALF,        /* cos(pi/6) / sqrt3 = 1/2 */
-    DFT12_Q15_INV_2SQRT3, DFT12_Q15_INV_2SQRT3,  /* cos(pi/3) / sqrt3 */
+    Q15_INV_SQRT3,  Q15_INV_SQRT3,   /* 1 / sqrt3 */
+    Q15_HALF,       Q15_HALF,        /* cos(pi/6) / sqrt3 = 1/2 */
+    Q15_INV_2SQRT3, Q15_INV_2SQRT3,  /* cos(pi/3) / sqrt3 */
     0,                    0
 };
 
 static const int16_t W12_R3_W1_IM_SIGNED[8] __attribute__((aligned(16))) = {
     0,                    0,
-    DFT12_Q15_INV_2SQRT3,-DFT12_Q15_INV_2SQRT3,
-    DFT12_Q15_HALF,      -DFT12_Q15_HALF,
-    DFT12_Q15_INV_SQRT3, -DFT12_Q15_INV_SQRT3
+    Q15_INV_2SQRT3,-Q15_INV_2SQRT3,
+    Q15_HALF,      -Q15_HALF,
+    Q15_INV_SQRT3, -Q15_INV_SQRT3
 };
 
 
 /* W12^(2k), k = 0..3 */
 static const int16_t W12_R3_W2_RE_RE[8] __attribute__((aligned(16))) = {
-    DFT12_Q15_INV_SQRT3,   DFT12_Q15_INV_SQRT3,
-    DFT12_Q15_INV_2SQRT3,  DFT12_Q15_INV_2SQRT3,
-   -DFT12_Q15_INV_2SQRT3, -DFT12_Q15_INV_2SQRT3,
-   -DFT12_Q15_INV_SQRT3,  -DFT12_Q15_INV_SQRT3
+    Q15_INV_SQRT3,   Q15_INV_SQRT3,
+    Q15_INV_2SQRT3,  Q15_INV_2SQRT3,
+   -Q15_INV_2SQRT3, -Q15_INV_2SQRT3,
+   -Q15_INV_SQRT3,  -Q15_INV_SQRT3
 };
 
 static const int16_t W12_R3_W2_IM_SIGNED[8] __attribute__((aligned(16))) = {
     0,               0,
-    DFT12_Q15_HALF, -DFT12_Q15_HALF,
-    DFT12_Q15_HALF, -DFT12_Q15_HALF,
+    Q15_HALF, -Q15_HALF,
+    Q15_HALF, -Q15_HALF,
     0,               0
 };
 
@@ -2156,7 +2121,7 @@ static inline void dft12lts_q15_128(const c16_t *src,
      *
      *   /2 * /sqrt(3) = 1/sqrt(12)
      */
-    const __m128i As = q15_mul_i16_128(A, DFT12_Q15_INV_SQRT3);
+    const __m128i As = q15_mul_i16_128(A, Q15_INV_SQRT3);
 
     /*
      * B[k] = W12^k    * X1[k] / sqrt(3)
@@ -2180,7 +2145,7 @@ static inline void dft12lts_q15_128(const c16_t *src,
      * base = A - 1/2 * (B + C)
      */
     const __m128i halfS =
-        q15_mul_i16_128(S, DFT12_Q15_HALF);
+        q15_mul_i16_128(S, Q15_HALF);
 
     const __m128i base =
         _mm_subs_epi16(As, halfS);
@@ -2189,7 +2154,7 @@ static inline void dft12lts_q15_128(const c16_t *src,
      * c3D = sqrt(3)/2 * (B - C)
      */
     const __m128i c3D =
-        q15_mul_i16_128(D, DFT12_Q15_SQRT3_OVER_2);
+        q15_mul_i16_128(D, Q15_SQRT3_OVER_2);
 
     /*
      * Forward radix-3:
@@ -2280,7 +2245,7 @@ static inline void dft12lts_q15_128_strided(const c16_t *src,
         _mm_load_si128((const __m128i *)(const void *)W12_R3_W2_IM_SIGNED);
 
     const __m128i As =
-        q15_mul_i16_128(A, DFT12_Q15_INV_SQRT3);
+        q15_mul_i16_128(A, Q15_INV_SQRT3);
 
     const __m128i B =
         complex_mul4_prepack_q15_128(X1, W1_RE, W1_IM);
@@ -2294,13 +2259,13 @@ static inline void dft12lts_q15_128_strided(const c16_t *src,
     const __m128i Y0 = _mm_adds_epi16(As, S);
 
     const __m128i halfS =
-        q15_mul_i16_128(S, DFT12_Q15_HALF);
+        q15_mul_i16_128(S, Q15_HALF);
 
     const __m128i base =
         _mm_subs_epi16(As, halfS);
 
     const __m128i c3D =
-        q15_mul_i16_128(D, DFT12_Q15_SQRT3_OVER_2);
+        q15_mul_i16_128(D, Q15_SQRT3_OVER_2);
 
     const __m128i Y1 =
         _mm_adds_epi16(base, mul_minuslts_q15_128(c3D));
@@ -2333,14 +2298,14 @@ static const int16_t W32_1_IM_SIGNED_LO[8] __attribute__((aligned(16))) = {
 };
 
 static const int16_t W32_1_RE_RE_HI[8] __attribute__((aligned(16))) = {
-    ONE_OVER_SQRT2_Q15,  ONE_OVER_SQRT2_Q15,
+    Q15_INV_SQRT2,  Q15_INV_SQRT2,
     DFT32_Q15_SIN_3PI_16, DFT32_Q15_SIN_3PI_16,
     Q15_SIN_PI_8,   Q15_SIN_PI_8,
     DFT32_Q15_SIN_PI_16,  DFT32_Q15_SIN_PI_16
 };
 
 static const int16_t W32_1_IM_SIGNED_HI[8] __attribute__((aligned(16))) = {
-    ONE_OVER_SQRT2_Q15,  -ONE_OVER_SQRT2_Q15,
+    Q15_INV_SQRT2,  -Q15_INV_SQRT2,
     DFT32_Q15_COS_3PI_16, -DFT32_Q15_COS_3PI_16,
     Q15_COS_PI_8,   -Q15_COS_PI_8,
     DFT32_Q15_COS_PI_16,  -DFT32_Q15_COS_PI_16
@@ -2354,28 +2319,28 @@ static const int16_t W32_1_IM_SIGNED_HI[8] __attribute__((aligned(16))) = {
 static const int16_t W32_2_RE_RE_LO[8] __attribute__((aligned(16))) = {
     DFT32_Q15_ONE,       DFT32_Q15_ONE,
     Q15_COS_PI_8,  Q15_COS_PI_8,
-    ONE_OVER_SQRT2_Q15, ONE_OVER_SQRT2_Q15,
+    Q15_INV_SQRT2, Q15_INV_SQRT2,
     Q15_SIN_PI_8,  Q15_SIN_PI_8
 };
 
 static const int16_t W32_2_IM_SIGNED_LO[8] __attribute__((aligned(16))) = {
     0,                   0,
     Q15_SIN_PI_8, -Q15_SIN_PI_8,
-    ONE_OVER_SQRT2_Q15,-ONE_OVER_SQRT2_Q15,
+    Q15_INV_SQRT2,-Q15_INV_SQRT2,
     Q15_COS_PI_8, -Q15_COS_PI_8
 };
 
 static const int16_t W32_2_RE_RE_HI[8] __attribute__((aligned(16))) = {
     0,                    0,
    -Q15_SIN_PI_8,  -Q15_SIN_PI_8,
-   -ONE_OVER_SQRT2_Q15, -ONE_OVER_SQRT2_Q15,
+   -Q15_INV_SQRT2, -Q15_INV_SQRT2,
    -Q15_COS_PI_8,  -Q15_COS_PI_8
 };
 
 static const int16_t W32_2_IM_SIGNED_HI[8] __attribute__((aligned(16))) = {
     DFT32_Q15_ONE,       -DFT32_Q15_ONE,
     Q15_COS_PI_8,  -Q15_COS_PI_8,
-    ONE_OVER_SQRT2_Q15, -ONE_OVER_SQRT2_Q15,
+    Q15_INV_SQRT2, -Q15_INV_SQRT2,
     Q15_SIN_PI_8,  -Q15_SIN_PI_8
 };
 
@@ -2399,14 +2364,14 @@ static const int16_t W32_3_IM_SIGNED_LO[8] __attribute__((aligned(16))) = {
 };
 
 static const int16_t W32_3_RE_RE_HI[8] __attribute__((aligned(16))) = {
-   -ONE_OVER_SQRT2_Q15,  -ONE_OVER_SQRT2_Q15,
+   -Q15_INV_SQRT2,  -Q15_INV_SQRT2,
    -DFT32_Q15_COS_PI_16,  -DFT32_Q15_COS_PI_16,
    -Q15_COS_PI_8,   -Q15_COS_PI_8,
    -DFT32_Q15_SIN_3PI_16, -DFT32_Q15_SIN_3PI_16
 };
 
 static const int16_t W32_3_IM_SIGNED_HI[8] __attribute__((aligned(16))) = {
-    ONE_OVER_SQRT2_Q15,  -ONE_OVER_SQRT2_Q15,
+    Q15_INV_SQRT2,  -Q15_INV_SQRT2,
     DFT32_Q15_SIN_PI_16,  -DFT32_Q15_SIN_PI_16,
    -Q15_SIN_PI_8,    Q15_SIN_PI_8,
    -DFT32_Q15_COS_3PI_16,  DFT32_Q15_COS_3PI_16
@@ -2446,10 +2411,10 @@ static inline void dft8x4_q15_128(
      * - Les DFT4 internes ont déjà fait /2.
      * - Il faut encore appliquer 1/sqrt(2) au combine.
      */
-    const __m128i E0s = q15_mul_i16_128(E0, ONE_OVER_SQRT2_Q15);
-    const __m128i E1s = q15_mul_i16_128(E1, ONE_OVER_SQRT2_Q15);
-    const __m128i E2s = q15_mul_i16_128(E2, ONE_OVER_SQRT2_Q15);
-    const __m128i E3s = q15_mul_i16_128(E3, ONE_OVER_SQRT2_Q15);
+    const __m128i E0s = q15_mul_i16_128(E0, Q15_INV_SQRT2);
+    const __m128i E1s = q15_mul_i16_128(E1, Q15_INV_SQRT2);
+    const __m128i E2s = q15_mul_i16_128(E2, Q15_INV_SQRT2);
+    const __m128i E3s = q15_mul_i16_128(E3, Q15_INV_SQRT2);
 
     /*
      * W8 scaled by 1/sqrt(2):
@@ -2460,7 +2425,7 @@ static inline void dft8x4_q15_128(
      * W8^3 / sqrt(2) = -1/2 - j1/2
      */
     const __m128i T0 =
-        q15_mul_i16_128(O0, ONE_OVER_SQRT2_Q15);
+        q15_mul_i16_128(O0, Q15_INV_SQRT2);
 
     const __m128i T1 =
         complex_mul4_bcast_q15_128(O1,
@@ -2470,7 +2435,7 @@ static inline void dft8x4_q15_128(
     const __m128i T2 =
         complex_mul4_bcast_q15_128(O2,
                                     0,
-                                   -ONE_OVER_SQRT2_Q15);
+                                   -Q15_INV_SQRT2);
 
     const __m128i T3 =
         complex_mul4_bcast_q15_128(O3,
@@ -2756,7 +2721,7 @@ static inline void radix3_combine4_q15_128_scaled(
 
 
     const __m128i As =
-        q15_mul_i16_128(A, DFT24_Q15_INV_SQRT3);
+        q15_mul_i16_128(A, Q15_INV_SQRT3);
 
     /*
      * B[k] = W24^k    * X1[k] / sqrt(3)
@@ -2782,7 +2747,7 @@ static inline void radix3_combine4_q15_128_scaled(
      * base = A - 1/2 * (B + C)
      */
     const __m128i halfS =
-        q15_mul_i16_128(S, DFT24_Q15_HALF);
+        q15_mul_i16_128(S, Q15_HALF);
 
     const __m128i base =
         _mm_subs_epi16(As, halfS);
@@ -2791,7 +2756,7 @@ static inline void radix3_combine4_q15_128_scaled(
      * c3D = sqrt(3)/2 * (B - C)
      */
     const __m128i c3D =
-        q15_mul_i16_128(D, DFT24_Q15_SQRT3_OVER_2);
+        q15_mul_i16_128(D, Q15_SQRT3_OVER_2);
 
     /*
      * Forward radix-3:
@@ -3068,7 +3033,7 @@ static inline void radix5_combine4_q15_128_dft20(
      * A also needs radix-5 scaling.
      */
     const __m128i As =
-        q15_mul_i16_128(A, DFT20_Q15_INV_SQRT5);
+        q15_mul_i16_128(A, Q15_INV_SQRT5);
 
     /*
      * Y0 = A + B + C + D + E
@@ -3085,15 +3050,15 @@ static inline void radix5_combine4_q15_128_dft20(
         _mm_adds_epi16(
             As,
             _mm_adds_epi16(
-                q15_mul_i16_128(BE, DFT20_Q15_COS_2PI_5),
-                q15_mul_i16_128(CD, DFT20_Q15_COS_4PI_5)
+                q15_mul_i16_128(BE, Q15_COS_2PI_5),
+                q15_mul_i16_128(CD, Q15_COS_4PI_5)
             )
         );
 
     const __m128i imag1 =
         _mm_adds_epi16(
-            q15_mul_i16_128(BEminus, DFT20_Q15_SIN_2PI_5),
-            q15_mul_i16_128(CDminus, DFT20_Q15_SIN_4PI_5)
+            q15_mul_i16_128(BEminus, Q15_SIN_2PI_5),
+            q15_mul_i16_128(CDminus, Q15_SIN_4PI_5)
         );
 
     *Y1 = _mm_adds_epi16(base1, mul_minuslts_q15_128(imag1));
@@ -3106,15 +3071,15 @@ static inline void radix5_combine4_q15_128_dft20(
         _mm_adds_epi16(
             As,
             _mm_adds_epi16(
-                q15_mul_i16_128(BE, DFT20_Q15_COS_4PI_5),
-                q15_mul_i16_128(CD, DFT20_Q15_COS_2PI_5)
+                q15_mul_i16_128(BE, Q15_COS_4PI_5),
+                q15_mul_i16_128(CD, Q15_COS_2PI_5)
             )
         );
 
     const __m128i imag2 =
         _mm_subs_epi16(
-            q15_mul_i16_128(BEminus, DFT20_Q15_SIN_4PI_5),
-            q15_mul_i16_128(CDminus, DFT20_Q15_SIN_2PI_5)
+            q15_mul_i16_128(BEminus, Q15_SIN_4PI_5),
+            q15_mul_i16_128(CDminus, Q15_SIN_2PI_5)
         );
 
     *Y2 = _mm_adds_epi16(base2, mul_minuslts_q15_128(imag2));
@@ -3404,11 +3369,11 @@ static void radix_3_fft_c16_scaled_strided(const c16_t *src,
         return;
     }
 
-    c16_t tmp_stack[RADIX3_STACK_MAX_N] __attribute__((aligned(64)));
+    c16_t tmp_stack[STACK_MAX_N] __attribute__((aligned(64)));
     c16_t *tmp_heap = NULL;
     c16_t *tmp = NULL;
 
-    if (N <= RADIX3_STACK_MAX_N) {
+    if (N <= STACK_MAX_N) {
         tmp = tmp_stack;
     } else {
         tmp_heap = aligned_malloc64(sizeof(c16_t) * (size_t)N);
@@ -3501,134 +3466,6 @@ static void radix_3_fft_c16_scaled_strided(const c16_t *src,
     free(tmp_heap);
 }
 
-static void radix_3_fft_c16_scaledlts(const c16_t *src,
-                                   c16_t *dst,
-                                   int N,
-                                   dft_dir_t dir)
-{
-    if ((N % 3) != 0) {
-        printf("radix_3_fft_c16_scaled: invalid N=%d\n", N);
-        return;
-    }
-
-    const int size = N / 3;
-
-    if ((size & 3) != 0) {
-        printf("radix_3_fft_c16_scaled: scalar tail not implemented, size=%d\n",
-               size);
-        return;
-    }
-
-    const TwiddleTable *tw = twiddle_table_get(N);
-
-    if (!tw ||
-        !tw->r3_q15_w1_re || !tw->r3_q15_w1_im ||
-        !tw->r3_q15_w2_re || !tw->r3_q15_w2_im) {
-        printf("radix_3_fft_c16_scaled: missing radix-3 twiddles\n");
-        return;
-    }
-
-    c16_t tmp_stack[RADIX3_STACK_MAX_N] __attribute__((aligned(64)));
-    c16_t *tmp_heap = NULL;
-    c16_t *tmp = NULL;
-
-    if (N <= RADIX3_STACK_MAX_N) {
-        tmp = tmp_stack;
-    } else {
-        tmp_heap = aligned_malloc64(sizeof(c16_t) * (size_t)N);
-        if (!tmp_heap) {
-            printf("radix_3_fft_c16_scaled: allocation failed\n");
-            return;
-        }
-        tmp = tmp_heap;
-    }
-    c16_t in_stack[RADIX3_STACK_MAX_N] __attribute__((aligned(64)));
-    c16_t *in_heap = NULL;
-    c16_t *in = NULL;
-
-    if (N <= RADIX3_STACK_MAX_N) {
-        in = in_stack;
-    } else {
-        in_heap = aligned_malloc64(sizeof(c16_t) * (size_t)N);
-        if (!in_heap) {
-            free(tmp_heap);
-            printf("radix_3_fft_c16_scaled: allocation failed\n");
-            return;
-        }
-        in = in_heap;
-    }
-
-    for (int n = 0; n < size; n++) {
-        in[0 * size + n] = src[3 * n + 0];
-        in[1 * size + n] = src[3 * n + 1];
-        in[2 * size + n] = src[3 * n + 2];
-    }
-
-    dft_mixed_radix_c16_scaled(in + 0 * size,
-                                   tmp + 0 * size,
-                                   size,
-                                   dir);
-
-    dft_mixed_radix_c16_scaled(in + 1 * size,
-                                   tmp + 1 * size,
-                                   size,
-                                   dir);
-
-    dft_mixed_radix_c16_scaled(in + 2 * size,
-                                   tmp + 2 * size,
-                                   size,
-                                   dir);
-
-    free(in_heap);
-
-
-    const __m128i *w1_re_tbl =
-        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w1_re : tw->r3_q15_w1_re_inv;
-
-    const __m128i *w1_im_tbl =
-        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w1_im : tw->r3_q15_w1_im_inv;
-
-    const __m128i *w2_re_tbl =
-        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w2_re : tw->r3_q15_w2_re_inv;
-
-    const __m128i *w2_im_tbl =
-        (dir == DFT_DIR_FORWARD) ? tw->r3_q15_w2_im : tw->r3_q15_w2_im_inv;
-
-    for (int k = 0; k < size; k += 4) {
-        const int b = k >> 2;
-
-        const __m128i A =
-            _mm_loadu_si128((const __m128i *)(const void *)(tmp + 0 * size + k));
-
-        const __m128i X1 =
-            _mm_loadu_si128((const __m128i *)(const void *)(tmp + 1 * size + k));
-
-        const __m128i X2 =
-            _mm_loadu_si128((const __m128i *)(const void *)(tmp + 2 * size + k));
-
-        __m128i Y0, Y1, Y2;
-
-        radix3_combine4_q15_128_fast(
-            A,
-            X1,
-            X2,
-            w1_re_tbl[b],
-            w1_im_tbl[b],
-            w2_re_tbl[b],
-            w2_im_tbl[b],
-            &Y0,
-            &Y1,
-            &Y2,
-            dir
-        );
-
-        _mm_storeu_si128((__m128i *)(void *)(dst + 0 * size + k), Y0);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 1 * size + k), Y1);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 2 * size + k), Y2);
-    }
-
-    free(tmp_heap);
-}
 //===================================================================
 // DFT RADIX 4
 //===================================================================
@@ -3655,7 +3492,7 @@ static inline void radix4_combine4_q15_128_fast(__m128i A0,
      * Scaling radix-4 = 1/2.
      * On scale avant les additions pour limiter la saturation.
      */
-    const __m128i A0s = _mm_srai_epi16(A0, 1); ;
+    const __m128i A0s = _mm_srai_epi16(A0, 1);
 
     const __m128i s02 = _mm_adds_epi16(A0s, A2);
     const __m128i d02 = _mm_subs_epi16(A0s, A2);
@@ -3744,14 +3581,6 @@ static void radix_4_fft_forward_c16_scaled_rec(const c16_t *src,
 //===================================================================
 // DFT RADIX 5
 //===================================================================
-static inline __m128i add4s_epi16(__m128i a,
-                                  __m128i b,
-                                  __m128i c,
-                                  __m128i d)
-{
-    return _mm_adds_epi16(_mm_adds_epi16(a, b),
-                          _mm_adds_epi16(c, d));
-}
 
 
 static inline void radix5_combine4_q15_128_fast(__m128i A,
@@ -4147,77 +3976,6 @@ static void dft_mixed_radix_c16_scaled_strided(const c16_t *src,
     free(tmp);
 }
 
-static void dft_mixed_radix_c16_scaledlts(const c16_t *src,
-                                                  c16_t *dst,
-                                                  int N, dft_dir_t dir)
-{
-    if (N == 1) {
-        dst[0] = src[0];
-        return;
-    }
-
-    if (N == 4) {
-        dft4(src,dst);
-        return;
-    }
-
-    if (N == 8) {
-        dft8(src,dst);
-        return;
-    }
-
-    if (N == 12) {
-        dft12lts_q15_128(src, dst);
-        return;
-    }
-
-    if (N == 16) {
-        dft16((int16_t*)src,(int16_t*)dst,0);
-        return;
-    }
-
-    if (N == 20) {
-        dft20lts_q15_128(src, dst);
-        return;
-    }
-
-    if (N == 24) {
-        dft24lts_q15_128(src, dst);
-        return;
-    }
-
-    if (N == 32) {
-        dft32lts_q15_128(src, dst);
-        return;
-    }
-    if (N == 64) {
-        dft64ltslts(src, dst, dir);
-        return;
-    }
-
-    if (N == 128) {
-        dft128lts_dir(src, dst, dir);
-        return;
-    }
-    if (N % 5 == 0) {
-        radix_5_fft_forward_c16_scaled_rec(src, dst, N);
-        return;
-    }
-
-    if (N % 3 == 0) {
-        radix_3_fft_c16_scaledlts(src, dst, N, dir);
-        return;
-    }
-
-
-    if (is_power_of_two_int(N) && N >= 256) {
-        dft_split_radix_pure_simd(src, dst, N, dir);
-        return;
-    }
-
-    printf("fft_forward_recursive_core_c16_scaled: unsupported N = %d\n", N);
-}
-
 static void dft_mixed_radix_c16_scaled(const c16_t *src,
                                        c16_t *dst,
                                        int N,
@@ -4500,6 +4258,11 @@ DEFINE_MIXED_IDFT_ONLY(3000)
 DEFINE_MIXED_DFT_ONLY(3240)
 
 DEFINE_MIXED_IDFT_ONLY(3240)
+
+DEFINE_MIXED_DFT_ONLY(1048576)
+
+DEFINE_MIXED_DFT_ONLY(1572864)
+
 
 
 #ifndef MR_MAIN
