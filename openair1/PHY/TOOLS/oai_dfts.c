@@ -77,7 +77,6 @@
 //============================================================================
 
 
-
 static inline __m128i load4_complex_strided_c16(const c16_t *src,
                                                 int stride,
                                                 int base)
@@ -211,7 +210,7 @@ static inline __m128i complex_mul4_bcast_q15_128(__m128i a,
     return complex_mul4_prepack_q15_128(a, w_re_re, w_im_signed);
 }
 
-static inline __m128i mullts_q15_128(__m128i z)
+static inline __m128i mul_q15_128(__m128i z)
 {
     /*
      * j * (r + ji) = -i + jr
@@ -230,7 +229,7 @@ static inline __m128i mullts_q15_128(__m128i z)
     return _mm_sign_epi16(swapped, sign);
 }
 
-static inline __m128i mul_minuslts_q15_128(__m128i z)
+static inline __m128i mul_minus_q15_128(__m128i z)
 {
     /*
      * -j * (r + ji) = i - jr
@@ -254,18 +253,24 @@ static inline __m128i q15_mul_i16_128(__m128i x, int16_t q15)
     return _mm_mulhrs_epi16(x, _mm_set1_epi16(q15));
 }
 
+
+typedef enum {
+    DFT_DIR_FORWARD = -1,
+    DFT_DIR_INVERSE = 1
+} dft_dir_t;
+
 static inline __m128i mul_minus_j_dir_i16_128(__m128i z, dft_dir_t dir)
 {
     return (dir == DFT_DIR_FORWARD)
-        ? mul_minuslts_q15_128(z)
-        : mullts_q15_128(z);
+        ? mul_minus_q15_128(z)
+        : mul_q15_128(z);
 }
 
 static inline __m128i mul_plus_j_dir_i16_128(__m128i z, dft_dir_t dir)
 {
     return (dir == DFT_DIR_FORWARD)
-        ? mullts_q15_128(z)
-        : mul_minuslts_q15_128(z);
+        ? mul_q15_128(z)
+        : mul_minus_q15_128(z);
 }
 
 static inline __m128i twiddle_im_dir_128(__m128i w_im_signed, dft_dir_t dir)
@@ -275,10 +280,12 @@ static inline __m128i twiddle_im_dir_128(__m128i w_im_signed, dft_dir_t dir)
         : _mm_sub_epi16(_mm_setzero_si128(), w_im_signed);
 }
 
-typedef enum {
-    DFT_DIR_FORWARD = -1,
-    DFT_DIR_INVERSE = 1
-} dft_dir_t;
+static inline int16_t twiddle_im_scalar_dir_i16(int16_t wi_forward, dft_dir_t dir)
+{
+    return (dir == DFT_DIR_FORWARD)
+        ? wi_forward
+        : sat_i16(-(long)wi_forward);
+}
 
 
 static void *aligned_malloc(size_t size)
@@ -473,6 +480,14 @@ typedef struct {
     __m128i *r5_q15_w3_im;
     __m128i *r5_q15_w4_re;
     __m128i *r5_q15_w4_im;
+    __m128i *r5_q15_w1_re_inv;
+    __m128i *r5_q15_w1_im_inv;
+    __m128i *r5_q15_w2_re_inv;
+    __m128i *r5_q15_w2_im_inv;
+    __m128i *r5_q15_w3_re_inv;
+    __m128i *r5_q15_w3_im_inv;
+    __m128i *r5_q15_w4_re_inv;
+    __m128i *r5_q15_w4_im_inv;
 
     __m256i C64_RE_RE_q15_256[8]           __attribute__((aligned(64)));
     __m256i C64_IM_SIGNED_q15_256[8]       __attribute__((aligned(64)));
@@ -548,7 +563,7 @@ static inline __m256i pack8_twiddle_q15_re_re256i(const float complex *W,
         v[2 * j + 1] = wr;
     }
 
-    return _mm256_load_si256((const __m256i *)(const void *)v);
+    return _mm256_load_si256((const __m256i *)v);
 }
 
 static inline __m256i pack8_twiddle_q15_im_signed256i(const float complex *W,
@@ -566,7 +581,7 @@ static inline __m256i pack8_twiddle_q15_im_signed256i(const float complex *W,
         v[2 * j + 1] = wi;
     }
 
-    return _mm256_load_si256((const __m256i *)(const void *)v);
+    return _mm256_load_si256((const __m256i *)v);
 }
 
 
@@ -736,10 +751,23 @@ static int twiddle_table_create_radix5_q15_simd(TwiddleTable *table)
     table->r5_q15_w4_re = aligned_malloc64(blocks * sizeof(__m128i));
     table->r5_q15_w4_im = aligned_malloc64(blocks * sizeof(__m128i));
 
+    table->r5_q15_w1_re_inv = aligned_malloc64(blocks * sizeof(__m128i));
+    table->r5_q15_w1_im_inv = aligned_malloc64(blocks * sizeof(__m128i));
+    table->r5_q15_w2_re_inv = aligned_malloc64(blocks * sizeof(__m128i));
+    table->r5_q15_w2_im_inv = aligned_malloc64(blocks * sizeof(__m128i));
+    table->r5_q15_w3_re_inv = aligned_malloc64(blocks * sizeof(__m128i));
+    table->r5_q15_w3_im_inv = aligned_malloc64(blocks * sizeof(__m128i));
+    table->r5_q15_w4_re_inv = aligned_malloc64(blocks * sizeof(__m128i));
+    table->r5_q15_w4_im_inv = aligned_malloc64(blocks * sizeof(__m128i));
+
     if (!table->r5_q15_w1_re || !table->r5_q15_w1_im ||
         !table->r5_q15_w2_re || !table->r5_q15_w2_im ||
         !table->r5_q15_w3_re || !table->r5_q15_w3_im ||
-        !table->r5_q15_w4_re || !table->r5_q15_w4_im) {
+        !table->r5_q15_w4_re || !table->r5_q15_w4_im ||
+        !table->r5_q15_w1_re_inv || !table->r5_q15_w1_im_inv ||
+        !table->r5_q15_w2_re_inv || !table->r5_q15_w2_im_inv ||
+        !table->r5_q15_w3_re_inv || !table->r5_q15_w3_im_inv ||
+        !table->r5_q15_w4_re_inv || !table->r5_q15_w4_im_inv) {
         return 0;
     }
 
@@ -758,6 +786,18 @@ static int twiddle_table_create_radix5_q15_simd(TwiddleTable *table)
 
         table->r5_q15_w4_re[b] = pack4_twiddle_q15_re_re_scaled(table->forward, k0, 4, N, scale5);
         table->r5_q15_w4_im[b] = pack4_twiddle_q15_im_signed_scaled(table->forward, k0, 4, N, scale5);
+
+        table->r5_q15_w1_re_inv[b] = pack4_twiddle_q15_re_re_scaled(table->inverse, k0, 1, N, scale5);
+        table->r5_q15_w1_im_inv[b] = pack4_twiddle_q15_im_signed_scaled(table->inverse, k0, 1, N, scale5);
+
+        table->r5_q15_w2_re_inv[b] = pack4_twiddle_q15_re_re_scaled(table->inverse, k0, 2, N, scale5);
+        table->r5_q15_w2_im_inv[b] = pack4_twiddle_q15_im_signed_scaled(table->inverse, k0, 2, N, scale5);
+
+        table->r5_q15_w3_re_inv[b] = pack4_twiddle_q15_re_re_scaled(table->inverse, k0, 3, N, scale5);
+        table->r5_q15_w3_im_inv[b] = pack4_twiddle_q15_im_signed_scaled(table->inverse, k0, 3, N, scale5);
+
+        table->r5_q15_w4_re_inv[b] = pack4_twiddle_q15_re_re_scaled(table->inverse, k0, 4, N, scale5);
+        table->r5_q15_w4_im_inv[b] = pack4_twiddle_q15_im_signed_scaled(table->inverse, k0, 4, N, scale5);
     }
 
     return 1;
@@ -944,7 +984,7 @@ const sr_twiddle_simd_t *sr_twiddle_table_get(int N, dft_dir_t dir)
 // DFT64 8x8 int
 //===================================================================
 
-static inline void dft8x8lts_q15_256_dir(
+static inline void dft8x8_q15_256_dir(
     const __m256i x0,
     const __m256i x1,
     const __m256i x2,
@@ -1011,24 +1051,24 @@ static inline void dft8x8lts_q15_256_dir(
     *Y3 = _mm256_subs_epi16(base_pj, t3);
 }
 
-static inline void dft64ltslts(
+static inline void dft64_avx(
     const c16_t *src,
     c16_t *dst,
     dft_dir_t dir)
 {
-    const __m256i x0 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 0));
-    const __m256i x1 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 8));
-    const __m256i x2 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 16));
-    const __m256i x3 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 24));
-    const __m256i x4 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 32));
-    const __m256i x5 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 40));
-    const __m256i x6 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 48));
-    const __m256i x7 = _mm256_loadu_si256((const __m256i *)(const void *)(src + 56));
+    const __m256i x0 = _mm256_loadu_si256((const __m256i *)(src + 0));
+    const __m256i x1 = _mm256_loadu_si256((const __m256i *)(src + 8));
+    const __m256i x2 = _mm256_loadu_si256((const __m256i *)(src + 16));
+    const __m256i x3 = _mm256_loadu_si256((const __m256i *)(src + 24));
+    const __m256i x4 = _mm256_loadu_si256((const __m256i *)(src + 32));
+    const __m256i x5 = _mm256_loadu_si256((const __m256i *)(src + 40));
+    const __m256i x6 = _mm256_loadu_si256((const __m256i *)(src + 48));
+    const __m256i x7 = _mm256_loadu_si256((const __m256i *)(src + 56));
 
     __m256i H0, H1, H2, H3;
     __m256i H4, H5, H6, H7;
 
-    dft8x8lts_q15_256_dir(
+    dft8x8_q15_256_dir(
         x0, x1, x2, x3,
         x4, x5, x6, x7,
         &H0, &H1, &H2, &H3,
@@ -1069,30 +1109,30 @@ static inline void dft64ltslts(
     /*
      * Second stage.
      */
-    dft8x8lts_q15_256_dir(
+    dft8x8_q15_256_dir(
         H0, H1, H2, H3,
         H4, H5, H6, H7,
         &Y0, &Y1, &Y2, &Y3,
         &Y4, &Y5, &Y6, &Y7,
         dir
     );
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 0),  Y0);
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 8),  Y1);
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 16), Y2);
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 24), Y3);
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 32), Y4);
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 40), Y5);
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 48), Y6);
-    _mm256_storeu_si256((__m256i *)(void *)(dst + 56), Y7);
+    _mm256_storeu_si256((__m256i *)(dst + 0),  Y0);
+    _mm256_storeu_si256((__m256i *)(dst + 8),  Y1);
+    _mm256_storeu_si256((__m256i *)(dst + 16), Y2);
+    _mm256_storeu_si256((__m256i *)(dst + 24), Y3);
+    _mm256_storeu_si256((__m256i *)(dst + 32), Y4);
+    _mm256_storeu_si256((__m256i *)(dst + 40), Y5);
+    _mm256_storeu_si256((__m256i *)(dst + 48), Y6);
+    _mm256_storeu_si256((__m256i *)(dst + 56), Y7);
 }
 
-static inline void dft64lts_q15_128_strided(const c16_t *src,
+static inline void dft64_q15_128_strided(const c16_t *src,
                                          int stride,
                                          c16_t *dst,
                                          dft_dir_t dir)
 {
     if (stride == 1) {
-        dft64ltslts((c16_t *)src, dst, dir);
+        dft64_avx((c16_t *)src, dst, dir);
         return;
     }
     c16_t tmp[64] __attribute__((aligned(64)));
@@ -1101,7 +1141,7 @@ static inline void dft64lts_q15_128_strided(const c16_t *src,
     }
 
 
-    dft64ltslts(tmp, dst, dir);
+    dft64_avx(tmp, dst, dir);
 }
 //===================================================================
 // DFT128 int
@@ -1115,11 +1155,11 @@ static inline void dft128_stage0_blk_q15_256_dir(
     dft_dir_t dir)
 {
     const __m256i x0 = _mm256_loadu_si256(
-        (const __m256i *)(const void *)(src + 8 * blk)
+        (const __m256i *)(src + 8 * blk)
     );
 
     const __m256i x1 = _mm256_loadu_si256(
-        (const __m256i *)(const void *)(src + 64 + 8 * blk)
+        (const __m256i *)(src + 64 + 8 * blk)
     );
 
     __m256i sum  = _mm256_adds_epi16(x0, x1);
@@ -1145,12 +1185,12 @@ static inline void dft128_stage0_blk_q15_256_dir(
     );
 
     _mm256_store_si256(
-        (__m256i *)(void *)(a + 8 * blk),
+        (__m256i *)(a + 8 * blk),
         sum
     );
 
     _mm256_store_si256(
-        (__m256i *)(void *)(b + 8 * blk),
+        (__m256i *)(b + 8 * blk),
         diff
     );
 }
@@ -1162,11 +1202,11 @@ static inline void interleave64_complex_q15_256(
 {
     for (int blk = 0; blk < 8; blk++) {
         const __m256i va = _mm256_load_si256(
-            (const __m256i *)(const void *)(A + 8 * blk)
+            (const __m256i *)(A + 8 * blk)
         );
 
         const __m256i vb = _mm256_load_si256(
-            (const __m256i *)(const void *)(B + 8 * blk)
+            (const __m256i *)(B + 8 * blk)
         );
 
         /*
@@ -1186,18 +1226,18 @@ static inline void interleave64_complex_q15_256(
         const __m256i out1 = _mm256_permute2x128_si256(lo, hi, 0x31);
 
         _mm256_storeu_si256(
-            (__m256i *)(void *)(dst + 16 * blk),
+            (__m256i *)(dst + 16 * blk),
             out0
         );
 
         _mm256_storeu_si256(
-            (__m256i *)(void *)(dst + 16 * blk + 8),
+            (__m256i *)(dst + 16 * blk + 8),
             out1
         );
     }
 }
 
-static inline void dft128lts_dir(
+static inline void dft128_dir(
     const c16_t *src,
     c16_t *dst,
     dft_dir_t dir)
@@ -1212,19 +1252,19 @@ static inline void dft128lts_dir(
         dft128_stage0_blk_q15_256_dir(src, a, b, blk, dir);
     }
 
-    dft64ltslts(a, A, dir);
-    dft64ltslts(b, B, dir);
+    dft64_avx(a, A, dir);
+    dft64_avx(b, B, dir);
 
     interleave64_complex_q15_256(A, B, dst);
 }
 
-static inline void dft128lts_q15_128_strided(const c16_t *src,
+static inline void dft128_q15_128_strided(const c16_t *src,
                                           int stride,
                                           c16_t *dst,
                                           dft_dir_t dir)
 {
     if (stride == 1) {
-        dft128lts_dir((c16_t *)src, dst, dir);
+        dft128_dir((c16_t *)src, dst, dir);
         return;
     }
 
@@ -1234,7 +1274,7 @@ static inline void dft128lts_q15_128_strided(const c16_t *src,
         tmp[i] = src[i * stride];
     }
 
-    dft128lts_dir(tmp, dst, dir);
+    dft128_dir(tmp, dst, dir);
 }
 
 
@@ -1441,12 +1481,12 @@ static void dft_split_radix_pure_simd_core(c16_t *__restrict x,
                                            dft_dir_t dir)
 {
     if (N == 64) {
-        dft64ltslts(x, y, dir);
+        dft64_avx(x, y, dir);
         return;
     }
 
     if (N == 128) {
-        dft128lts_dir(x, y, dir);
+        dft128_dir(x, y, dir);
         return;
     }
 
@@ -1538,11 +1578,11 @@ static void dft_split_radix_pure_simd_core_strided(const c16_t *__restrict x,
                                                    dft_dir_t dir)
 {
     if (N == 64) {
-        dft64lts_q15_128_strided(x, stride, y, dir);
+        dft64_q15_128_strided(x, stride, y, dir);
         return;
     }
     if (N == 128) {
-        dft128lts_q15_128_strided(x, stride, y, dir);
+        dft128_q15_128_strided(x, stride, y, dir);
         return;
     }
     const int half    = N >> 1;
@@ -1644,10 +1684,13 @@ static void dft_split_radix_pure_simd_strided(const c16_t *x,
 //===================================================================
 // DFT4
 //===================================================================
-static inline __m128i dft4lts(__m128i x, dft_dir_t dir)
+static inline __m128i dft4_avx(__m128i x, dft_dir_t dir)
 {
+    /*
+     * lo = [x0 x1 x0 x1]
+     * hi = [x2 x3 x2 x3]
+     */
     x = _mm_srai_epi16(x, 1);
-
     const __m128i lo = _mm_shuffle_epi32(x, _MM_SHUFFLE(1, 0, 1, 0));
     const __m128i hi = _mm_shuffle_epi32(x, _MM_SHUFFLE(3, 2, 3, 2));
 
@@ -1663,34 +1706,41 @@ static inline __m128i dft4lts(__m128i x, dft_dir_t dir)
     const __m128i y1v = _mm_adds_epi16(d, mul_minus_j_dir_i16_128(d_sw, dir));
     const __m128i y3v = _mm_adds_epi16(d, mul_plus_j_dir_i16_128(d_sw, dir));
 
-    const __m128i y01 = _mm_unpacklo_epi32(y0v, y1v);
-    const __m128i y23 = _mm_unpacklo_epi32(y2v, y3v);
+    /*
+     * y0v lane0 = Y0
+     * y1v lane0 = Y1
+     * y2v lane0 = Y2
+     * y3v lane0 = Y3
+     */
+    const __m128i y01 = _mm_unpacklo_epi32(y0v, y1v);  // [Y0 Y1 ... ...]
+    const __m128i y23 = _mm_unpacklo_epi32(y2v, y3v);  // [Y2 Y3 ... ...]
 
-    return _mm_unpacklo_epi64(y01, y23);
+    return _mm_unpacklo_epi64(y01, y23);               // [Y0 Y1 Y2 Y3]
 }
 
-static inline void dft4(const c16_t *src, c16_t *dst, dft_dir_t dir)
+static inline void dft4_void(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
+
     const __m128i x =
-        _mm_loadu_si128((const __m128i *)(const void *)src);
+        _mm_loadu_si128((const __m128i *)src);
 
-    const __m128i y = dft4lts(x, dir);
+    const __m128i y = dft4_avx(x, dir);
 
-    _mm_storeu_si128((__m128i *)(void *)dst, y);
+    _mm_storeu_si128((__m128i *)dst, y);
 }
 
 
-static inline void dft8(const c16_t *src, c16_t *dst)
+static inline void dft8(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
     /*
      * v0 = [x0 x1 x2 x3]
      * v1 = [x4 x5 x6 x7]
      */
     const __m128i v0 =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 0));
+        _mm_loadu_si128((const __m128i *)(src + 0));
 
     const __m128i v1 =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 4));
+        _mm_loadu_si128((const __m128i *)(src + 4));
 
     /*
      * Séparation pair/impair :
@@ -1722,8 +1772,8 @@ static inline void dft8(const c16_t *src, c16_t *dst)
      * E = DFT4(x0, x2, x4, x6)
      * O = DFT4(x1, x3, x5, x7)
      */
-    const __m128i E = q15_mul_i16_128(dft4lts(E_in), Q15_INV_SQRT2);
-    const __m128i O = dft4lts(O_in);
+    const __m128i E = q15_mul_i16_128(dft4_avx(E_in, dir), Q15_INV_SQRT2);
+    const __m128i O = dft4_avx(O_in, dir);
 
     /*
      * Twiddles W8 forward :
@@ -1745,12 +1795,14 @@ static inline void dft8(const c16_t *src, c16_t *dst)
        -Q15_HALF, -Q15_HALF
     );
 
-    const __m128i W8_IM_SIGNED = _mm_setr_epi16(
+    const __m128i W8_IM_SIGNED_FWD = _mm_setr_epi16(
         0,              0,
         Q15_HALF, -Q15_HALF,
         23170,       -23170,
         Q15_HALF, -Q15_HALF
     );
+
+    const __m128i W8_IM_SIGNED = twiddle_im_dir_128(W8_IM_SIGNED_FWD, dir);
 
     /*
      * T[k] = W8^k * O[k], k = 0..3
@@ -1767,14 +1819,15 @@ static inline void dft8(const c16_t *src, c16_t *dst)
     const __m128i Y03 = _mm_adds_epi16(E, T);   // [Y0 Y1 Y2 Y3]
     const __m128i Y47 = _mm_subs_epi16(E, T);   // [Y4 Y5 Y6 Y7]
 
-    _mm_storeu_si128((__m128i *)(void *)(dst + 0), Y03);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 4), Y47);
+    _mm_storeu_si128((__m128i *)(dst + 0), Y03);
+    _mm_storeu_si128((__m128i *)(dst + 4), Y47);
 }
 
 
 static inline void dft8_strided_q15_128(const c16_t *src,
                                         int stride,
-                                        c16_t *dst)
+                                        c16_t *dst,
+                                        dft_dir_t dir)
 {
     c16_t tmp[8] __attribute__((aligned(16)));
 
@@ -1782,7 +1835,7 @@ static inline void dft8_strided_q15_128(const c16_t *src,
         tmp[i] = src[i * stride];
     }
 
-    dft8(tmp, dst);
+    dft8(tmp, dst, dir);
 }
 
 
@@ -1852,7 +1905,7 @@ static inline void dft4x4_q15_128(
     __m128i *Y0,
     __m128i *Y1,
     __m128i *Y2,
-    __m128i *Y3, 
+    __m128i *Y3,
     dft_dir_t dir)
 {
     const __m128i x0s = _mm_srai_epi16(x0, 1);
@@ -1899,8 +1952,9 @@ static inline void transpose4_complex_i16_128(__m128i *Y0,
     *Y3 = _mm_unpackhi_epi64(ab_hi, cd_hi); // [a3 b3 c3 d3]
 }
 
-static inline void combine16lts_q15_128(const __m128i H[4],
-                                        c16_t *dst)
+static inline void combine16_q15_128(const __m128i H[4],
+                                        c16_t *dst,
+                                        dft_dir_t dir)
 {
     /*
      * H[0] = [H0[0] H0[1] H0[2] H0[3]]
@@ -1909,22 +1963,22 @@ static inline void combine16lts_q15_128(const __m128i H[4],
      * H[3] = [H3[0] H3[1] H3[2] H3[3]]
      */
     const __m128i W1_RE_RE =
-    _mm_load_si128((const __m128i *)(const void *)W16_1_RE_RE);
+    _mm_load_si128((const __m128i *)W16_1_RE_RE);
 
     const __m128i W1_IM_SIGNED =
-    _mm_load_si128((const __m128i *)(const void *)W16_1_IM_SIGNED);
+    twiddle_im_dir_128(_mm_load_si128((const __m128i *)W16_1_IM_SIGNED), dir);
 
     const __m128i W2_RE_RE =
-    _mm_load_si128((const __m128i *)(const void *)W16_2_RE_RE);
+    _mm_load_si128((const __m128i *)W16_2_RE_RE);
 
     const __m128i W2_IM_SIGNED =
-    _mm_load_si128((const __m128i *)(const void *)W16_2_IM_SIGNED);
+    twiddle_im_dir_128(_mm_load_si128((const __m128i *)W16_2_IM_SIGNED), dir);
 
     const __m128i W3_RE_RE =
-    _mm_load_si128((const __m128i *)(const void *)W16_3_RE_RE);
+    _mm_load_si128((const __m128i *)W16_3_RE_RE);
 
     const __m128i W3_IM_SIGNED =
-    _mm_load_si128((const __m128i *)(const void *)W16_3_IM_SIGNED);
+    twiddle_im_dir_128(_mm_load_si128((const __m128i *)W16_3_IM_SIGNED), dir);
     const __m128i A0 = H[0];
 
     const __m128i A1 =
@@ -1953,48 +2007,51 @@ static inline void combine16lts_q15_128(const __m128i H[4],
      */
     dft4x4_q15_128(
         t0, t1, t2, t3,
-        &Y0, &Y1, &Y2, &Y3
+        &Y0, &Y1, &Y2, &Y3,
+        dir
     );
 
-    _mm_storeu_si128((__m128i *)(void *)(dst + 0),  Y0);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 4),  Y1);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 8),  Y2);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 12), Y3);
+    _mm_storeu_si128((__m128i *)(dst + 0),  Y0);
+    _mm_storeu_si128((__m128i *)(dst + 4),  Y1);
+    _mm_storeu_si128((__m128i *)(dst + 8),  Y2);
+    _mm_storeu_si128((__m128i *)(dst + 12), Y3);
 }
 
-static inline void dft16lts_q15_128(const c16_t *src,
-                                    c16_t *dst)
+static inline void dft16_q15_128(const c16_t *src,
+                                    c16_t *dst,
+                                    dft_dir_t dir)
 {
     __m128i H[4] __attribute__((aligned(16)));
 
     const __m128i x0 =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 0));
+        _mm_loadu_si128((const __m128i *)(src + 0));
 
     const __m128i x1 =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 4));
+        _mm_loadu_si128((const __m128i *)(src + 4));
 
     const __m128i x2 =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 8));
+        _mm_loadu_si128((const __m128i *)(src + 8));
 
     const __m128i x3 =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 12));
+        _mm_loadu_si128((const __m128i *)(src + 12));
 
     dft4x4_q15_128(
         x0, x1, x2, x3,
-        &H[0], &H[1], &H[2], &H[3]
+        &H[0], &H[1], &H[2], &H[3],
+        dir
     );
 
-    combine16lts_q15_128(H, dst);
+    combine16_q15_128(H, dst, dir);
 }
 
 void dft16(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
-    const c16_t *src = (const c16_t *)(const void *)x;
-    c16_t *dst = (c16_t *)(void *)y;
+    const c16_t *src = (const c16_t *)x;
+    c16_t *dst = (c16_t *)y;
 
     (void)scale_flag;
 
-    dft16lts_q15_128(src, dst);
+    dft16_q15_128(src, dst, DFT_DIR_FORWARD);
 }
 
 
@@ -2054,8 +2111,9 @@ static inline __m128i pack3_complex_plus_zero_c16(const c16_t a,
     );
 }
 
-static inline void dft12lts_q15_128(const c16_t *src,
-                                    c16_t *dst)
+static inline void dft12_q15_128(const c16_t *src,
+                                    c16_t *dst,
+                                    dft_dir_t dir)
 {
     /*
      * Même layout que ta version float :
@@ -2084,7 +2142,8 @@ static inline void dft12lts_q15_128(const c16_t *src,
      */
     dft4x4_q15_128(
         x0, x1, x2, x3,
-        &H0, &H1, &H2, &H3
+        &H0, &H1, &H2, &H3,
+        dir
     );
 
     /*
@@ -2102,16 +2161,16 @@ static inline void dft12lts_q15_128(const c16_t *src,
     const __m128i X2 = H2;
 
     const __m128i W1_RE =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W1_RE_RE);
+        _mm_load_si128((const __m128i *)W12_R3_W1_RE_RE);
 
     const __m128i W1_IM =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W1_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W12_R3_W1_IM_SIGNED), dir);
 
     const __m128i W2_RE =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W2_RE_RE);
+        _mm_load_si128((const __m128i *)W12_R3_W2_RE_RE);
 
     const __m128i W2_IM =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W2_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W12_R3_W2_IM_SIGNED), dir);
 
     /*
      * A est aussi multiplié par 1/sqrt(3).
@@ -2163,10 +2222,10 @@ static inline void dft12lts_q15_128(const c16_t *src,
      * Y2 = base + j*c3D
      */
     const __m128i Y1 =
-        _mm_adds_epi16(base, mul_minuslts_q15_128(c3D));
+        _mm_adds_epi16(base, mul_minus_j_dir_i16_128(c3D, dir));
 
     const __m128i Y2 =
-        _mm_adds_epi16(base, mullts_q15_128(c3D));
+        _mm_adds_epi16(base, mul_plus_j_dir_i16_128(c3D, dir));
 
     /*
      * size = 4
@@ -2175,25 +2234,26 @@ static inline void dft12lts_q15_128(const c16_t *src,
      * dst[4..7]   = Y1
      * dst[8..11]  = Y2
      */
-    _mm_storeu_si128((__m128i *)(void *)(dst + 0), Y0);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 4), Y1);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 8), Y2);
+    _mm_storeu_si128((__m128i *)(dst + 0), Y0);
+    _mm_storeu_si128((__m128i *)(dst + 4), Y1);
+    _mm_storeu_si128((__m128i *)(dst + 8), Y2);
 }
 
 
 void dft12(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
-    const c16_t *src = (const c16_t *)(const void *)x;
-    c16_t *dst = (c16_t *)(void *)y;
+    const c16_t *src = (const c16_t *)x;
+    c16_t *dst = (c16_t *)y;
 
     (void)scale_flag;
 
-    dft12lts_q15_128(src, dst);
+    dft12_q15_128(src, dst, DFT_DIR_FORWARD);
 }
 
-static inline void dft12lts_q15_128_strided(const c16_t *src,
+static inline void dft12_q15_128_strided(const c16_t *src,
                                             int stride,
-                                            c16_t *dst)
+                                            c16_t *dst,
+                                            dft_dir_t dir)
 {
     const __m128i x0 = pack3_complex_plus_zero_c16(
         src[0 * stride],
@@ -2223,7 +2283,8 @@ static inline void dft12lts_q15_128_strided(const c16_t *src,
 
     dft4x4_q15_128(
         x0, x1, x2, x3,
-        &H0, &H1, &H2, &H3
+        &H0, &H1, &H2, &H3,
+        dir
     );
 
     transpose4_complex_i16_128(&H0, &H1, &H2, &H3);
@@ -2233,16 +2294,16 @@ static inline void dft12lts_q15_128_strided(const c16_t *src,
     const __m128i X2 = H2;
 
     const __m128i W1_RE =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W1_RE_RE);
+        _mm_load_si128((const __m128i *)W12_R3_W1_RE_RE);
 
     const __m128i W1_IM =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W1_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W12_R3_W1_IM_SIGNED), dir);
 
     const __m128i W2_RE =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W2_RE_RE);
+        _mm_load_si128((const __m128i *)W12_R3_W2_RE_RE);
 
     const __m128i W2_IM =
-        _mm_load_si128((const __m128i *)(const void *)W12_R3_W2_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W12_R3_W2_IM_SIGNED), dir);
 
     const __m128i As =
         q15_mul_i16_128(A, Q15_INV_SQRT3);
@@ -2268,14 +2329,14 @@ static inline void dft12lts_q15_128_strided(const c16_t *src,
         q15_mul_i16_128(D, Q15_SQRT3_OVER_2);
 
     const __m128i Y1 =
-        _mm_adds_epi16(base, mul_minuslts_q15_128(c3D));
+        _mm_adds_epi16(base, mul_minus_j_dir_i16_128(c3D, dir));
 
     const __m128i Y2 =
-        _mm_adds_epi16(base, mullts_q15_128(c3D));
+        _mm_adds_epi16(base, mul_plus_j_dir_i16_128(c3D, dir));
 
-    _mm_storeu_si128((__m128i *)(void *)(dst + 0), Y0);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 4), Y1);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 8), Y2);
+    _mm_storeu_si128((__m128i *)(dst + 0), Y0);
+    _mm_storeu_si128((__m128i *)(dst + 4), Y1);
+    _mm_storeu_si128((__m128i *)(dst + 8), Y2);
 }
 
 
@@ -2394,7 +2455,8 @@ static inline void dft8x4_q15_128(
     __m128i *Y4,
     __m128i *Y5,
     __m128i *Y6,
-    __m128i *Y7)
+    __m128i *Y7,
+    dft_dir_t dir)
 {
     __m128i E0, E1, E2, E3;
     __m128i O0, O1, O2, O3;
@@ -2402,8 +2464,8 @@ static inline void dft8x4_q15_128(
     /*
      * dft4x4_q15_128() doit être ta version scaled /2.
      */
-    dft4x4_q15_128(x0, x2, x4, x6, &E0, &E1, &E2, &E3);
-    dft4x4_q15_128(x1, x3, x5, x7, &O0, &O1, &O2, &O3);
+    dft4x4_q15_128(x0, x2, x4, x6, &E0, &E1, &E2, &E3, dir);
+    dft4x4_q15_128(x1, x3, x5, x7, &O0, &O1, &O2, &O3, dir);
 
     /*
      * Pour que DFT8 soit normalisée par 1/sqrt(8) :
@@ -2430,17 +2492,17 @@ static inline void dft8x4_q15_128(
     const __m128i T1 =
         complex_mul4_bcast_q15_128(O1,
                                     Q15_HALF,
-                                   -Q15_HALF);
+                                    twiddle_im_scalar_dir_i16(-Q15_HALF, dir));
 
     const __m128i T2 =
         complex_mul4_bcast_q15_128(O2,
                                     0,
-                                   -Q15_INV_SQRT2);
+                                    twiddle_im_scalar_dir_i16(-Q15_INV_SQRT2, dir));
 
     const __m128i T3 =
         complex_mul4_bcast_q15_128(O3,
                                    -Q15_HALF,
-                                   -Q15_HALF);
+                                    twiddle_im_scalar_dir_i16(-Q15_HALF, dir));
 
     *Y0 = _mm_adds_epi16(E0s, T0);
     *Y4 = _mm_subs_epi16(E0s, T0);
@@ -2455,39 +2517,40 @@ static inline void dft8x4_q15_128(
     *Y7 = _mm_subs_epi16(E3s, T3);
 }
 
-static inline void combine32lts_q15_128(const __m128i H_lo[4],
+static inline void combine32_q15_128(const __m128i H_lo[4],
                                         const __m128i H_hi[4],
-                                        c16_t *dst)
+                                        c16_t *dst,
+                                        dft_dir_t dir)
 {
     const __m128i W1_RE_LO =
-        _mm_load_si128((const __m128i *)(const void *)W32_1_RE_RE_LO);
+        _mm_load_si128((const __m128i *)W32_1_RE_RE_LO);
     const __m128i W1_IM_LO =
-        _mm_load_si128((const __m128i *)(const void *)W32_1_IM_SIGNED_LO);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W32_1_IM_SIGNED_LO), dir);
 
     const __m128i W1_RE_HI =
-        _mm_load_si128((const __m128i *)(const void *)W32_1_RE_RE_HI);
+        _mm_load_si128((const __m128i *)W32_1_RE_RE_HI);
     const __m128i W1_IM_HI =
-        _mm_load_si128((const __m128i *)(const void *)W32_1_IM_SIGNED_HI);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W32_1_IM_SIGNED_HI), dir);
 
     const __m128i W2_RE_LO =
-        _mm_load_si128((const __m128i *)(const void *)W32_2_RE_RE_LO);
+        _mm_load_si128((const __m128i *)W32_2_RE_RE_LO);
     const __m128i W2_IM_LO =
-        _mm_load_si128((const __m128i *)(const void *)W32_2_IM_SIGNED_LO);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W32_2_IM_SIGNED_LO), dir);
 
     const __m128i W2_RE_HI =
-        _mm_load_si128((const __m128i *)(const void *)W32_2_RE_RE_HI);
+        _mm_load_si128((const __m128i *)W32_2_RE_RE_HI);
     const __m128i W2_IM_HI =
-        _mm_load_si128((const __m128i *)(const void *)W32_2_IM_SIGNED_HI);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W32_2_IM_SIGNED_HI), dir);
 
     const __m128i W3_RE_LO =
-        _mm_load_si128((const __m128i *)(const void *)W32_3_RE_RE_LO);
+        _mm_load_si128((const __m128i *)W32_3_RE_RE_LO);
     const __m128i W3_IM_LO =
-        _mm_load_si128((const __m128i *)(const void *)W32_3_IM_SIGNED_LO);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W32_3_IM_SIGNED_LO), dir);
 
     const __m128i W3_RE_HI =
-        _mm_load_si128((const __m128i *)(const void *)W32_3_RE_RE_HI);
+        _mm_load_si128((const __m128i *)W32_3_RE_RE_HI);
     const __m128i W3_IM_HI =
-        _mm_load_si128((const __m128i *)(const void *)W32_3_IM_SIGNED_HI);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W32_3_IM_SIGNED_HI), dir);
 
     const __m128i A0_lo = H_lo[0];
     const __m128i A0_hi = H_hi[0];
@@ -2527,72 +2590,77 @@ static inline void combine32lts_q15_128(const __m128i H_lo[4],
         lo0, lo1, lo2, lo3,
         hi0, hi1, hi2, hi3,
         &Y0, &Y1, &Y2, &Y3,
-        &Y4, &Y5, &Y6, &Y7
+        &Y4, &Y5, &Y6, &Y7,
+        dir
     );
 
-    _mm_storeu_si128((__m128i *)(void *)(dst + 0),  Y0);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 4),  Y1);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 8),  Y2);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 12), Y3);
+    _mm_storeu_si128((__m128i *)(dst + 0),  Y0);
+    _mm_storeu_si128((__m128i *)(dst + 4),  Y1);
+    _mm_storeu_si128((__m128i *)(dst + 8),  Y2);
+    _mm_storeu_si128((__m128i *)(dst + 12), Y3);
 
-    _mm_storeu_si128((__m128i *)(void *)(dst + 16), Y4);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 20), Y5);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 24), Y6);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 28), Y7);
+    _mm_storeu_si128((__m128i *)(dst + 16), Y4);
+    _mm_storeu_si128((__m128i *)(dst + 20), Y5);
+    _mm_storeu_si128((__m128i *)(dst + 24), Y6);
+    _mm_storeu_si128((__m128i *)(dst + 28), Y7);
 }
 
-static inline void dft32lts_q15_128(const c16_t *src,
-                                    c16_t *dst)
+static inline void dft32_q15_128(const c16_t *src,
+                                    c16_t *dst,
+                                    dft_dir_t dir)
 {
     __m128i H_lo[4] __attribute__((aligned(16)));
     __m128i H_hi[4] __attribute__((aligned(16)));
 
     const __m128i x0_lo =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 0));
+        _mm_loadu_si128((const __m128i *)(src + 0));
     const __m128i x0_hi =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 4));
+        _mm_loadu_si128((const __m128i *)(src + 4));
 
     const __m128i x1_lo =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 8));
+        _mm_loadu_si128((const __m128i *)(src + 8));
     const __m128i x1_hi =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 12));
+        _mm_loadu_si128((const __m128i *)(src + 12));
 
     const __m128i x2_lo =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 16));
+        _mm_loadu_si128((const __m128i *)(src + 16));
     const __m128i x2_hi =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 20));
+        _mm_loadu_si128((const __m128i *)(src + 20));
 
     const __m128i x3_lo =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 24));
+        _mm_loadu_si128((const __m128i *)(src + 24));
     const __m128i x3_hi =
-        _mm_loadu_si128((const __m128i *)(const void *)(src + 28));
+        _mm_loadu_si128((const __m128i *)(src + 28));
 
     dft4x4_q15_128(
         x0_lo, x1_lo, x2_lo, x3_lo,
-        &H_lo[0], &H_lo[1], &H_lo[2], &H_lo[3]
+        &H_lo[0], &H_lo[1], &H_lo[2], &H_lo[3],
+        dir
     );
 
     dft4x4_q15_128(
         x0_hi, x1_hi, x2_hi, x3_hi,
-        &H_hi[0], &H_hi[1], &H_hi[2], &H_hi[3]
+        &H_hi[0], &H_hi[1], &H_hi[2], &H_hi[3],
+        dir
     );
 
-    combine32lts_q15_128(H_lo, H_hi, dst);
+    combine32_q15_128(H_lo, H_hi, dst, dir);
 }
 
 void dft32(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
-    const c16_t *src = (const c16_t *)(const void *)x;
-    c16_t *dst = (c16_t *)(void *)y;
+    const c16_t *src = (const c16_t *)x;
+    c16_t *dst = (c16_t *)y;
 
     (void)scale_flag;
 
-    dft32lts_q15_128(src, dst);
+    dft32_q15_128(src, dst, DFT_DIR_FORWARD);
 }
 /*
-static inline void dft32lts_q15_128_strided(const c16_t *src,
+static inline void dft32_q15_128_strided(const c16_t *src,
                                             int stride,
-                                            c16_t *dst)
+                                            c16_t *dst,
+                                            dft_dir_t dir)
 {
     c16_t tmp[32] __attribute__((aligned(64)));
 
@@ -2600,12 +2668,13 @@ static inline void dft32lts_q15_128_strided(const c16_t *src,
         tmp[i] = src[i * stride];
     }
 
-    dft32lts_q15_128(tmp, dst);
+    dft32_q15_128(tmp, dst);
 }
 */
-static inline void dft32lts_q15_128_strided(const c16_t *src,
+static inline void dft32_q15_128_strided(const c16_t *src,
                                             int stride,
-                                            c16_t *dst)
+                                            c16_t *dst,
+                                            dft_dir_t dir)
 {
     __m128i H_lo[4] __attribute__((aligned(16)));
     __m128i H_hi[4] __attribute__((aligned(16)));
@@ -2624,15 +2693,17 @@ static inline void dft32lts_q15_128_strided(const c16_t *src,
 
     dft4x4_q15_128(
         x0_lo, x1_lo, x2_lo, x3_lo,
-        &H_lo[0], &H_lo[1], &H_lo[2], &H_lo[3]
+        &H_lo[0], &H_lo[1], &H_lo[2], &H_lo[3],
+        dir
     );
 
     dft4x4_q15_128(
         x0_hi, x1_hi, x2_hi, x3_hi,
-        &H_hi[0], &H_hi[1], &H_hi[2], &H_hi[3]
+        &H_hi[0], &H_hi[1], &H_hi[2], &H_hi[3],
+        dir
     );
 
-    combine32lts_q15_128(H_lo, H_hi, dst);
+    combine32_q15_128(H_lo, H_hi, dst, dir);
 }
 
 /*
@@ -2716,7 +2787,8 @@ static inline void radix3_combine4_q15_128_scaled(
     __m128i w2_im,
     __m128i *Y0,
     __m128i *Y1,
-    __m128i *Y2)
+    __m128i *Y2,
+    dft_dir_t dir)
 {
 
 
@@ -2764,12 +2836,13 @@ static inline void radix3_combine4_q15_128_scaled(
      * Y1 = base - j*c3D
      * Y2 = base + j*c3D
      */
-    *Y1 = _mm_adds_epi16(base, mul_minuslts_q15_128(c3D));
-    *Y2 = _mm_adds_epi16(base, mullts_q15_128(c3D));
+    *Y1 = _mm_adds_epi16(base, mul_minus_j_dir_i16_128(c3D, dir));
+    *Y2 = _mm_adds_epi16(base, mul_plus_j_dir_i16_128(c3D, dir));
 }
 
-static inline void dft24lts_q15_128(const c16_t *src,
-                                    c16_t *dst)
+static inline void dft24_q15_128(const c16_t *src,
+                                    c16_t *dst,
+                                    dft_dir_t dir)
 {
     /*
      * Radix-3 split.
@@ -2808,7 +2881,8 @@ static inline void dft24lts_q15_128(const c16_t *src,
         x0, x1, x2, x3,
         x4, x5, x6, x7,
         &H0, &H1, &H2, &H3,
-        &H4, &H5, &H6, &H7
+        &H4, &H5, &H6, &H7,
+        dir
     );
 
     /*
@@ -2838,24 +2912,24 @@ static inline void dft24lts_q15_128(const c16_t *src,
     const __m128i X2_hi = H6;
 
     const __m128i W1_RE_LO =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W1_RE_RE_LO);
+        _mm_load_si128((const __m128i *)W24_R3_W1_RE_RE_LO);
     const __m128i W1_IM_LO =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W1_IM_SIGNED_LO);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W24_R3_W1_IM_SIGNED_LO), dir);
 
     const __m128i W2_RE_LO =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W2_RE_RE_LO);
+        _mm_load_si128((const __m128i *)W24_R3_W2_RE_RE_LO);
     const __m128i W2_IM_LO =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W2_IM_SIGNED_LO);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W24_R3_W2_IM_SIGNED_LO), dir);
 
     const __m128i W1_RE_HI =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W1_RE_RE_HI);
+        _mm_load_si128((const __m128i *)W24_R3_W1_RE_RE_HI);
     const __m128i W1_IM_HI =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W1_IM_SIGNED_HI);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W24_R3_W1_IM_SIGNED_HI), dir);
 
     const __m128i W2_RE_HI =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W2_RE_RE_HI);
+        _mm_load_si128((const __m128i *)W24_R3_W2_RE_RE_HI);
     const __m128i W2_IM_HI =
-        _mm_load_si128((const __m128i *)(const void *)W24_R3_W2_IM_SIGNED_HI);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W24_R3_W2_IM_SIGNED_HI), dir);
 
     __m128i Y0_lo, Y1_lo, Y2_lo;
     __m128i Y0_hi, Y1_hi, Y2_hi;
@@ -2864,14 +2938,16 @@ static inline void dft24lts_q15_128(const c16_t *src,
         A_lo, X1_lo, X2_lo,
         W1_RE_LO, W1_IM_LO,
         W2_RE_LO, W2_IM_LO,
-        &Y0_lo, &Y1_lo, &Y2_lo
+        &Y0_lo, &Y1_lo, &Y2_lo,
+        dir
     );
 
     radix3_combine4_q15_128_scaled(
         A_hi, X1_hi, X2_hi,
         W1_RE_HI, W1_IM_HI,
         W2_RE_HI, W2_IM_HI,
-        &Y0_hi, &Y1_hi, &Y2_hi
+        &Y0_hi, &Y1_hi, &Y2_hi,
+        dir
     );
 
     /*
@@ -2881,30 +2957,31 @@ static inline void dft24lts_q15_128(const c16_t *src,
      * dst[8..15]   = Y1
      * dst[16..23]  = Y2
      */
-    _mm_storeu_si128((__m128i *)(void *)(dst + 0),  Y0_lo);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 4),  Y0_hi);
+    _mm_storeu_si128((__m128i *)(dst + 0),  Y0_lo);
+    _mm_storeu_si128((__m128i *)(dst + 4),  Y0_hi);
 
-    _mm_storeu_si128((__m128i *)(void *)(dst + 8),  Y1_lo);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 12), Y1_hi);
+    _mm_storeu_si128((__m128i *)(dst + 8),  Y1_lo);
+    _mm_storeu_si128((__m128i *)(dst + 12), Y1_hi);
 
-    _mm_storeu_si128((__m128i *)(void *)(dst + 16), Y2_lo);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 20), Y2_hi);
+    _mm_storeu_si128((__m128i *)(dst + 16), Y2_lo);
+    _mm_storeu_si128((__m128i *)(dst + 20), Y2_hi);
 }
 
 
 void dft24(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
-    const c16_t *src = (const c16_t *)(const void *)x;
-    c16_t *dst = (c16_t *)(void *)y;
+    const c16_t *src = (const c16_t *)x;
+    c16_t *dst = (c16_t *)y;
 
     (void)scale_flag;
 
-    dft24lts_q15_128(src, dst);
+    dft24_q15_128(src, dst, DFT_DIR_FORWARD);
 }
 
-static inline void dft24lts_q15_128_strided(const c16_t *src,
+static inline void dft24_q15_128_strided(const c16_t *src,
                                             int stride,
-                                            c16_t *dst)
+                                            c16_t *dst,
+                                            dft_dir_t dir)
 {
     c16_t tmp[24] __attribute__((aligned(64)));
 
@@ -2912,7 +2989,7 @@ static inline void dft24lts_q15_128_strided(const c16_t *src,
         tmp[i] = src[i * stride];
     }
 
-    dft24lts_q15_128(tmp, dst);
+    dft24_q15_128(tmp, dst, dir);
 }
 
 
@@ -3006,7 +3083,8 @@ static inline void radix5_combine4_q15_128_dft20(
     __m128i *Y1,
     __m128i *Y2,
     __m128i *Y3,
-    __m128i *Y4)
+    __m128i *Y4,
+    dft_dir_t dir)
 {
     /*
      * Twiddles W20 are already scaled by 1/sqrt(5).
@@ -3061,8 +3139,8 @@ static inline void radix5_combine4_q15_128_dft20(
             q15_mul_i16_128(CDminus, Q15_SIN_4PI_5)
         );
 
-    *Y1 = _mm_adds_epi16(base1, mul_minuslts_q15_128(imag1));
-    *Y4 = _mm_adds_epi16(base1, mullts_q15_128(imag1));
+    *Y1 = _mm_adds_epi16(base1, mul_minus_j_dir_i16_128(imag1, dir));
+    *Y4 = _mm_adds_epi16(base1, mul_plus_j_dir_i16_128(imag1, dir));
 
     /*
      * Y2 / Y3
@@ -3082,11 +3160,12 @@ static inline void radix5_combine4_q15_128_dft20(
             q15_mul_i16_128(CDminus, Q15_SIN_2PI_5)
         );
 
-    *Y2 = _mm_adds_epi16(base2, mul_minuslts_q15_128(imag2));
-    *Y3 = _mm_adds_epi16(base2, mullts_q15_128(imag2));
+    *Y2 = _mm_adds_epi16(base2, mul_minus_j_dir_i16_128(imag2, dir));
+    *Y3 = _mm_adds_epi16(base2, mul_plus_j_dir_i16_128(imag2, dir));
 }
-static inline void dft20lts_q15_128(const c16_t *src,
-                                    c16_t *dst)
+static inline void dft20_q15_128(const c16_t *src,
+                                    c16_t *dst,
+                                    dft_dir_t dir)
 {
     /*
      * Radix-5 split, size = 4.
@@ -3129,7 +3208,8 @@ static inline void dft20lts_q15_128(const c16_t *src,
      */
     dft4x4_q15_128(
         x0, x1, x2, x3,
-        &H0, &H1, &H2, &H3
+        &H0, &H1, &H2, &H3,
+        dir
     );
 
     /*
@@ -3167,7 +3247,8 @@ static inline void dft20lts_q15_128(const c16_t *src,
 
     dft4x4_q15_128(
         z0, z1, z2, z3,
-        &G0, &G1, &G2, &G3
+        &G0, &G1, &G2, &G3,
+        dir
     );
 
     /*
@@ -3178,24 +3259,24 @@ static inline void dft20lts_q15_128(const c16_t *src,
     const __m128i X4 = _mm_unpacklo_epi64(g01, g23);
 
     const __m128i W1_RE =
-        _mm_load_si128((const __m128i *)(const void *)W20_1_RE_RE);
+        _mm_load_si128((const __m128i *)W20_1_RE_RE);
     const __m128i W1_IM =
-        _mm_load_si128((const __m128i *)(const void *)W20_1_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W20_1_IM_SIGNED), dir);
 
     const __m128i W2_RE =
-        _mm_load_si128((const __m128i *)(const void *)W20_2_RE_RE);
+        _mm_load_si128((const __m128i *)W20_2_RE_RE);
     const __m128i W2_IM =
-        _mm_load_si128((const __m128i *)(const void *)W20_2_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W20_2_IM_SIGNED), dir);
 
     const __m128i W3_RE =
-        _mm_load_si128((const __m128i *)(const void *)W20_3_RE_RE);
+        _mm_load_si128((const __m128i *)W20_3_RE_RE);
     const __m128i W3_IM =
-        _mm_load_si128((const __m128i *)(const void *)W20_3_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W20_3_IM_SIGNED), dir);
 
     const __m128i W4_RE =
-        _mm_load_si128((const __m128i *)(const void *)W20_4_RE_RE);
+        _mm_load_si128((const __m128i *)W20_4_RE_RE);
     const __m128i W4_IM =
-        _mm_load_si128((const __m128i *)(const void *)W20_4_IM_SIGNED);
+        twiddle_im_dir_128(_mm_load_si128((const __m128i *)W20_4_IM_SIGNED), dir);
 
     __m128i Y0, Y1, Y2, Y3, Y4;
 
@@ -3205,7 +3286,8 @@ static inline void dft20lts_q15_128(const c16_t *src,
         W2_RE, W2_IM,
         W3_RE, W3_IM,
         W4_RE, W4_IM,
-        &Y0, &Y1, &Y2, &Y3, &Y4
+        &Y0, &Y1, &Y2, &Y3, &Y4,
+        dir
     );
 
     /*
@@ -3217,26 +3299,27 @@ static inline void dft20lts_q15_128(const c16_t *src,
      * dst[12..15]  = Y3
      * dst[16..19]  = Y4
      */
-    _mm_storeu_si128((__m128i *)(void *)(dst + 0),  Y0);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 4),  Y1);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 8),  Y2);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 12), Y3);
-    _mm_storeu_si128((__m128i *)(void *)(dst + 16), Y4);
+    _mm_storeu_si128((__m128i *)(dst + 0),  Y0);
+    _mm_storeu_si128((__m128i *)(dst + 4),  Y1);
+    _mm_storeu_si128((__m128i *)(dst + 8),  Y2);
+    _mm_storeu_si128((__m128i *)(dst + 12), Y3);
+    _mm_storeu_si128((__m128i *)(dst + 16), Y4);
 }
 
 void dft20(int16_t *x, int16_t *y, uint8_t scale_flag)
 {
-    const c16_t *src = (const c16_t *)(const void *)x;
-    c16_t *dst = (c16_t *)(void *)y;
+    const c16_t *src = (const c16_t *)x;
+    c16_t *dst = (c16_t *)y;
 
     (void)scale_flag;
 
-    dft20lts_q15_128(src, dst);
+    dft20_q15_128(src, dst, DFT_DIR_FORWARD);
 }
 
-static inline void dft20lts_q15_128_strided(const c16_t *src,
+static inline void dft20_q15_128_strided(const c16_t *src,
                                             int stride,
-                                            c16_t *dst)
+                                            c16_t *dst,
+                                            dft_dir_t dir)
 {
     c16_t tmp[20] __attribute__((aligned(64)));
 
@@ -3244,28 +3327,31 @@ static inline void dft20lts_q15_128_strided(const c16_t *src,
         tmp[i] = src[i * stride];
     }
 
-    dft20lts_q15_128(tmp, dst);
+    dft20_q15_128(tmp, dst, dir);
 }
 
-static inline void dft16lts_q15_128_from_regs(const __m128i x0,
+static inline void dft16_q15_128_from_regs(const __m128i x0,
                                               const __m128i x1,
                                               const __m128i x2,
                                               const __m128i x3,
-                                              c16_t *dst)
+                                              c16_t *dst,
+                                              dft_dir_t dir)
 {
     __m128i H[4] __attribute__((aligned(16)));
 
     dft4x4_q15_128(
         x0, x1, x2, x3,
-        &H[0], &H[1], &H[2], &H[3]
+        &H[0], &H[1], &H[2], &H[3],
+        dir
     );
 
-    combine16lts_q15_128(H, dst);
+    combine16_q15_128(H, dst, dir);
 }
 
-static inline void dft16lts_q15_128_strided(const c16_t *src,
+static inline void dft16_q15_128_strided(const c16_t *src,
                                             int stride,
-                                            c16_t *dst)
+                                            c16_t *dst,
+                                            dft_dir_t dir)
 {
     const __m128i x0 = load4_complex_strided_c16(src, stride, 0);
 
@@ -3275,7 +3361,7 @@ static inline void dft16lts_q15_128_strided(const c16_t *src,
 
     const __m128i x3 = load4_complex_strided_c16(src, stride, 12);
 
-    dft16lts_q15_128_from_regs(x0, x1, x2, x3, dst);
+    dft16_q15_128_from_regs(x0, x1, x2, x3, dst, dir);
 }
 
 
@@ -3319,7 +3405,6 @@ static inline void radix3_combine4_q15_128_fast(__m128i A,
      * base = A/sqrt(3) - B/(2*sqrt(3)) - C/(2*sqrt(3))
      */
     const __m128i Sh = _mm_srai_epi16(S,1);
-    const __m128i Dh = _mm_srai_epi16(D,1);
 
     const __m128i base = _mm_subs_epi16(As,Sh);
 
@@ -3334,8 +3419,8 @@ static inline void radix3_combine4_q15_128_fast(__m128i A,
      * Y1 = base - j*Z
      * Y2 = base + j*Z
      */
-    *Y1 = _mm_adds_epi16(base, (dir == DFT_DIR_FORWARD) ? mul_minuslts_q15_128(Z) : mullts_q15_128(Z));
-    *Y2 = _mm_adds_epi16(base, (dir == DFT_DIR_FORWARD) ? mullts_q15_128(Z) : mul_minuslts_q15_128(Z));
+    *Y1 = _mm_adds_epi16(base, (dir == DFT_DIR_FORWARD) ? mul_minus_q15_128(Z) : mul_q15_128(Z));
+    *Y2 = _mm_adds_epi16(base, (dir == DFT_DIR_FORWARD) ? mul_q15_128(Z) : mul_minus_q15_128(Z));
 }
 
 
@@ -3434,13 +3519,13 @@ static void radix_3_fft_c16_scaled_strided(const c16_t *src,
         const int b = k >> 2;
 
         const __m128i A =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 0 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 0 * size + k));
 
         const __m128i X1 =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 1 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 1 * size + k));
 
         const __m128i X2 =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 2 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 2 * size + k));
 
         __m128i Y0, Y1, Y2;
 
@@ -3458,9 +3543,9 @@ static void radix_3_fft_c16_scaled_strided(const c16_t *src,
             dir
         );
 
-        _mm_storeu_si128((__m128i *)(void *)(dst + 0 * size + k), Y0);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 1 * size + k), Y1);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 2 * size + k), Y2);
+        _mm_storeu_si128((__m128i *)(dst + 0 * size + k), Y0);
+        _mm_storeu_si128((__m128i *)(dst + 1 * size + k), Y1);
+        _mm_storeu_si128((__m128i *)(dst + 2 * size + k), Y2);
     }
 
     free(tmp_heap);
@@ -3482,7 +3567,8 @@ static inline void radix4_combine4_q15_128_fast(__m128i A0,
                                                 __m128i *Y0,
                                                 __m128i *Y1,
                                                 __m128i *Y2,
-                                                __m128i *Y3)
+                                                __m128i *Y3,
+                                                dft_dir_t dir)
 {
     const __m128i A1 = complex_mul4_prepack_q15_128(X1, w1_re, w1_im);
     const __m128i A2 = complex_mul4_prepack_q15_128(X2, w2_re, w2_im);
@@ -3503,8 +3589,8 @@ static inline void radix4_combine4_q15_128_fast(__m128i A0,
     *Y0 = _mm_adds_epi16(s02, s13);
     *Y2 = _mm_subs_epi16(s02, s13);
 
-    *Y1 = _mm_adds_epi16(d02, mul_minuslts_q15_128(d13));
-    *Y3 = _mm_adds_epi16(d02, mullts_q15_128(d13));
+    *Y1 = _mm_adds_epi16(d02, mul_minus_j_dir_i16_128(d13, dir));
+    *Y3 = _mm_adds_epi16(d02, mul_plus_j_dir_i16_128(d13, dir));
 }
 
 static void radix_4_fft_forward_c16_scaled_rec(const c16_t *src,
@@ -3563,7 +3649,8 @@ static void radix_4_fft_forward_c16_scaled_rec(const c16_t *src,
                                       tw->r4_q15_w2_im[b],
                                       tw->r4_q15_w3_re[b],
                                       tw->r4_q15_w3_im[b],
-                                      &Y0, &Y1, &Y2, &Y3);
+                                      &Y0, &Y1, &Y2, &Y3,
+                                      DFT_DIR_FORWARD);
 
         _mm_storeu_si128((__m128i *)(dst + 0 * size + k), Y0);
         _mm_storeu_si128((__m128i *)(dst + 1 * size + k), Y1);
@@ -3600,7 +3687,8 @@ static inline void radix5_combine4_q15_128_fast(__m128i A,
                                                 __m128i *Y1,
                                                 __m128i *Y2,
                                                 __m128i *Y3,
-                                                __m128i *Y4)
+                                                __m128i *Y4,
+                                                dft_dir_t dir)
 {
     const __m128i B = complex_mul4_prepack_q15_128(X1, w1_re, w1_im);
     const __m128i C = complex_mul4_prepack_q15_128(X2, w2_re, w2_im);
@@ -3635,8 +3723,8 @@ static inline void radix5_combine4_q15_128_fast(__m128i A,
         q15_mul_i16_128(CDminus,19260)
     );
 
-    *Y1 = _mm_adds_epi16(base1, mul_minuslts_q15_128(imag1));
-    *Y4 = _mm_adds_epi16(base1, mullts_q15_128(imag1));
+    *Y1 = _mm_adds_epi16(base1, mul_minus_j_dir_i16_128(imag1, dir));
+    *Y4 = _mm_adds_epi16(base1, mul_plus_j_dir_i16_128(imag1, dir));
 
     /*
      * base2 = A/sqrt5 + c2/sqrt5*(B+E) + c1/sqrt5*(C+D)
@@ -3654,8 +3742,8 @@ static inline void radix5_combine4_q15_128_fast(__m128i A,
         q15_mul_i16_128(CDminus,31163)
     );
 
-    *Y2 = _mm_adds_epi16(base2, mul_minuslts_q15_128(imag2));
-    *Y3 = _mm_adds_epi16(base2, mullts_q15_128(imag2));
+    *Y2 = _mm_adds_epi16(base2, mul_minus_j_dir_i16_128(imag2, dir));
+    *Y3 = _mm_adds_epi16(base2, mul_plus_j_dir_i16_128(imag2, dir));
 }
 
 #define RADIX5_STACK_MAX_N 1024
@@ -3685,7 +3773,11 @@ static void radix_5_fft_c16_scaled_strided(const c16_t *src,
         !tw->r5_q15_w1_re || !tw->r5_q15_w1_im ||
         !tw->r5_q15_w2_re || !tw->r5_q15_w2_im ||
         !tw->r5_q15_w3_re || !tw->r5_q15_w3_im ||
-        !tw->r5_q15_w4_re || !tw->r5_q15_w4_im) {
+        !tw->r5_q15_w4_re || !tw->r5_q15_w4_im ||
+        !tw->r5_q15_w1_re_inv || !tw->r5_q15_w1_im_inv ||
+        !tw->r5_q15_w2_re_inv || !tw->r5_q15_w2_im_inv ||
+        !tw->r5_q15_w3_re_inv || !tw->r5_q15_w3_im_inv ||
+        !tw->r5_q15_w4_re_inv || !tw->r5_q15_w4_im_inv) {
         printf("radix_5_fft_c16_scaled_strided: missing radix-5 twiddles\n");
         return;
     }
@@ -3745,126 +3837,48 @@ static void radix_5_fft_c16_scaled_strided(const c16_t *src,
         dir
     );
 
+    const __m128i *w1_re_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w1_re : tw->r5_q15_w1_re_inv;
+    const __m128i *w1_im_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w1_im : tw->r5_q15_w1_im_inv;
+    const __m128i *w2_re_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w2_re : tw->r5_q15_w2_re_inv;
+    const __m128i *w2_im_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w2_im : tw->r5_q15_w2_im_inv;
+    const __m128i *w3_re_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w3_re : tw->r5_q15_w3_re_inv;
+    const __m128i *w3_im_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w3_im : tw->r5_q15_w3_im_inv;
+    const __m128i *w4_re_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w4_re : tw->r5_q15_w4_re_inv;
+    const __m128i *w4_im_tbl = (dir == DFT_DIR_FORWARD) ? tw->r5_q15_w4_im : tw->r5_q15_w4_im_inv;
+
     for (int k = 0; k < size; k += 4) {
         const int b = k >> 2;
 
         const __m128i A =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 0 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 0 * size + k));
 
         const __m128i X1 =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 1 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 1 * size + k));
 
         const __m128i X2 =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 2 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 2 * size + k));
 
         const __m128i X3 =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 3 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 3 * size + k));
 
         const __m128i X4 =
-            _mm_load_si128((const __m128i *)(const void *)(tmp + 4 * size + k));
+            _mm_load_si128((const __m128i *)(tmp + 4 * size + k));
 
         __m128i Y0, Y1, Y2, Y3, Y4;
 
         radix5_combine4_q15_128_fast(
             A, X1, X2, X3, X4,
-            tw->r5_q15_w1_re[b],
-            tw->r5_q15_w1_im[b],
-            tw->r5_q15_w2_re[b],
-            tw->r5_q15_w2_im[b],
-            tw->r5_q15_w3_re[b],
-            tw->r5_q15_w3_im[b],
-            tw->r5_q15_w4_re[b],
-            tw->r5_q15_w4_im[b],
-            &Y0, &Y1, &Y2, &Y3, &Y4
+            w1_re_tbl[b],
+            w1_im_tbl[b],
+            w2_re_tbl[b],
+            w2_im_tbl[b],
+            w3_re_tbl[b],
+            w3_im_tbl[b],
+            w4_re_tbl[b],
+            w4_im_tbl[b],
+            &Y0, &Y1, &Y2, &Y3, &Y4,
+            dir
         );
-
-        _mm_storeu_si128((__m128i *)(void *)(dst + 0 * size + k), Y0);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 1 * size + k), Y1);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 2 * size + k), Y2);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 3 * size + k), Y3);
-        _mm_storeu_si128((__m128i *)(void *)(dst + 4 * size + k), Y4);
-    }
-
-    free(tmp_heap);
-}
-static void radix_5_fft_forward_c16_scaled_rec(const c16_t *src,
-                                               c16_t *dst,
-                                               int N)
-{
-    const int size = N / 5;
-
-    c16_t stack_work[2 * STACK_MAX_N] __attribute__((aligned(64)));
-    c16_t *heap_work = NULL;
-    c16_t *work = NULL;
-
-    if (N <= STACK_MAX_N) {
-        work = stack_work;
-    } else {
-        heap_work = aligned_malloc64(sizeof(c16_t) * 2 * (size_t)N);
-        if (!heap_work) {
-            printf("radix_5_fft_forward_c16_scaled_rec: allocation failed\n");
-            return;
-        }
-        work = heap_work;
-    }
-
-    c16_t *in  = work;
-    c16_t *tmp = work + N;
-
-    if (!in || !tmp) {
-        printf("radix_5_fft_forward_c16_scaled_rec: allocation failed\n");
-        free(in);
-        free(tmp);
-        return;
-    }
-
-    for (int n = 0; n < size; n++) {
-        in[0 * size + n] = src[5 * n + 0];
-        in[1 * size + n] = src[5 * n + 1];
-        in[2 * size + n] = src[5 * n + 2];
-        in[3 * size + n] = src[5 * n + 3];
-        in[4 * size + n] = src[5 * n + 4];
-    }
-
-    dft_mixed_radix_c16_scaled(in + 0 * size, tmp + 0 * size, size, DFT_DIR_FORWARD);
-    dft_mixed_radix_c16_scaled(in + 1 * size, tmp + 1 * size, size, DFT_DIR_FORWARD);
-    dft_mixed_radix_c16_scaled(in + 2 * size, tmp + 2 * size, size, DFT_DIR_FORWARD);
-    dft_mixed_radix_c16_scaled(in + 3 * size, tmp + 3 * size, size, DFT_DIR_FORWARD);
-    dft_mixed_radix_c16_scaled(in + 4 * size, tmp + 4 * size, size, DFT_DIR_FORWARD);
-
-    const TwiddleTable *tw = twiddle_table_get(N);
-
-    if (!tw || !tw->r5_q15_w1_re || !tw->r5_q15_w2_re ||
-        !tw->r5_q15_w3_re || !tw->r5_q15_w4_re) {
-        printf("radix_5_fft_forward_c16_scaled_rec: missing Q15 twiddles\n");
-        free(in);
-        free(tmp);
-        return;
-    }
-
-    int k = 0;
-
-    for (; k + 3 < size; k += 4) {
-        const int b = k >> 2;
-
-        const __m128i A  = _mm_loadu_si128((const __m128i *)(tmp + 0 * size + k));
-        const __m128i X1 = _mm_loadu_si128((const __m128i *)(tmp + 1 * size + k));
-        const __m128i X2 = _mm_loadu_si128((const __m128i *)(tmp + 2 * size + k));
-        const __m128i X3 = _mm_loadu_si128((const __m128i *)(tmp + 3 * size + k));
-        const __m128i X4 = _mm_loadu_si128((const __m128i *)(tmp + 4 * size + k));
-
-        __m128i Y0, Y1, Y2, Y3, Y4;
-
-        radix5_combine4_q15_128_fast(A, X1, X2, X3, X4,
-                                      tw->r5_q15_w1_re[b],
-                                      tw->r5_q15_w1_im[b],
-                                      tw->r5_q15_w2_re[b],
-                                      tw->r5_q15_w2_im[b],
-                                      tw->r5_q15_w3_re[b],
-                                      tw->r5_q15_w3_im[b],
-                                      tw->r5_q15_w4_re[b],
-                                      tw->r5_q15_w4_im[b],
-                                      &Y0, &Y1, &Y2, &Y3, &Y4);
 
         _mm_storeu_si128((__m128i *)(dst + 0 * size + k), Y0);
         _mm_storeu_si128((__m128i *)(dst + 1 * size + k), Y1);
@@ -3873,11 +3887,7 @@ static void radix_5_fft_forward_c16_scaled_rec(const c16_t *src,
         _mm_storeu_si128((__m128i *)(dst + 4 * size + k), Y4);
     }
 
-    if (k != size) {
-        printf("radix_5_fft_forward_c16_scaled_rec: scalar tail not implemented, size=%d\n", size);
-    }
-
-    free(heap_work);
+    free(tmp_heap);
 }
 
 //===================================================================
@@ -3895,47 +3905,47 @@ static void dft_mixed_radix_c16_scaled_strided(const c16_t *src,
     }
 
     if (N == 4) {
-        dft4(src, dst);
+        dft4_void(src, dst, dir);
         return;
     }
 
     if (N == 8) {
-        dft8_strided_q15_128(src, stride, dst);
+        dft8_strided_q15_128(src, stride, dst, dir);
         return;
     }
 
     if (N == 12) {
-        dft12lts_q15_128_strided(src, stride, dst);
+        dft12_q15_128_strided(src, stride, dst, dir);
         return;
     }
 
     if (N == 16) {
-        dft16lts_q15_128_strided(src, stride, dst);
+        dft16_q15_128_strided(src, stride, dst, dir);
         return;
     }
 
     if (N == 20) {
-        dft20lts_q15_128_strided(src, stride, dst);
+        dft20_q15_128_strided(src, stride, dst, dir);
         return;
     }
 
     if (N == 24) {
-        dft24lts_q15_128_strided(src, stride, dst);
+        dft24_q15_128_strided(src, stride, dst, dir);
         return;
     }
 
     if (N == 32) {
-        dft32lts_q15_128_strided(src, stride, dst);
+        dft32_q15_128_strided(src, stride, dst, dir);
         return;
     }
 
     if (N == 64) {
-        dft64lts_q15_128_strided(src, stride, dst, dir);
+        dft64_q15_128_strided(src, stride, dst, dir);
         return;
     }
 
     if (N == 128) {
-        dft128lts_q15_128_strided(src, stride, dst, dir);
+        dft128_q15_128_strided(src, stride, dst, dir);
         return;
     }
 
@@ -4007,6 +4017,14 @@ void idft##N(int16_t *input, int16_t *output, uint8_t scale_flag)      \
                                DFT_DIR_INVERSE);                      \
 }
 
+
+DEFINE_MIXED_IDFT_ONLY(4)
+DEFINE_MIXED_IDFT_ONLY(8)
+DEFINE_MIXED_IDFT_ONLY(12)
+DEFINE_MIXED_IDFT_ONLY(16)
+DEFINE_MIXED_IDFT_ONLY(20)
+DEFINE_MIXED_IDFT_ONLY(24)
+DEFINE_MIXED_IDFT_ONLY(32)
 
 DEFINE_MIXED_DFT_ONLY(192)
 DEFINE_MIXED_DFT_ONLY(384)
@@ -4260,8 +4278,10 @@ DEFINE_MIXED_DFT_ONLY(3240)
 DEFINE_MIXED_IDFT_ONLY(3240)
 
 DEFINE_MIXED_DFT_ONLY(1048576)
+DEFINE_MIXED_IDFT_ONLY(1048576)
 
 DEFINE_MIXED_DFT_ONLY(1572864)
+DEFINE_MIXED_IDFT_ONLY(1572864)
 
 
 

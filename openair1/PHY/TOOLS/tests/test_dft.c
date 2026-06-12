@@ -4723,6 +4723,9 @@ static inline void print_time_col(double v)
 
 
 
+/* =========================================================
+ * Main
+ * ========================================================= */
 
 /* =========================================================
  * Main
@@ -4739,21 +4742,20 @@ int main(void)
     /*
      * Tailles testées.
      *
-     * Tu peux ajouter ici des tailles non power-of-two :
-     * 12, 48, 96, 192, 384, 768, 1536, ...
-     *
-     * OAI et split-radix seront automatiquement désactivés
-     * si la taille n'est pas supportée.
+     * Pour debug IDFT, commence plutôt par des petites tailles :
+     * 4, 8, 12, 16, 20, 24, 32, 36, 48, 60, 64, 72, 96, 108, 120, 128, 192.
      */
-    const int sizes[] = {1048576, 1572864, 16384,
-    18432, 24576, 32768, 36864, 49152, 65536, 98304, 192, 16, 36, 48, 12, 24, 60, 64, 72, 96, 108, 120, 128,
-    144, 180, 192, 216, 240, 256, 288, 300, 324, 360,
-    384, 432, 480, 512, 540, 576, 600, 648, 720, 768,
-    864, 900, 960, 972, 1024, 1080, 1152, 1200, 1296,
-    1440, 1500, 1536, 1620, 1728, 1800, 1920, 1944,
-    2048, 2160, 2304, 2400, 2592, 2700, 2880, 2916,
-    3000, 3072, 3240, 4096, 6144, 8192, 12288, 16384,
-    18432, 24576, 32768, 36864, 49152, 65536, 98304
+    const int sizes[] = {
+        1048576, 1572864, 16384,
+        18432, 24576, 32768, 36864, 49152, 65536, 98304,
+        192, 16, 36, 48, 12, 24, 60, 64, 72, 96, 108, 120, 128,
+        144, 180, 192, 216, 240, 256, 288, 300, 324, 360,
+        384, 432, 480, 512, 540, 576, 600, 648, 720, 768,
+        864, 900, 960, 972, 1024, 1080, 1152, 1200, 1296,
+        1440, 1500, 1536, 1620, 1728, 1800, 1920, 1944,
+        2048, 2160, 2304, 2400, 2592, 2700, 2880, 2916,
+        3000, 3072, 3240, 4096, 6144, 8192, 12288, 16384,
+        18432, 24576, 32768, 36864, 49152, 65536, 98304
     };
 
     const int nb_sizes = sizeof(sizes) / sizeof(sizes[0]);
@@ -4769,24 +4771,26 @@ int main(void)
     const unsigned seed = 12345;
     randominit(seed);
 
-    double coeffs[] = {1, 10 , 20, 30, 40, 50, 60, 70};
+    double coeffs[] = {1, 10, 20, 30, 40, 50, 60, 70};
     const int nb_coeffs = sizeof(coeffs) / sizeof(coeffs[0]);
 
-    printf("================================================================================================================================================\n");
-    printf("DFT robustness comparison\n");
-    printf("Classic DFT is used only as EVM reference\n");
-    printf("Compared: OAI DFT c16 vs split-radix SIMD c16 vs mixed-radix float LTS vs split-radix float LTS\n");
+    printf("===============================================================================================================================================================\n");
+    printf("DFT / IDFT robustness comparison\n");
+    printf("Forward reference: FFTW_FORWARD / sqrt(N)\n");
+    printf("Inverse reference: FFTW_BACKWARD(freq_input) / sqrt(N)\n");
+    printf("Roundtrip check: IDFT(DFT(x_oai)) compared to quantized x_oai\n");
     printf("Seed = %u\n", seed);
-    printf("================================================================================================================================================\n\n");
+    printf("===============================================================================================================================================================\n\n");
 
-    printf("%8s | %8s | %12s | %12s | %12s | %12s | %12s | %12s || %12s | %12s | %12s | %12s | %12s | %12s\n",
+    printf("%8s | %8s | %12s | %12s | %12s | %12s | %12s | %12s | %12s || %12s | %12s | %12s | %12s | %12s | %12s\n",
            "N",
            "Coeff",
-           "OAI EVM %",
+           "OAI DFT %",
+           "OAI IDFT %",
+           "OAI RT %",
            "SplitOAI %",
            "FFTW EVM %",
            "FFTZ EVM %",
-           "Mixed EVM %",
            "Splitflt %",
            "OAI ns",
            "SplitOAI ns",
@@ -4795,7 +4799,7 @@ int main(void)
            "Mixed ns",
            "Splitflt ns");
 
-    printf("---------+----------+--------------+--------------+--------------+--------------+--------------+--------------++--------------+--------------+--------------+--------------+--------------+--------------\n");
+    printf("---------+----------+--------------+--------------+--------------+--------------+--------------+--------------+--------------++--------------+--------------+--------------+--------------+--------------+--------------\n");
 
     for (int si = 0; si < nb_sizes; si++) {
         const int N = sizes[si];
@@ -4819,17 +4823,15 @@ int main(void)
         }
 
         float complex *x = NULL;
-        float complex *classic_ref = NULL;
-        float complex *classic_scaled = NULL;
 
         c16_t *x_oai = NULL;
         c16_t *oai_out_q = NULL;
+        c16_t *oai_idft_out_q = NULL;
         c16_t *split_out_q = NULL;
 
-        
-
-        
+        float complex *x_oai_f = NULL;
         float complex *oai_out_f = NULL;
+        float complex *oai_idft_out_f = NULL;
         float complex *split_out_f = NULL;
 
         float complex *avx64_out_f = NULL;
@@ -4838,17 +4840,25 @@ int main(void)
         float complex *splitflt_out_f = NULL;
         float complex *splitflt_scaled_f = NULL;
 
+        float complex *fftw_out_f = NULL;
+        float complex *fftw_scaled_f = NULL;
+        float complex *fftw_idft_scaled_f = NULL;
+
+        float complex *fftz_out_f = NULL;
+        float complex *fftz_scaled_f = NULL;
+
         int ret = 0;
 
         ret |= posix_memalign((void **)&x, 64, sizeof(float complex) * N);
-        ret |= posix_memalign((void **)&classic_ref, 64, sizeof(float complex) * N);
-        ret |= posix_memalign((void **)&classic_scaled, 64, sizeof(float complex) * N);
 
         ret |= posix_memalign((void **)&x_oai, 64, sizeof(c16_t) * N);
         ret |= posix_memalign((void **)&oai_out_q, 64, sizeof(c16_t) * N);
+        ret |= posix_memalign((void **)&oai_idft_out_q, 64, sizeof(c16_t) * N);
         ret |= posix_memalign((void **)&split_out_q, 64, sizeof(c16_t) * N);
 
+        ret |= posix_memalign((void **)&x_oai_f, 64, sizeof(float complex) * N);
         ret |= posix_memalign((void **)&oai_out_f, 64, sizeof(float complex) * N);
+        ret |= posix_memalign((void **)&oai_idft_out_f, 64, sizeof(float complex) * N);
         ret |= posix_memalign((void **)&split_out_f, 64, sizeof(float complex) * N);
 
         ret |= posix_memalign((void **)&avx64_out_f, 64, sizeof(float complex) * N);
@@ -4857,26 +4867,48 @@ int main(void)
         ret |= posix_memalign((void **)&splitflt_out_f, 64, sizeof(float complex) * N);
         ret |= posix_memalign((void **)&splitflt_scaled_f, 64, sizeof(float complex) * N);
 
-
-        float complex *fftw_out_f = NULL;
-        float complex *fftw_scaled_f = NULL;
-        float complex *fftz_out_f = NULL;
-        float complex *fftz_scaled_f = NULL;
-
-        #ifdef USE_FFTW_BACKEND
+#ifdef USE_FFTW_BACKEND
         fftwf_complex *fftw_in = NULL;
         fftwf_complex *fftw_out = NULL;
         fftwf_plan fftw_plan = NULL;
+        fftwf_plan fftw_plan_idft = NULL;
+        int has_fftw_runtime = 0;
 
         fftw_in = fftwf_malloc(sizeof(fftwf_complex) * N);
         fftw_out = fftwf_malloc(sizeof(fftwf_complex) * N);
-        fftw_plan = fftwf_plan_dft_1d(N, fftw_in, fftw_out, FFTW_FORWARD, FFTW_ESTIMATE);
 
-        ret |= posix_memalign((void **)&fftw_out_f, 64, sizeof(float complex) * N);
-        ret |= posix_memalign((void **)&fftw_scaled_f, 64, sizeof(float complex) * N);
-        #endif
+        if (fftw_in && fftw_out) {
+            fftw_plan = fftwf_plan_dft_1d(
+                N,
+                fftw_in,
+                fftw_out,
+                FFTW_FORWARD,
+                FFTW_ESTIMATE
+            );
 
-        #ifdef USE_FFTZ_BACKEND
+            fftw_plan_idft = fftwf_plan_dft_1d(
+                N,
+                fftw_in,
+                fftw_out,
+                FFTW_BACKWARD,
+                FFTW_ESTIMATE
+            );
+
+            if (fftw_plan && fftw_plan_idft) {
+                has_fftw_runtime = 1;
+
+                ret |= posix_memalign((void **)&fftw_out_f, 64, sizeof(float complex) * N);
+                ret |= posix_memalign((void **)&fftw_scaled_f, 64, sizeof(float complex) * N);
+                ret |= posix_memalign((void **)&fftw_idft_scaled_f, 64, sizeof(float complex) * N);
+            } else {
+                printf("FFTW plan creation failed for N=%d, FFTW reference disabled for this size\n", N);
+            }
+        } else {
+            printf("FFTW allocation failed for N=%d, FFTW reference disabled for this size\n", N);
+        }
+#endif
+
+#ifdef USE_FFTZ_BACKEND
         float *fftz_in = NULL;
         float *fftz_out = NULL;
         void *fftz_handle = NULL;
@@ -4923,32 +4955,44 @@ int main(void)
 
         ret |= posix_memalign((void **)&fftz_out_f, 64, sizeof(float complex) * N);
         ret |= posix_memalign((void **)&fftz_scaled_f, 64, sizeof(float complex) * N);
-        #endif
-
+#endif
 
         if (ret != 0 ||
             !x ||
-            !classic_ref ||
-            !classic_scaled ||
+            !x_oai ||
+            !oai_out_q ||
+            !oai_idft_out_q ||
+            !split_out_q ||
+            !x_oai_f ||
             !oai_out_f ||
+            !oai_idft_out_f ||
             !split_out_f ||
             !avx64_out_f ||
             !avx64_scaled_f ||
             !splitflt_out_f ||
-            !splitflt_scaled_f ||
-            !x_oai ||
-            !oai_out_q ||
-            !split_out_q) {
-            printf("allocation failed\n");
+            !splitflt_scaled_f) {
+            printf("allocation failed for N=%d\n", N);
             return 2;
         }
+
         memset(x_oai, 0, sizeof(c16_t) * N);
         memset(oai_out_q, 0, sizeof(c16_t) * N);
+        memset(oai_idft_out_q, 0, sizeof(c16_t) * N);
         memset(split_out_q, 0, sizeof(c16_t) * N);
+
+        memset(x_oai_f, 0, sizeof(float complex) * N);
+        memset(oai_out_f, 0, sizeof(float complex) * N);
+        memset(oai_idft_out_f, 0, sizeof(float complex) * N);
+        memset(split_out_f, 0, sizeof(float complex) * N);
+
+        memset(avx64_out_f, 0, sizeof(float complex) * N);
+        memset(avx64_scaled_f, 0, sizeof(float complex) * N);
+
+        memset(splitflt_out_f, 0, sizeof(float complex) * N);
+        memset(splitflt_scaled_f, 0, sizeof(float complex) * N);
 
         for (int c = 0; c < nb_coeffs; c++) {
             double coeff = coeffs[c];
-            //double expand = coeff * SHRT_MAX / sqrt((double)N);
             double expand = pow(10.0, .05 * coeff) / sqrt(2);
 
             for (int i = 0; i < N; i++) {
@@ -4957,113 +5001,170 @@ int main(void)
 
                 x[i] = (float)rr + (float)ii * I;
 
-                #ifdef USE_FFTW_BACKEND
-                fftw_in[i] = crealf(x[i]) + cimagf(x[i]) * I;
-                #endif
-
-                #ifdef USE_FFTZ_BACKEND
+#ifdef USE_FFTZ_BACKEND
                 fftz_in[2 * i + 0] = crealf(x[i]);
                 fftz_in[2 * i + 1] = cimagf(x[i]);
-                #endif
+#endif
 
                 x_oai[i].r = sat_i16(lrint(rr));
                 x_oai[i].i = sat_i16(lrint(ii));
             }
-            /*
-            fprintf(stderr, "precreate twiddle 1000\n");
-            fflush(stderr);
 
-            const TwiddleTable *tw1000 = twiddle_table_get(1000);
-            if (!tw1000) {
-                fprintf(stderr, "twiddle_table_get(1000) failed\n");
-                abort();
-            }
-
-            fprintf(stderr, "twiddle 1000 OK\n");
-            fflush(stderr);
-            */
             /*
-             * Reference classic float DFT.
+             * Quantized input as float, used for roundtrip:
+             * IDFT(DFT(x_oai)) vs x_oai.
              */
-            const size_t fft_scratch_bytes = sizeof(float complex) * N;
-
-
-            //classic_dft_forward(x, classic_ref, N);
-
-            //scale_complex(classic_ref, classic_scaled, N, ref_scale);
-            #ifdef USE_FFTW_BACKEND
-                fftwf_execute(fftw_plan);
-                scale_complex(fftw_out, fftw_scaled_f, N, ref_scale);
-            #endif
-
+            oai_out_to_float_complex(x_oai, x_oai_f, N);
 
             /*
-             * OAI DFT c16.
-             * Appelé seulement si N est supporté.
+             * FFTW forward reference:
+             * FFTW_FORWARD(x) / sqrt(N)
+             */
+#ifdef USE_FFTW_BACKEND
+            if (has_fftw_runtime) {
+                for (int i = 0; i < N; i++) {
+                    ((float complex *)fftw_in)[i] =
+                        crealf(x[i]) + cimagf(x[i]) * I;
+                }
+
+                fftwf_execute(fftw_plan);
+
+                for (int i = 0; i < N; i++) {
+                    fftw_out_f[i] = ((float complex *)fftw_out)[i];
+                }
+
+                scale_complex(fftw_out_f, fftw_scaled_f, N, ref_scale);
+            }
+#endif
+
+            /*
+             * OAI DFT / IDFT c16.
              */
             double evm_oai_scaled = NAN;
+            double evm_oai_idft_scaled = NAN;
+            double evm_oai_roundtrip = NAN;
             double t_oai = NAN;
 
             if (has_oai) {
-                dft(get_dft(N), (int16_t *)x_oai, (int16_t *)oai_out_q, 1);
+                /*
+                 * Forward:
+                 * X = DFT(x_oai)
+                 */
+                dft(
+                    get_dft(N),
+                    (int16_t *)x_oai,
+                    (int16_t *)oai_out_q,
+                    1
+                );
+
                 oai_out_to_float_complex(oai_out_q, oai_out_f, N);
 
-                evm_oai_scaled = rms_evm_percent_fc(fftw_scaled_f, oai_out_f, N);
+#ifdef USE_FFTW_BACKEND
+                if (has_fftw_runtime) {
+                    evm_oai_scaled =
+                        rms_evm_percent_fc(fftw_scaled_f, oai_out_f, N);
+                }
+#endif
+
                 t_oai = time_oai256_ns_per_dft(x_oai, oai_out_q, N);
+
+                /*
+                 * Correct direct IDFT test:
+                 *
+                 * We test inverse on a frequency-domain vector.
+                 *
+                 * OAI:
+                 *   x_idft = IDFT(oai_out_q)
+                 *
+                 * FFTW reference:
+                 *   x_ref = FFTW_BACKWARD(oai_out_f) / sqrt(N)
+                 *
+                 * This avoids the wrong previous test:
+                 *   IDFT(x_time)
+                 */
+#ifdef USE_FFTW_BACKEND
+                if (has_fftw_runtime) {
+                    for (int i = 0; i < N; i++) {
+                        ((float complex *)fftw_in)[i] =
+                            crealf(oai_out_f[i]) + cimagf(oai_out_f[i]) * I;
+                    }
+
+                    fftwf_execute(fftw_plan_idft);
+
+                    for (int i = 0; i < N; i++) {
+                        fftw_out_f[i] = ((float complex *)fftw_out)[i];
+                    }
+
+                    scale_complex(fftw_out_f, fftw_idft_scaled_f, N, ref_scale);
+                }
+#endif
+
+                idft(
+                    get_dft(N),
+                    (int16_t *)oai_out_q,
+                    (int16_t *)oai_idft_out_q,
+                    1
+                );
+
+                oai_out_to_float_complex(oai_idft_out_q, oai_idft_out_f, N);
+
+#ifdef USE_FFTW_BACKEND
+                if (has_fftw_runtime) {
+                    evm_oai_idft_scaled =
+                        rms_evm_percent_fc(fftw_idft_scaled_f, oai_idft_out_f, N);
+                }
+#endif
+
+                /*
+                 * Roundtrip:
+                 * IDFT(DFT(x_oai)) vs x_oai.
+                 *
+                 * Since oai_idft_out_q is already IDFT(oai_out_q),
+                 * this is exactly the roundtrip result.
+                 */
+                evm_oai_roundtrip =
+                    rms_evm_percent_fc(x_oai_f, oai_idft_out_f, N);
             }
 
             /*
              * Split-radix pure SIMD c16.
-             * Appelé seulement si N est power-of-two supporté.
+             * Currently disabled in your test.
              */
             double evm_split_scaled = NAN;
             double t_split = NAN;
 
             if (has_split_c16) {
-                //dft_split_radix_pure_simd(x_oai, split_out_q, N);
-                //dft_mixed_radix_c16_scaled(x_oai, split_out_q, N, -1);
                 oai_out_to_float_complex(split_out_q, split_out_f, N);
 
-                evm_split_scaled = 0; //rms_evm_percent_fc(classic_scaled, split_out_f, N);
-                t_split = 0; //time_split256_ns_per_dft(x_oai, split_out_q, N);
+                evm_split_scaled = 0.0;
+                t_split = 0.0;
             }
 
             /*
              * Mixed-radix float LTS.
-             * Celui-ci est ton chemin générique : il peut gérer les tailles mixtes.
+             * Currently disabled in your test.
              */
-            //fft_forward_recursive_core(x, avx64_out_f, N);
             scale_complex(avx64_out_f, avx64_scaled_f, N, ref_scale);
 
-
-            double evm_avx64_scaled = 0;
-                //rms_evm_percent_fc(classic_scaled, avx64_scaled_f, N);
-
-
-            double t_avx64 =0;
-//                time_mixed_ns_per_dftlts(x, avx64_out_f, N);
+            double evm_avx64_scaled = 0.0;
+            double t_avx64 = 0.0;
 
             /*
-             * FFTW.
+             * FFTW timing/reference.
+             * Do not call time_fftw_ns_per_dft while debugging memory corruption.
              */
-            #ifdef USE_FFTW_BACKEND
-            fftwf_execute(fftw_plan);
-            scale_complex(fftw_out, fftw_scaled_f, N, ref_scale);
-
-            double evm_fftw =
-                rms_evm_percent_fc(classic_scaled, fftw_scaled_f, N);
-
-            double t_fftw =
-                time_fftw_ns_per_dft(fftw_plan);
-            #else
+#ifdef USE_FFTW_BACKEND
+            double evm_fftw = has_fftw_runtime ? 0.0 : NAN;
+            double t_fftw = 0.0;
+#else
             double evm_fftw = NAN;
             double t_fftw = NAN;
-            #endif
+#endif
 
             /*
              * FFTZ.
              */
-            #ifdef USE_FFTZ_BACKEND
+#ifdef USE_FFTZ_BACKEND
             aoclfftz_execute_io(fftz_handle, fftz_in, fftz_out);
 
             for (int i = 0; i < N; i++) {
@@ -5072,19 +5173,24 @@ int main(void)
 
             scale_complex(fftz_out_f, fftz_scaled_f, N, ref_scale);
 
+#ifdef USE_FFTW_BACKEND
             double evm_fftz =
-                rms_evm_percent_fc(classic_scaled, fftz_scaled_f, N);
+                has_fftw_runtime
+                    ? rms_evm_percent_fc(fftw_scaled_f, fftz_scaled_f, N)
+                    : NAN;
+#else
+            double evm_fftz = NAN;
+#endif
 
             double t_fftz =
                 time_fftz_ns_per_dft(fftz_handle, fftz_in, fftz_out);
-            #else
+#else
             double evm_fftz = NAN;
             double t_fftz = NAN;
-            #endif
+#endif
 
             /*
              * Split-radix float LTS.
-             * Appelé seulement si N est power-of-two supporté.
              */
             double evm_splitflt_scaled = NAN;
             double t_splitflt = NAN;
@@ -5093,11 +5199,14 @@ int main(void)
                 dft_split_radix_pure_simdlts(x, splitflt_out_f, N);
                 scale_complex(splitflt_out_f, splitflt_scaled_f, N, ref_scale);
 
-                evm_splitflt_scaled =
-                    rms_evm_percent_fc(classic_scaled, splitflt_scaled_f, N);
+#ifdef USE_FFTW_BACKEND
+                if (has_fftw_runtime) {
+                    evm_splitflt_scaled =
+                        rms_evm_percent_fc(fftw_scaled_f, splitflt_scaled_f, N);
+                }
+#endif
 
-                t_splitflt =0;
-                    //time_splitflt_ns_per_dftlts(x, splitflt_out_f, N);
+                t_splitflt = 0.0;
             }
 
             /*
@@ -5108,6 +5217,12 @@ int main(void)
             print_evm_col(evm_oai_scaled);
             printf(" | ");
 
+            print_evm_col(evm_oai_idft_scaled);
+            printf(" | ");
+
+            print_evm_col(evm_oai_roundtrip);
+            printf(" | ");
+
             print_evm_col(evm_split_scaled);
             printf(" | ");
 
@@ -5115,9 +5230,6 @@ int main(void)
             printf(" | ");
 
             print_evm_col(evm_fftz);
-            printf(" | ");
-
-            print_evm_col(evm_avx64_scaled);
             printf(" | ");
 
             print_evm_col(evm_splitflt_scaled);
@@ -5145,10 +5257,15 @@ int main(void)
         free(data);
 
         free(x);
-        free(classic_ref);
-        free(classic_scaled);
 
+        free(x_oai);
+        free(oai_out_q);
+        free(oai_idft_out_q);
+        free(split_out_q);
+
+        free(x_oai_f);
         free(oai_out_f);
+        free(oai_idft_out_f);
         free(split_out_f);
 
         free(avx64_out_f);
@@ -5157,25 +5274,38 @@ int main(void)
         free(splitflt_out_f);
         free(splitflt_scaled_f);
 
-        free(x_oai);
-        free(oai_out_q);
-        free(split_out_q);
+#ifdef USE_FFTW_BACKEND
+        if (fftw_plan) {
+            fftwf_destroy_plan(fftw_plan);
+        }
 
-        #ifdef USE_FFTW_BACKEND
-        if (fftw_plan) fftwf_destroy_plan(fftw_plan);
-        if (fftw_in) fftwf_free(fftw_in);
-        if (fftw_out) fftwf_free(fftw_out);
+        if (fftw_plan_idft) {
+            fftwf_destroy_plan(fftw_plan_idft);
+        }
+
+        if (fftw_in) {
+            fftwf_free(fftw_in);
+        }
+
+        if (fftw_out) {
+            fftwf_free(fftw_out);
+        }
+
         free(fftw_out_f);
         free(fftw_scaled_f);
-        #endif
+        free(fftw_idft_scaled_f);
+#endif
 
-        #ifdef USE_FFTZ_BACKEND
-        if (fftz_handle) aoclfftz_destroy(fftz_handle);
+#ifdef USE_FFTZ_BACKEND
+        if (fftz_handle) {
+            aoclfftz_destroy(fftz_handle);
+        }
+
         free(fftz_in);
         free(fftz_out);
         free(fftz_out_f);
         free(fftz_scaled_f);
-        #endif
+#endif
 
         printf("\n");
     }
