@@ -1357,10 +1357,7 @@ static inline void sr_combine_simd(c16_t *E,
 
         E0 = simde_mm256_mulhrs_epi16(E0, sqrt2_inv);
         E1 = simde_mm256_mulhrs_epi16(E1, sqrt2_inv);
-        /*
-        a    = simde_mm256_srai_epi16(a, 1);
-        bval = simde_mm256_srai_epi16(bval, 1);
-        */
+
         simde__m256i Y0 = simde_mm256_add_epi16(E0, a);
         simde__m256i Y2 = simde_mm256_sub_epi16(E0, a);
         simde__m256i Y1 = simde_mm256_add_epi16(E1, bval);
@@ -1424,8 +1421,6 @@ static inline void pack_split_radix_input_avx2_fused(const c16_t *__restrict x,
          * low128(p1) = x8,  x10, x12, x14
          * low128(p2) = x16, x18, x20, x22
          * low128(p3) = x24, x26, x28, x30
-         *
-         * On stocke en 128-bit pour éviter vinserti64x2 / vinserti128.
          */
         simde_mm_store_si128((simde__m128i *)&E_in[e + 0],
                              simde_mm256_castsi256_si128(p0));
@@ -1743,8 +1738,6 @@ static inline void dft8(const c16_t *src, c16_t *dst, dft_dir_t dir)
         _mm_loadu_si128((const __m128i *)(src + 4));
 
     /*
-     * Séparation pair/impair :
-     *
      * E_in = [x0 x2 x4 x6]
      * O_in = [x1 x3 x5 x7]
      */
@@ -1767,8 +1760,6 @@ static inline void dft8(const c16_t *src, c16_t *dst, dft_dir_t dir)
         _mm_unpacklo_epi64(v0_odd, v1_odd);     // [x1 x3 x5 x7]
 
     /*
-     * DFT4 des échantillons pairs et impairs.
-     *
      * E = DFT4(x0, x2, x4, x6)
      * O = DFT4(x1, x3, x5, x7)
      */
@@ -1995,16 +1986,10 @@ static inline void combine16_q15_128(const __m128i H[4],
     __m128i t2 = A2;
     __m128i t3 = A3;
 
-    /*
-     * Même rôle que transpose4_complex_shuffle_ps en float.
-     */
     transpose4_complex_i16_128(&t0, &t1, &t2, &t3);
 
     __m128i Y0, Y1, Y2, Y3;
 
-    /*
-     * Réapplication de dft4x4, comme dans ta version float.
-     */
     dft4x4_q15_128(
         t0, t1, t2, t3,
         &Y0, &Y1, &Y2, &Y3,
@@ -2065,7 +2050,6 @@ void dft16(int16_t *x, int16_t *y, uint8_t scale_flag)
  * Forward:
  *   W12^k = cos(2*pi*k/12) - j sin(2*pi*k/12)
  *
- * Ici les twiddles sont déjà multipliés par 1/sqrt(3).
  */
 
 /* W12^k, k = 0..3 */
@@ -2116,8 +2100,6 @@ static inline void dft12_q15_128(const c16_t *src,
                                     dft_dir_t dir)
 {
     /*
-     * Même layout que ta version float :
-     *
      * lane 0 : src[0], src[3], src[6],  src[9]
      * lane 1 : src[1], src[4], src[7],  src[10]
      * lane 2 : src[2], src[5], src[8],  src[11]
@@ -2461,18 +2443,11 @@ static inline void dft8x4_q15_128(
     __m128i E0, E1, E2, E3;
     __m128i O0, O1, O2, O3;
 
-    /*
-     * dft4x4_q15_128() doit être ta version scaled /2.
-     */
+
     dft4x4_q15_128(x0, x2, x4, x6, &E0, &E1, &E2, &E3, dir);
     dft4x4_q15_128(x1, x3, x5, x7, &O0, &O1, &O2, &O3, dir);
 
-    /*
-     * Pour que DFT8 soit normalisée par 1/sqrt(8) :
-     *
-     * - Les DFT4 internes ont déjà fait /2.
-     * - Il faut encore appliquer 1/sqrt(2) au combine.
-     */
+
     const __m128i E0s = q15_mul_i16_128(E0, Q15_INV_SQRT2);
     const __m128i E1s = q15_mul_i16_128(E1, Q15_INV_SQRT2);
     const __m128i E2s = q15_mul_i16_128(E2, Q15_INV_SQRT2);
@@ -2798,8 +2773,6 @@ static inline void radix3_combine4_q15_128_scaled(
     /*
      * B[k] = W24^k    * X1[k] / sqrt(3)
      * C[k] = W24^(2k) * X2[k] / sqrt(3)
-     *
-     * Les twiddles sont déjà scalés par 1/sqrt(3).
      */
     const __m128i B =
         complex_mul4_prepack_q15_128(X1, w1_re, w1_im);
@@ -2867,15 +2840,11 @@ static inline void dft24_q15_128(const c16_t *src,
     __m128i H4, H5, H6, H7;
 
     /*
-     * Calcule trois DFT8 en parallèle + une lane dummy.
-     *
-     * Après :
      * H0 = [F0[0], F1[0], F2[0], dummy]
      * H1 = [F0[1], F1[1], F2[1], dummy]
      * ...
      * H7 = [F0[7], F1[7], F2[7], dummy]
-     *
-     * dft8x4_q15_128 doit être scaled par 1/sqrt(8).
+
      */
     dft8x4_q15_128(
         x0, x1, x2, x3,
@@ -3197,10 +3166,6 @@ static inline void dft20_q15_128(const c16_t *src,
     __m128i H0, H1, H2, H3;
 
     /*
-     * dft4x4_q15_128 must be the scaled /2 version.
-     *
-     * After this:
-     *
      * H0 = [F0[0], F1[0], F2[0], F3[0]]
      * H1 = [F0[1], F1[1], F2[1], F3[1]]
      * H2 = [F0[2], F1[2], F2[2], F3[2]]
@@ -3574,10 +3539,6 @@ static inline void radix4_combine4_q15_128_fast(__m128i A0,
     const __m128i A2 = complex_mul4_prepack_q15_128(X2, w2_re, w2_im);
     const __m128i A3 = complex_mul4_prepack_q15_128(X3, w3_re, w3_im);
 
-    /*
-     * Scaling radix-4 = 1/2.
-     * On scale avant les additions pour limiter la saturation.
-     */
     const __m128i A0s = _mm_srai_epi16(A0, 1);
 
     const __m128i s02 = _mm_adds_epi16(A0s, A2);
@@ -3968,9 +3929,6 @@ static void dft_mixed_radix_c16_scaled_strided(const c16_t *src,
         return;
     }
 
-    /*
-     * Fallback sécurisé : copier strided vers contiguous.
-     */
     c16_t *tmp = aligned_malloc64(sizeof(c16_t) * (size_t)N);
     if (!tmp) {
         printf("dft_mixed_radix_c16_scaled_strided: allocation failed N=%d\n", N);
