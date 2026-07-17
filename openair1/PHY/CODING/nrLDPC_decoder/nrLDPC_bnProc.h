@@ -209,7 +209,7 @@ static inline void nrLDPC_llr2bitPacked(uint8_t* out, int8_t* llrOut, uint16_t n
         const int8_t* p_llrOut8 = (int8_t*) p_llrOut;
         uint32_t bitsTmp = 0;
         for (uint32_t i = 0; i < Mr; i++)
-            bitsTmp |= (p_llrOut8[i] < 0) << ((7 - i) + (16 * (i / 8)));
+            bitsTmp |= (uint32_t)(p_llrOut8[i] < 0) << ((7 - i) + (16 * (i / 8)));
         *p_bits = bitsTmp;
     }
 }
