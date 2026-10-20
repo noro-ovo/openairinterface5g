@@ -529,7 +529,10 @@ int main(int argc, char *argv[])
       printf("-G Offset of samples to read from file (0 default)\n");
       printf("-h This message\n");
       printf("-H Slot number\n");
-      printf("-i Change channel estimation technique. Arguments list: Number of arguments=2, Frequency domain {0:Linear interpolation, 1:PRB based averaging}, Time domain {0:Estimates of last DMRS symbol, 1:Average of DMRS symbols}. e.g. -i 1,0\n");
+      printf(
+          "-i Change channel estimation technique. Arguments list: Number of arguments=2, Frequency domain {0:Linear "
+          "interpolation, 1:PRB based averaging, 2:LMMSE interpolation (DMRS type 1)}, Time domain {0:Estimates of last DMRS "
+          "symbol, 1:Average of DMRS symbols}. e.g. -i 1,0\n");
       printf("-I Maximum LDPC decoder iterations\n");
       printf("-j Save signal buffers in binary format\n");
       printf("-k 3/4 sampling\n");
