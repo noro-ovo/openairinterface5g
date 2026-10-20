@@ -111,6 +111,8 @@ void nr_freq_equalization(NR_DL_FRAME_PARMS *frame_parms,
                           unsigned char Qm);
 
 void nr_init_fde(void);
+/* Builds the LMMSE frequency interpolation filters (chest_freq 2) for one subcarrier spacing; no-op for other modes. */
+void nr_ul_chest_lmmse_init(int chest_freq, int subcarrier_spacing);
 
 #endif
 /** @}*/

@@ -123,6 +123,7 @@ void phy_init_nr_gNB(PHY_VARS_gNB *gNB)
     LOG_I(PHY, "Max number of concurrent beams: %d\n", common_vars->num_beams_period);
   } else
     common_vars->num_beams_period = 1;
+  nr_ul_chest_lmmse_init(gNB->chest_freq, fp->subcarrier_spacing);
 
   int Ptx = cfg->carrier_config.num_tx_ant.value;
   int Prx = cfg->carrier_config.num_rx_ant.value;
