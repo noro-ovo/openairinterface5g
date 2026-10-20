@@ -8,6 +8,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <pthread.h>
+#include <limits.h>
 
 #include "nr_ul_estimation.h"
 #include "PHY/sse_intrin.h"
@@ -218,6 +221,385 @@ static int pusch_chest_mode(void)
   return mode;
 }
 
+/* chest_freq values for the frequency-domain channel estimation */
+enum { CHEST_FREQ_BOX_INTERP = 0, CHEST_FREQ_PRB_AVERAGE = 1, CHEST_FREQ_LMMSE_INTERP = 2 };
+
+/* Frequency-domain LMMSE interpolation of DMRS type 1 (comb 2) estimates.
+ * Pilot values p[m] at RE sp m + off2 / 2 (before delay compensation) are combined over the W_K nearest
+ * pilots: h[k] = sum_i w_o[i] p[m0+i], with o = k - sp m0 the offset of RE k in its window; the
+ * weights depend only on o (sp W_K filters per design). Pilot grids (sp, off2):
+ * - DMRS type 1, single layer: per-pilot LS, (2, 0);
+ * - DMRS type 1, multi-layer: pair averages of each CDM pilot pair (the frequency OCC despreading), (4, 2);
+ * - DMRS type 2: pair averages of the two adjacent pilots, (6, 2 delta + 1), delta = 0, 2 or 4.
+ * Channel correlation model:
+ * exponential power delay profile starting at delay 0, R(df) = 1 / (1 + j 2 pi df tau).
+ * Per call, tau and the noise-to-signal ratio are estimated from pilot correlations c(L):
+ * tau from |c(4)|/|c(1)| (noise-free lags), then doubled (robust: over-estimating the delay
+ * spread costs little, under-estimating it biases the estimate); s2 = (c(0) - S) / S with
+ * S = |c(1)| sqrt(1 + (2 pi df1 tau)^2). Designs are quantised (tau grid x 1 dB SNR) and built at init. */
+#define W_K 16
+#define W_NTAU 13
+#define W_NSNR 61 /* -10 .. 50 dB */
+static const double w_tau_grid[W_NTAU] =
+    {10e-9, 20e-9, 30e-9, 50e-9, 75e-9, 100e-9, 150e-9, 200e-9, 300e-9, 450e-9, 700e-9, 1000e-9, 1500e-9};
+typedef struct {
+  float r[W_K], i[W_K];
+} wiener_row_t; /* taps of the filter for one output offset o */
+/* The weights only depend on the distance between output RE and pilots, so the three DMRS type 2 grids share the
+ * delta = 0 design: row o of grid delta is row o - delta of grid 0. That design is extended by W_PRE2 rows before
+ * offset 0. */
+#define W_NGRID 3
+#define W_PRE2 4
+static const int w_grids[W_NGRID][3] = {{2, 0, 0}, {4, 2, 0}, {6, 1, W_PRE2}}; /* sp, off2, rows before offset 0 */
+static wiener_row_t *w_cache[W_NGRID][W_NTAU][W_NSNR]; /* [pilot grid][tau][SNR], offsets -pre .. sp W_K - 1 */
+/* design index of the pilot grid (sp, off2), and the shift in RE of that grid relative to the design */
+static int w_grid_index(int sp, int off2, int *shift)
+{
+  *shift = 0;
+  if (sp == 2 && off2 == 0)
+    return 0;
+  if (sp == 4 && off2 == 2)
+    return 1;
+  if (sp == 6 && (off2 == 1 || off2 == 5 || off2 == 9)) {
+    *shift = off2 / 2;
+    return 2;
+  }
+  AssertFatal(false, "UL LMMSE chest: unsupported pilot grid %d/%d\n", sp, off2);
+  return -1;
+}
+
+/* solve A x = b for complex A (n x n, row-major), Gaussian elimination with partial pivoting */
+static void w_solve(int n, double ar[n][n], double ai[n][n], double br[n], double bi[n])
+{
+  for (int c = 0; c < n; c++) {
+    int p = c;
+    for (int r = c + 1; r < n; r++)
+      if (ar[r][c] * ar[r][c] + ai[r][c] * ai[r][c] > ar[p][c] * ar[p][c] + ai[p][c] * ai[p][c])
+        p = r;
+    for (int j = 0; j < n; j++) {
+      double t = ar[c][j];
+      ar[c][j] = ar[p][j];
+      ar[p][j] = t;
+      t = ai[c][j];
+      ai[c][j] = ai[p][j];
+      ai[p][j] = t;
+    }
+    double t = br[c];
+    br[c] = br[p];
+    br[p] = t;
+    t = bi[c];
+    bi[c] = bi[p];
+    bi[p] = t;
+    const double d = ar[c][c] * ar[c][c] + ai[c][c] * ai[c][c];
+    for (int r = c + 1; r < n; r++) {
+      /* f = A[r][c] / A[c][c] */
+      const double fr = (ar[r][c] * ar[c][c] + ai[r][c] * ai[c][c]) / d;
+      const double fi = (ai[r][c] * ar[c][c] - ar[r][c] * ai[c][c]) / d;
+      for (int j = c; j < n; j++) {
+        ar[r][j] -= fr * ar[c][j] - fi * ai[c][j];
+        ai[r][j] -= fr * ai[c][j] + fi * ar[c][j];
+      }
+      br[r] -= fr * br[c] - fi * bi[c];
+      bi[r] -= fr * bi[c] + fi * br[c];
+    }
+  }
+  for (int c = n - 1; c >= 0; c--) {
+    double sr = br[c], si = bi[c];
+    for (int j = c + 1; j < n; j++) {
+      sr -= ar[c][j] * br[j] - ai[c][j] * bi[j];
+      si -= ar[c][j] * bi[j] + ai[c][j] * br[j];
+    }
+    const double d = ar[c][c] * ar[c][c] + ai[c][c] * ai[c][c];
+    br[c] = (sr * ar[c][c] + si * ai[c][c]) / d;
+    bi[c] = (si * ar[c][c] - sr * ai[c][c]) / d;
+  }
+}
+
+/* R(df) = 1 / (1 + j a), a = 2 pi df tau */
+static inline void w_corr(double df, double tau, double *re, double *im)
+{
+  const double a = 2 * M_PI * df * tau;
+  *re = 1.0 / (1.0 + a * a);
+  *im = -a / (1.0 + a * a);
+}
+
+/* One design: the filters for offsets -pre .. sp W_K - 1 of the pilot grid (sp, off2), delay spread w_tau_grid[ti] and
+ * SNR bin si; offset o is stored in f[pre + o]. */
+static void w_design(wiener_row_t *f, int sp, int off2, int pre, int ti, int si, double scs)
+{
+  const double tau = w_tau_grid[ti], s2 = pow(10.0, -(si - 10) / 10.0);
+  for (int o = -pre; o < sp * W_K; o++) {
+    /* h_o = a (R + s2 I)^-1 p, a_i = R(f_o - f_i): solve (R + s2 I)^T x = a^T, h_o = x . p */
+    double ar[W_K][W_K], ai[W_K][W_K], br[W_K], bi[W_K];
+    for (int r = 0; r < W_K; r++) {
+      for (int c = 0; c < W_K; c++) {
+        double re, im;
+        w_corr((sp * c - sp * r) * scs, tau, &re, &im); /* (R^T)[r][c] = R(f_c - f_r) */
+        ar[r][c] = re + (r == c ? s2 : 0.0);
+        ai[r][c] = im;
+      }
+      w_corr((o - sp * r - off2 / 2.0) * scs, tau, &br[r], &bi[r]);
+    }
+    w_solve(W_K, ar, ai, br, bi);
+    for (int r = 0; r < W_K; r++) {
+      f[pre + o].r[r] = br[r];
+      f[pre + o].i[r] = bi[r];
+    }
+  }
+}
+
+static double w_cache_scs; /* subcarrier spacing of the designs, 0 until nr_ul_chest_lmmse_init() */
+
+void nr_ul_chest_lmmse_init(int chest_freq, int subcarrier_spacing)
+{
+  if (chest_freq != CHEST_FREQ_LMMSE_INTERP)
+    return;
+  if (w_cache_scs != 0) {
+    AssertFatal(w_cache_scs == subcarrier_spacing, "UL LMMSE chest: one subcarrier spacing per process\n");
+    return;
+  }
+  for (int g = 0; g < W_NGRID; g++) {
+    const int sp = w_grids[g][0], off2 = w_grids[g][1], pre = w_grids[g][2];
+    for (int ti = 0; ti < W_NTAU; ti++)
+      for (int si = 0; si < W_NSNR; si++) {
+        wiener_row_t *f = malloc((pre + sp * W_K) * sizeof(*f));
+        AssertFatal(f, "UL LMMSE chest: out of memory\n");
+        w_design(f, sp, off2, pre, ti, si, subcarrier_spacing);
+        w_cache[g][ti][si] = f;
+      }
+  }
+  w_cache_scs = subcarrier_spacing;
+}
+
+/* All designs are built by nr_ul_chest_lmmse_init(): no allocation or lock in the slot processing. Returns the filter of
+ * offset 0, valid for offsets 0 .. sp W_K - 1. */
+static const wiener_row_t *w_get_filters(int sp, int off2, int ti, int si, double scs)
+{
+  AssertFatal(w_cache_scs == scs, "UL LMMSE chest: filters not built for SCS %.0f (nr_ul_chest_lmmse_init)\n", scs);
+  int shift;
+  const int g = w_grid_index(sp, off2, &shift);
+  return w_cache[g][ti][si] + w_grids[g][2] - shift;
+}
+
+typedef struct {
+  double t0; /* first-path delay, s */
+  double t_mean; /* mean delay arg c(1) / (2 pi df1), s */
+  double S; /* signal power per pilot, int16^2 units */
+  int snr_db; /* estimated SNR per pilot, clamped to [-10, 50] dB */
+} ul_chest_wiener_est_t;
+
+/* p: npil pilot values (pilot m at RE sp m + off2 / 2, see the pilot grids above); writes sp * npil RE to out and
+ * the channel parameters to est */
+static void ul_chest_wiener_interp(const c16_t *p,
+                                   const int npil,
+                                   const int sp,
+                                   const int off2,
+                                   const double scs,
+                                   c16_t *out,
+                                   ul_chest_wiener_est_t *est)
+{
+  AssertFatal(npil >= W_K, "UL LMMSE chest: need at least %d pilots\n", W_K);
+  /* exact integer sums: at most 2 * 3276 products of 2^30 */
+  int64_t s0 = 0, s1r = 0, s1i = 0, s4r = 0, s4i = 0;
+  for (int m = 0; m < npil; m++) {
+    s0 += (int64_t)p[m].r * p[m].r + (int64_t)p[m].i * p[m].i;
+    if (m + 1 < npil) {
+      s1r += (int64_t)p[m].r * p[m + 1].r + (int64_t)p[m].i * p[m + 1].i;
+      s1i += (int64_t)p[m].i * p[m + 1].r - (int64_t)p[m].r * p[m + 1].i;
+    }
+    if (m + 4 < npil) {
+      s4r += (int64_t)p[m].r * p[m + 4].r + (int64_t)p[m].i * p[m + 4].i;
+      s4i += (int64_t)p[m].i * p[m + 4].r - (int64_t)p[m].r * p[m + 4].i;
+    }
+  }
+  const double c0 = (double)s0 / npil, c1r = s1r, c1i = s1i, c4r = s4r, c4i = s4i;
+  const double a1 = sqrt(c1r * c1r + c1i * c1i) / (npil - 1), a4 = sqrt(c4r * c4r + c4i * c4i) / (npil - 4);
+  const double d1 = sp * scs, d4 = 4 * sp * scs;
+  double rho = a1 > 0 ? a4 / a1 : 1.0;
+  rho = min(max(rho, 1e-3), 0.9999);
+  const double x = rho * rho;
+  const double den = x * (2 * M_PI * d4) * (2 * M_PI * d4) - (2 * M_PI * d1) * (2 * M_PI * d1);
+  double tau = den > 0 ? sqrt(max((1 - x) / den, 0.0)) : 1e-6;
+  tau = min(max(tau, 10e-9), 1e-6);
+  const double S = a1 * sqrt(1 + (2 * M_PI * d1 * tau) * (2 * M_PI * d1 * tau));
+  const double s2 = S > 0 ? max(c0 - S, 1e-5 * S) / S : 1.0;
+  /* robust design: twice the estimated delay spread, nearest grid point in log scale */
+  const double td = 2 * tau;
+  int ti = 0;
+  for (int t = 1; t < W_NTAU; t++)
+    if (fabs(log(w_tau_grid[t] / td)) < fabs(log(w_tau_grid[ti] / td)))
+      ti = t;
+  int si = (int)lround(-10 * log10(s2)) + 10;
+  si = min(max(si, 0), W_NSNR - 1);
+  const wiener_row_t *f = w_get_filters(sp, off2, ti, si, scs);
+  /* first-path delay: arg c(1) = 2 pi d1 t0 + atan(2 pi d1 tau) for the exponential model; remove
+   * the corresponding phase ramp before filtering and restore it afterwards (timing offset) */
+  const double t0 = (atan2(c1i, c1r) - atan(2 * M_PI * d1 * tau)) / (2 * M_PI * d1);
+  *est = (ul_chest_wiener_est_t){.t0 = t0, .t_mean = atan2(c1i, c1r) / (2 * M_PI * d1), .S = S, .snr_db = si - 10};
+  const double dphi = 2 * M_PI * scs * t0; /* phase step per RE */
+  /* derotate the pilots, p * exp(+j 2 pi f_m t0) with f_m = (sp m + off2 / 2) scs: 8 pilots at a time, the phasor
+   * of pilot m = 8 b + l is base_b * step_l, with base advanced by a double-precision recursion */
+  float pr[npil], pim[npil];
+  {
+    float sr[8], si[8];
+    for (int l = 0; l < 8; l++) {
+      sr[l] = cos(sp * dphi * l);
+      si[l] = sin(sp * dphi * l);
+    }
+    const simde__m256 vsr = simde_mm256_loadu_ps(sr), vsi = simde_mm256_loadu_ps(si);
+    const simde__m256i deint = simde_mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    const double wr = cos(8 * sp * dphi), wi = sin(8 * sp * dphi);
+    double br = cos(off2 * dphi / 2), bi = sin(off2 * dphi / 2);
+    int m = 0;
+    for (; m + 8 <= npil; m += 8) {
+      /* phasor for the 8 pilots */
+      const simde__m256 vbr = simde_mm256_set1_ps(br), vbi = simde_mm256_set1_ps(bi);
+      const simde__m256 cr = simde_mm256_fmsub_ps(vbr, vsr, simde_mm256_mul_ps(vbi, vsi));
+      const simde__m256 ci = simde_mm256_fmadd_ps(vbr, vsi, simde_mm256_mul_ps(vbi, vsr));
+      /* 8 c16 pilots -> float, de-interleaved */
+      const simde__m256i v = simde_mm256_loadu_si256((const simde__m256i *)(p + m));
+      const simde__m256 lo =
+          simde_mm256_permutevar8x32_ps(simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(simde_mm256_castsi256_si128(v))), deint);
+      const simde__m256 hi =
+          simde_mm256_permutevar8x32_ps(simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(simde_mm256_extracti128_si256(v, 1))),
+                                        deint);
+      const simde__m256 xr = simde_mm256_permute2f128_ps(lo, hi, 0x20), xi = simde_mm256_permute2f128_ps(lo, hi, 0x31);
+      simde_mm256_storeu_ps(pr + m, simde_mm256_fmsub_ps(xr, cr, simde_mm256_mul_ps(xi, ci)));
+      simde_mm256_storeu_ps(pim + m, simde_mm256_fmadd_ps(xr, ci, simde_mm256_mul_ps(xi, cr)));
+      const double t = br * wr - bi * wi;
+      bi = br * wi + bi * wr;
+      br = t;
+    }
+    for (; m < npil; m++) {
+      const double cr = br * sr[m % 8] - bi * si[m % 8], ci = br * si[m % 8] + bi * sr[m % 8];
+      pr[m] = p[m].r * cr - p[m].i * ci;
+      pim[m] = p[m].r * ci + p[m].i * cr;
+    }
+  }
+  const int nre = sp * npil;
+  float yr[nre], yi[nre];
+  /* interior RE: k = sp j + r (offset o = sp W_K / 2 + r) with window m0 = j - W_K/2, for j in
+   * [W_K/2, npil - W_K/2]; consecutive j share the filter and slide the window by one pilot, so 8 outputs
+   * are computed at once with one broadcast weight per tap */
+  const int j0 = W_K / 2, j1 = npil - W_K / 2; /* inclusive */
+  int j = j0;
+  for (; j + 7 <= j1; j += 8) {
+    for (int r = 0; r < sp; r++) {
+      const wiener_row_t *w = &f[sp * W_K / 2 + r];
+      simde__m256 er = simde_mm256_setzero_ps(), ei = er;
+      for (int i = 0; i < W_K; i++) {
+        const simde__m256 vr = simde_mm256_loadu_ps(pr + j - W_K / 2 + i), vi = simde_mm256_loadu_ps(pim + j - W_K / 2 + i);
+        const simde__m256 fr = simde_mm256_set1_ps(w->r[i]), fi = simde_mm256_set1_ps(w->i[i]);
+        er = simde_mm256_fnmadd_ps(fi, vi, simde_mm256_fmadd_ps(fr, vr, er));
+        ei = simde_mm256_fmadd_ps(fi, vr, simde_mm256_fmadd_ps(fr, vi, ei));
+      }
+      float t_r[8], t_i[8];
+      simde_mm256_storeu_ps(t_r, er);
+      simde_mm256_storeu_ps(t_i, ei);
+      for (int l = 0; l < 8; l++) {
+        yr[sp * (j + l) + r] = t_r[l];
+        yi[sp * (j + l) + r] = t_i[l];
+      }
+    }
+  }
+  /* remaining interior RE and the band edges: scalar */
+  for (int k = 0; k < nre; k++) {
+    if (k / sp >= j0 && k / sp < j)
+      continue; /* done above */
+    const int m0 = min(max(k / sp - W_K / 2, 0), npil - W_K);
+    const wiener_row_t *w = &f[k - sp * m0];
+    float accr = 0, acci = 0;
+    for (int i = 0; i < W_K; i++) {
+      accr += w->r[i] * pr[m0 + i] - w->i[i] * pim[m0 + i];
+      acci += w->r[i] * pim[m0 + i] + w->i[i] * pr[m0 + i];
+    }
+    yr[k] = accr;
+    yi[k] = acci;
+  }
+  /* restore the phase ramp, y * exp(-j 2 pi f_k t0), 8 RE at a time as above, then round to nearest,
+   * saturate to int16 and interleave to c16_t */
+  {
+    float sr[8], si[8];
+    for (int l = 0; l < 8; l++) {
+      sr[l] = cos(dphi * l);
+      si[l] = -sin(dphi * l);
+    }
+    const simde__m256 vsr = simde_mm256_loadu_ps(sr), vsi = simde_mm256_loadu_ps(si);
+    const double wr = cos(8 * dphi), wi = -sin(8 * dphi);
+    double br = 1.0, bi = 0.0;
+    int k = 0;
+    for (; k + 8 <= nre; k += 8) {
+      const simde__m256 vbr = simde_mm256_set1_ps(br), vbi = simde_mm256_set1_ps(bi);
+      const simde__m256 cr = simde_mm256_fmsub_ps(vbr, vsr, simde_mm256_mul_ps(vbi, vsi));
+      const simde__m256 ci = simde_mm256_fmadd_ps(vbr, vsi, simde_mm256_mul_ps(vbi, vsr));
+      const simde__m256 vr = simde_mm256_loadu_ps(yr + k), vi = simde_mm256_loadu_ps(yi + k);
+      const simde__m256i zr = simde_mm256_cvtps_epi32(simde_mm256_fmsub_ps(vr, cr, simde_mm256_mul_ps(vi, ci)));
+      const simde__m256i zi = simde_mm256_cvtps_epi32(simde_mm256_fmadd_ps(vr, ci, simde_mm256_mul_ps(vi, cr)));
+      /* (r, i) pairs of RE k..k+3 in the low lane and k+4..k+7 in the high lane, saturated to int16 */
+      const simde__m256i lo = simde_mm256_unpacklo_epi32(zr, zi), hi = simde_mm256_unpackhi_epi32(zr, zi);
+      simde_mm256_storeu_si256((simde__m256i *)(out + k), simde_mm256_packs_epi32(lo, hi));
+      const double t = br * wr - bi * wi;
+      bi = br * wi + bi * wr;
+      br = t;
+    }
+    for (; k < nre; k++) {
+      const double cr = br * sr[k % 8] - bi * si[k % 8], ci = br * si[k % 8] + bi * sr[k % 8];
+      const double zr = yr[k] * cr - yi[k] * ci, zi = yr[k] * ci + yi[k] * cr;
+      out[k] = (c16_t){.r = (int16_t)max(-32768, min(32767, lrint(zr))), .i = (int16_t)max(-32768, min(32767, lrint(zi)))};
+    }
+  }
+}
+
+/* Timing estimate from pilot values on a comb of spacing sp: per-pilot LS of a single layer (sp = 2), or pair averages
+ * for multi-layer (sp = 4). The N-point impulse response of the comb (zeros in between) is periodic in M = N / sp samples
+ * and equals, up to a factor 1 / sqrt(sp), the M-point IDFT of the packed pilot values, which is computed instead: the
+ * peak search covers delays in [-N / (2 sp), N / (2 sp)). For sp = 2 this covers the TA range (+-31 steps of 16 N / 2048
+ * samples) without the images that the 4-RE hold of the box LS creates; for multi-layer the per-pilot values cannot be
+ * used (the other port of the CDM group appears with an alternating sign, i.e. as a second peak N / 4 away), and sp = 4
+ * gives the same +-N / 8 range as the box LS. Same peak criterion as nr_est_delay(). The input is shifted right so that
+ * the unitary fixed-point IDFT cannot overflow at high input level: each output component is bounded by
+ * sum(|re| + |im|) / sqrt(M) of the input (reached for phase-aligned input) and the shift adds at most 1 per component,
+ * so s is the smallest shift with (sum >> s) + 2M <= 32767 sqrt(M) (same bound as the issue #691 fix). The argmax and
+ * the peak-to-mean ratio are scale-invariant; delay_max_val is reported at the unshifted scale of an N-point IDFT (the
+ * unit of nr_est_delay()) for the cross-antenna comparison. The M samples of the impulse response are written to t. */
+static void ul_chest_pilot_delay(const c16_t *pls, const int npil, const int sp, const int N, delay_t *delay, c16_t *t)
+{
+  const int M = N / sp, n = min(npil, M);
+  int64_t l1 = 0;
+  for (int m = 0; m < n; m++)
+    l1 += abs(pls[m].r) + abs(pls[m].i);
+  int sh = 0;
+  while (sh < 16) {
+    const int64_t bound = (l1 >> sh) + 2 * (int64_t)M;
+    if (bound * bound <= 32767LL * 32767 * M)
+      break;
+    sh++;
+  }
+  c16_t in[M] __attribute__((aligned(32)));
+  for (int m = 0; m < n; m++)
+    in[m] = (c16_t){.r = pls[m].r >> sh, .i = pls[m].i >> sh};
+  memset(in + n, 0, (M - n) * sizeof(*in));
+  idft(get_idft(M), (int16_t *)in, (int16_t *)t, 1);
+  int max_pos = delay->delay_max_pos;
+  int64_t max_val = ((int64_t)delay->delay_max_val * sp) >> (2 * sh);
+  uint64_t mean_val = 0;
+  for (int i = 0; i < M; i++) {
+    const int v = c16amp2(t[i]) >> 1;
+    mean_val += v;
+    if (v > max_val) {
+      max_pos = i;
+      max_val = v;
+    }
+  }
+  mean_val /= M;
+  if (max_pos >= M / 2)
+    max_pos -= M;
+  delay->delay_max_pos = max_pos;
+  delay->delay_max_val = (int)min((max_val << (2 * sh)) / sp, (int64_t)INT_MAX);
+  delay->valid = mean_val > 0 && (uint64_t)max_val / mean_val > 15; /* PEAK_DETECT_THRESHOLD of nr_est_delay() */
+  delay->est_delay = delay->valid ? max_pos : 0;
+}
+
 static void nr_pusch_antenna_processing(void *arg)
 {
   puschAntennaProc_t *rdata = (puschAntennaProc_t *)arg;
@@ -274,7 +656,8 @@ static void nr_pusch_antenna_processing(void *arg)
     LOG_I(PHY, "ul_ch addr %p \n", ul_ch);
 #endif
 
-    if (pusch_pdu->dmrs_config_type == pusch_dmrs_type1 && chest_freq == 0) {
+    if (pusch_pdu->dmrs_config_type == pusch_dmrs_type1
+        && (chest_freq == CHEST_FREQ_BOX_INTERP || chest_freq == CHEST_FREQ_LMMSE_INTERP)) {
       c16_t *pil = pilot;
       int re_offset = k0;
       LOG_D(PHY, "PUSCH estimation DMRS type 1, Freq-domain interpolation");
@@ -283,7 +666,15 @@ static void nr_pusch_antenna_processing(void *arg)
       int ch_est_cnt = 0; // To trace channel coefficients
 #endif
 
-      const int ls_mode = pusch_chest_mode();
+      /* LMMSE needs W_K pilot values: per-pilot LS for a single layer (3 PRB), pair averages for multi-layer
+       * (6 PRB). Smaller allocations use the box interpolation. */
+      const int single_layer = pusch_pdu->nrOfLayers == 1;
+      const int lmmse = chest_freq == CHEST_FREQ_LMMSE_INTERP && (single_layer ? 6 : 3) * nb_rb_pusch >= W_K;
+      /* single-layer LMMSE input: per-pilot LS v = (pilot rx) >> 15, saturated to int16, no delay compensation (the
+       * LMMSE interpolator estimates the first-path delay); the box LS is derived from it, (pilot rx) >> 16 = v >> 1 */
+      c16_t pls[lmmse && single_layer ? 6 * nb_rb_pusch : 1];
+      // the vectorised LS has no per-pilot output: LMMSE takes the scalar loop
+      const int ls_mode = lmmse ? 1 : pusch_chest_mode();
 #if T_TRACER
       const int ls_traced = T_ACTIVE(T_GNB_PHY_UL_FD_CHAN_EST_DMRS_POS) && nl == 0;
 #else
@@ -302,7 +693,14 @@ static void nr_pusch_antenna_processing(void *arg)
 
           for (int k_line = 0; k_line <= 1; k_line++) {
             re_offset = (k0 + (n << 2) + (k_line << 1) + delta);
-            ch = c32x16maddShift(*pil, rxdataF[re_offset], ch, 16);
+            if (lmmse && single_layer) {
+              const c32_t v = c32x16mulShift(*pil, rxdataF[re_offset], 15);
+              pls[2 * n + k_line] = (c16_t){.r = (int16_t)max(-32768, min(32767, v.r)), .i = (int16_t)max(-32768, min(32767, v.i))};
+              ch.r += v.r >> 1;
+              ch.i += v.i >> 1;
+            } else {
+              ch = c32x16maddShift(*pil, rxdataF[re_offset], ch, 16);
+            }
             pil++;
           }
 
@@ -332,107 +730,163 @@ static void nr_pusch_antenna_processing(void *arg)
             fprintf(stderr, "OAI_CHEST_CHECK LS: %d checked, %d mismatched%s\n", ls_checked, ls_bad, bad ? " (MISMATCH)" : "");
         }
       }
-      c16_t ch_estimates_time[frame_parms->ofdm_symbol_size] __attribute__((aligned(32)));
-      nr_est_delay(frame_parms->ofdm_symbol_size, ul_ls_est, ch_estimates_time, delay);
-      if (rdata->scope && antenna == 0) {
-        metadata mt = {.slot = -1, .frame = -1};
-        scopeData_t *tmp = rdata->scope;
-        tmp->copyData(tmp, gNBulDelay, ch_estimates_time, sizeof(c16_t), 1, frame_parms->ofdm_symbol_size, 0, &mt);
-      }
-      int delay_idx = get_delay_idx(delay->est_delay, MAX_DELAY_COMP);
-      c16_t *ul_delay_table = frame_parms->delay_table[delay_idx];
+      if (lmmse) {
+        const int N = frame_parms->ofdm_symbol_size;
+        c16_t t_delay[N / 2] __attribute__((aligned(32))); /* impulse response of the IDFT peak search, for the scope */
+        int t_delay_len = 0;
+        if (lmmse && single_layer) {
+          const int npil = 6 * nb_rb_pusch;
+          ul_chest_wiener_est_t est;
+          ul_chest_wiener_interp(pls, npil, 2, 0, frame_parms->subcarrier_spacing, ul_ch, &est);
+          /* timing advance input: the mean delay arg c(1) / (2 pi df1), in samples at the OFDM symbol rate, replaces
+           * the IDFT peak search when it is accurate: c(1) has an SNR of about (npil - 1) snr^2 / (2 snr + 1), which
+           * gives the delay standard deviation below; it must stay under a quarter of a TA step (16 N / 2048 samples)
+           * and the allocation must have 10 PRB or more. Otherwise, at low SNR or on small allocations, the IDFT peak
+           * search on the per-pilot LS is used. */
+          const double snr = pow(10.0, est.snr_db / 10.0);
+          const double snr_c1 = (npil - 1) * snr * snr / (2 * snr + 1);
+          const double delay_std = N / (4 * M_PI * sqrt(2 * snr_c1));
+          if (npil >= 60 && delay_std <= (16.0 * N / 2048) / 4 && est.S > 0) {
+            /* cross-antenna metric in the unit of the IDFT peak search: peak power of a single path of power S */
+            const double val = (double)npil * npil * est.S / (2 * N);
+            if (val > delay->delay_max_val) {
+              const int d = lrint(est.t_mean * N * frame_parms->subcarrier_spacing);
+              delay->delay_max_pos = d;
+              delay->delay_max_val = (int)min(val, (double)INT_MAX);
+              delay->valid = true;
+              delay->est_delay = d;
+            }
+          } else {
+            ul_chest_pilot_delay(pls, npil, 2, N, delay, t_delay);
+            t_delay_len = N / 2;
+          }
+        } else if (lmmse) {
+          /* multi-layer: the pair average of each CDM pilot pair (box LS, held in ul_ls_est[4n .. 4n+3]) is the frequency
+           * OCC despreading, so the LMMSE runs on these values, one per 4 RE at RE 4n + 1. Timing advance: IDFT peak
+           * search on the same values (see ul_chest_pilot_delay). */
+          const int nq = 3 * nb_rb_pusch;
+          c16_t q[nq];
+          for (int n = 0; n < nq; n++)
+            q[n] = ul_ls_est[4 * n];
+          ul_chest_wiener_est_t est;
+          ul_chest_wiener_interp(q, nq, 4, 2, frame_parms->subcarrier_spacing, ul_ch, &est);
+          ul_chest_pilot_delay(q, nq, 4, N, delay, t_delay);
+          t_delay_len = N / 4;
+        }
+        if (t_delay_len && rdata->scope && antenna == 0) {
+          metadata mt = {.slot = -1, .frame = -1};
+          scopeData_t *tmp = rdata->scope;
+          tmp->copyData(tmp, gNBulDelay, t_delay, sizeof(c16_t), 1, t_delay_len, 0, &mt);
+        }
+
+        // LMMSE output has no delay to revert: noise as the residual of the box LS
+        ul_ch = ul_ch_estimates[nl * num_sp_streams + antenna] + rdata->ch_row_offset;
+        for (int k = 0; k < 12 * nb_rb_pusch; k++)
+          noise_amp2 += c16amp2(c16sub(ul_ls_est[k], ul_ch[k]));
+        nest_count += 12 * nb_rb_pusch;
+      } else {
+        c16_t ch_estimates_time[frame_parms->ofdm_symbol_size] __attribute__((aligned(32)));
+        nr_est_delay(frame_parms->ofdm_symbol_size, ul_ls_est, ch_estimates_time, delay);
+        if (rdata->scope && antenna == 0) {
+          metadata mt = {.slot = -1, .frame = -1};
+          scopeData_t *tmp = rdata->scope;
+          tmp->copyData(tmp, gNBulDelay, ch_estimates_time, sizeof(c16_t), 1, frame_parms->ofdm_symbol_size, 0, &mt);
+        }
+        int delay_idx = get_delay_idx(delay->est_delay, MAX_DELAY_COMP);
+        c16_t *ul_delay_table = frame_parms->delay_table[delay_idx];
 
 #ifdef DEBUG_PUSCH
-      printf("Estimated delay = %i\n", delay->est_delay >> 1);
+        printf("Estimated delay = %i\n", delay->est_delay >> 1);
 #endif
 
-      const int chest_mode = pusch_chest_mode();
-      c16_t *ul_ch0 = ul_ch;
-      c16_t fast_ch[chest_mode == 2 ? symbolSize : 1] __attribute__((aligned(32)));
-      uint64_t fast_noise = 0;
-      int fast_nest = 0;
-      const uint64_t noise_before = noise_amp2;
-      const int nest_before = nest_count;
-      if (chest_mode != 1) {
-        int inv_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
-        c16_t *dst = chest_mode == 2 ? fast_ch : ul_ch;
-        if (chest_mode == 2)
-          memset(fast_ch, 0, sizeof(c16_t) * symbolSize);
-        pusch_type1_interp_fast(ul_ls_est, ul_delay_table, frame_parms->delay_table[inv_idx], nb_rb_pusch, dst, &fast_noise, &fast_nest);
-      }
-      if (chest_mode != 0) {
-        pilot_cnt = 0;
-        for (int n = 0; n < 3 * nb_rb_pusch; n++) {
-          // Channel interpolation
-          for (int k_line = 0; k_line <= 1; k_line++) {
-            // Apply delay
-            int k = pilot_cnt << 1;
-            c16_t ch16 = c16mulShift(ul_ls_est[k], ul_delay_table[k], 8);
+        const int chest_mode = pusch_chest_mode();
+        c16_t *ul_ch0 = ul_ch;
+        c16_t fast_ch[chest_mode == 2 ? symbolSize : 1] __attribute__((aligned(32)));
+        uint64_t fast_noise = 0;
+        int fast_nest = 0;
+        const uint64_t noise_before = noise_amp2;
+        const int nest_before = nest_count;
+        if (chest_mode != 1) {
+          int inv_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
+          c16_t *dst = chest_mode == 2 ? fast_ch : ul_ch;
+          if (chest_mode == 2)
+            memset(fast_ch, 0, sizeof(c16_t) * symbolSize);
+          pusch_type1_interp_fast(ul_ls_est, ul_delay_table, frame_parms->delay_table[inv_idx], nb_rb_pusch, dst, &fast_noise, &fast_nest);
+        }
+        if (chest_mode != 0) {
+          pilot_cnt = 0;
+          for (int n = 0; n < 3 * nb_rb_pusch; n++) {
+            // Channel interpolation
+            for (int k_line = 0; k_line <= 1; k_line++) {
+              // Apply delay
+              int k = pilot_cnt << 1;
+              c16_t ch16 = c16mulShift(ul_ls_est[k], ul_delay_table[k], 8);
 
-  #ifdef DEBUG_PUSCH
-            re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
-            c16_t *rxF = &rxdataF[re_offset];
-            printf("pilot %4d: pil -> (%6d,%6d), rxF -> (%4d,%4d), ch -> (%4d,%4d)\n",
-                   pilot_cnt,
-                   pil->r,
-                   pil->i,
-                   rxF->r,
-                   rxF->i,
-                   ch.r,
-                   ch.i);
-  #endif
+    #ifdef DEBUG_PUSCH
+              re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
+              c16_t *rxF = &rxdataF[re_offset];
+              printf("pilot %4d: pil -> (%6d,%6d), rxF -> (%4d,%4d), ch -> (%4d,%4d)\n",
+                     pilot_cnt,
+                     pil->r,
+                     pil->i,
+                     rxF->r,
+                     rxF->i,
+                     ch.r,
+                     ch.i);
+    #endif
 
-            if (pilot_cnt == 0) {
-              c16multaddVectRealComplex(filt16_ul_p0, &ch16, ul_ch, 16);
-            } else if (pilot_cnt == 1 || pilot_cnt == 2) {
-              c16multaddVectRealComplex(filt16_ul_p1p2, &ch16, ul_ch, 16);
-            } else if (pilot_cnt == (6 * nb_rb_pusch - 1)) {
-              c16multaddVectRealComplex(filt16_ul_last, &ch16, ul_ch, 16);
-            } else {
-              c16multaddVectRealComplex(filt16_ul_middle, &ch16, ul_ch, 16);
-              if (pilot_cnt % 2 == 0) {
-                ul_ch += 4;
+              if (pilot_cnt == 0) {
+                c16multaddVectRealComplex(filt16_ul_p0, &ch16, ul_ch, 16);
+              } else if (pilot_cnt == 1 || pilot_cnt == 2) {
+                c16multaddVectRealComplex(filt16_ul_p1p2, &ch16, ul_ch, 16);
+              } else if (pilot_cnt == (6 * nb_rb_pusch - 1)) {
+                c16multaddVectRealComplex(filt16_ul_last, &ch16, ul_ch, 16);
+              } else {
+                c16multaddVectRealComplex(filt16_ul_middle, &ch16, ul_ch, 16);
+                if (pilot_cnt % 2 == 0) {
+                  ul_ch += 4;
+                }
               }
+
+              pilot_cnt++;
             }
+          }
 
-            pilot_cnt++;
+          // Revert delay
+          pilot_cnt = 0;
+          ul_ch = ul_ch_estimates[nl * num_sp_streams + antenna] + rdata->ch_row_offset;
+          int inv_delay_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
+          c16_t *ul_inv_delay_table = frame_parms->delay_table[inv_delay_idx];
+          for (int n = 0; n < 3 * nb_rb_pusch; n++) {
+            for (int k_line = 0; k_line <= 1; k_line++) {
+              int k = pilot_cnt << 1;
+              ul_ch[k] = c16mulShift(ul_ch[k], ul_inv_delay_table[k], 8);
+              ul_ch[k + 1] = c16mulShift(ul_ch[k + 1], ul_inv_delay_table[k + 1], 8);
+              noise_amp2 += c16amp2(c16sub(ul_ls_est[k], ul_ch[k]));
+              noise_amp2 += c16amp2(c16sub(ul_ls_est[k + 1], ul_ch[k + 1]));
+
+    #ifdef DEBUG_PUSCH
+              re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
+              printf("ch -> (%4d,%4d), ch_inter -> (%4d,%4d)\n", ul_ls_est[k].r, ul_ls_est[k].i, ul_ch[k].r, ul_ch[k].i);
+    #endif
+              pilot_cnt++;
+              nest_count += 2;
+            }
           }
         }
-
-        // Revert delay
-        pilot_cnt = 0;
-        ul_ch = ul_ch_estimates[nl * num_sp_streams + antenna] + rdata->ch_row_offset;
-        int inv_delay_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
-        c16_t *ul_inv_delay_table = frame_parms->delay_table[inv_delay_idx];
-        for (int n = 0; n < 3 * nb_rb_pusch; n++) {
-          for (int k_line = 0; k_line <= 1; k_line++) {
-            int k = pilot_cnt << 1;
-            ul_ch[k] = c16mulShift(ul_ch[k], ul_inv_delay_table[k], 8);
-            ul_ch[k + 1] = c16mulShift(ul_ch[k + 1], ul_inv_delay_table[k + 1], 8);
-            noise_amp2 += c16amp2(c16sub(ul_ls_est[k], ul_ch[k]));
-            noise_amp2 += c16amp2(c16sub(ul_ls_est[k + 1], ul_ch[k + 1]));
-
-  #ifdef DEBUG_PUSCH
-            re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
-            printf("ch -> (%4d,%4d), ch_inter -> (%4d,%4d)\n", ul_ls_est[k].r, ul_ls_est[k].i, ul_ch[k].r, ul_ch[k].i);
-  #endif
-            pilot_cnt++;
-            nest_count += 2;
-          }
+        if (chest_mode == 0) {
+          noise_amp2 += fast_noise;
+          nest_count += fast_nest;
+        } else if (chest_mode == 2) {
+          // compare with the filter loop over the REs it writes (12 nb_rb + 4) and the noise / estimate counters
+          static int checked, mismatched;
+          const uint64_t loop_noise = noise_amp2 - noise_before;
+          const int bad = memcmp(fast_ch, ul_ch0, sizeof(c16_t) * (12 * nb_rb_pusch + 4)) != 0 || fast_noise != loop_noise
+                          || fast_nest != nest_count - nest_before;
+          mismatched += bad;
+          if (bad || (++checked % 1000) == 0 || checked == 1)
+            fprintf(stderr, "OAI_CHEST_CHECK: %d checked, %d mismatched%s\n", checked, mismatched, bad ? " (MISMATCH)" : "");
         }
-      }
-      if (chest_mode == 0) {
-        noise_amp2 += fast_noise;
-        nest_count += fast_nest;
-      } else if (chest_mode == 2) {
-        // compare with the filter loop over the REs it writes (12 nb_rb + 4) and the noise / estimate counters
-        static int checked, mismatched;
-        const uint64_t loop_noise = noise_amp2 - noise_before;
-        const int bad = memcmp(fast_ch, ul_ch0, sizeof(c16_t) * (12 * nb_rb_pusch + 4)) != 0 || fast_noise != loop_noise
-                        || fast_nest != nest_count - nest_before;
-        mismatched += bad;
-        if (bad || (++checked % 1000) == 0 || checked == 1)
-          fprintf(stderr, "OAI_CHEST_CHECK: %d checked, %d mismatched%s\n", checked, mismatched, bad ? " (MISMATCH)" : "");
       }
       // Align the channel estimates for the delta shift
       if (delta != 0) {
@@ -443,7 +897,8 @@ static void nr_pusch_antenna_processing(void *arg)
       }
 
     } else if (pusch_pdu->dmrs_config_type == pusch_dmrs_type2
-               && chest_freq == 0) { // pusch_dmrs_type2  |p_r,p_l,d,d,d,d,p_r,p_l,d,d,d,d|
+               && (chest_freq == CHEST_FREQ_BOX_INTERP
+                   || chest_freq == CHEST_FREQ_LMMSE_INTERP)) { // pusch_dmrs_type2  |p_r,p_l,d,d,d,d,p_r,p_l,d,d,d,d|
       LOG_D(PHY, "PUSCH estimation DMRS type 2, Freq-domain interpolation\n");
       c16_t *pil = pilot;
       c16_t *rx = &rxdataF[delta];
@@ -469,10 +924,22 @@ static void nr_pusch_antenna_processing(void *arg)
         scopeData_t *tmp = rdata->scope;
         tmp->copyData(tmp, gNBulDelay, ch_estimates_time, sizeof(c16_t), 1, frame_parms->ofdm_symbol_size, 0, &mt);
       }
-      int delay_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
-      c16_t *ul_delay_table = frame_parms->delay_table[delay_idx];
-      for (int n = 0; n < nb_rb_pusch * NR_NB_SC_PER_RB; n++) {
-        ul_ch[n] = c16mulShift(ul_ls_est[n], ul_delay_table[n % 6], 8);
+      if (chest_freq == CHEST_FREQ_LMMSE_INTERP && 2 * nb_rb_pusch >= W_K) {
+        /* LMMSE on the pair averages (the frequency OCC despreading, held in ul_ls_est[6n + 4]), one per 6 RE at RE
+         * 6n + delta + 1/2 relative to k0; the output is aligned on k0. The timing advance keeps the IDFT peak
+         * search above (arg c(1) at a 6-RE spacing wraps inside the TA range). */
+        const int nq = 2 * nb_rb_pusch;
+        c16_t q[nq];
+        for (int n = 0; n < nq; n++)
+          q[n] = ul_ls_est[6 * n + 4];
+        ul_chest_wiener_est_t est;
+        ul_chest_wiener_interp(q, nq, 6, 2 * delta + 1, frame_parms->subcarrier_spacing, ul_ch, &est);
+      } else {
+        int delay_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
+        c16_t *ul_delay_table = frame_parms->delay_table[delay_idx];
+        for (int n = 0; n < nb_rb_pusch * NR_NB_SC_PER_RB; n++) {
+          ul_ch[n] = c16mulShift(ul_ls_est[n], ul_delay_table[n % 6], 8);
+        }
       }
 
     }
