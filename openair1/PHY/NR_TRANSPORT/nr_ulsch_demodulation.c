@@ -156,6 +156,80 @@ static int get_nb_re_pusch(NR_DL_FRAME_PARMS *frame_parms,
   return re_pusch;
 }
 
+/* |h|^2 of REs 8b..8b+7 summed over RX antennas, in float (an int32 sum can overflow with many antennas) */
+static inline simde__m256 tp_mag(int nb_rx_ant, int buffer_length, c16_t chF[nb_rx_ant][buffer_length], int b, simde__m256 scale)
+{
+  simde__m256 m = simde_mm256_setzero_ps();
+  for (int aarx = 0; aarx < nb_rx_ant; aarx++) {
+    const simde__m256i h = simde_mm256_loadu_si256((simde__m256i *)&chF[aarx][8 * b]);
+    m = simde_mm256_add_ps(m, simde_mm256_cvtepi32_ps(simde_mm256_madd_epi16(h, h)));
+  }
+  return simde_mm256_mul_ps(m, scale);
+}
+
+/* Transform precoding: per-RE MMSE equalisation before the de-spreading IDFT, for every modulation order.
+ * The matched filter output conj(h)y = |h|^2 x keeps the |h|^2 ripple across the allocation, which the IDFT turns
+ * into inter-symbol interference. The output keeps the mean matched-filter gain mean|h|^2, so the QAM thresholds
+ * are mean|h|^2 times the usual constants. noise: noise variance per data RE, in the units of |chF|^2. */
+static void nr_tp_equalization(c16_t *comp,
+                               int nb_rx_ant,
+                               int buffer_length,
+                               c16_t chF[nb_rx_ant][buffer_length],
+                               int nb_re,
+                               int output_shift,
+                               float noise,
+                               int qam_mod_order,
+                               c16_t *ch_maga,
+                               c16_t *ch_magb)
+{
+  if (nb_re == 0)
+    return;
+  // buffers are zero beyond nb_re and buffer_length is a multiple of 16, so whole blocks of 8 REs are processed
+  const int nb_blk = (nb_re + 7) >> 3;
+  const simde__m256 scale = simde_mm256_set1_ps(1.0f / (float)(1 << output_shift));
+  simde__m256 sum = simde_mm256_setzero_ps();
+  for (int b = 0; b < nb_blk; b++) {
+    const simde__m256 mf = tp_mag(nb_rx_ant, buffer_length, chF, b, scale);
+    sum = simde_mm256_add_ps(sum, mf);
+  }
+  float s8[8] __attribute__((aligned(32)));
+  simde_mm256_store_ps(s8, sum);
+  const float mean = (s8[0] + s8[1] + s8[2] + s8[3] + s8[4] + s8[5] + s8[6] + s8[7]) / nb_re;
+  const float sigma2 = fmaxf(noise / (float)(1 << output_shift), 1e-6f * mean); // numerical guard only
+
+  const simde__m256 vmean = simde_mm256_set1_ps(mean);
+  const simde__m256 vsigma2 = simde_mm256_set1_ps(sigma2);
+  const simde__m256 vmax = simde_mm256_set1_ps(32767.0f);
+  const simde__m256 vmin = simde_mm256_set1_ps(-32768.0f);
+  const simde__m256i dup_lo = simde_mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
+  const simde__m256i dup_hi = simde_mm256_setr_epi32(4, 4, 5, 5, 6, 6, 7, 7);
+  for (int b = 0; b < nb_blk; b++) {
+    const simde__m256 mf = tp_mag(nb_rx_ant, buffer_length, chF, b, scale); // recomputed: no stack array
+    const simde__m256 g = simde_mm256_div_ps(vmean, simde_mm256_add_ps(mf, vsigma2));
+    simde__m256i *z = (simde__m256i *)&comp[8 * b];
+    const simde__m256i x = simde_mm256_loadu_si256(z);
+    const simde__m256 xl = simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(simde_mm256_castsi256_si128(x)));
+    const simde__m256 xh = simde_mm256_cvtepi32_ps(simde_mm256_cvtepi16_epi32(simde_mm256_extracti128_si256(x, 1)));
+    // clamp before the conversion: cvtps_epi32 turns any float beyond int32 into INT_MIN (wrong sign)
+    const simde__m256 fl = simde_mm256_min_ps(simde_mm256_max_ps(simde_mm256_mul_ps(xl, simde_mm256_permutevar8x32_ps(g, dup_lo)), vmin), vmax);
+    const simde__m256 fh = simde_mm256_min_ps(simde_mm256_max_ps(simde_mm256_mul_ps(xh, simde_mm256_permutevar8x32_ps(g, dup_hi)), vmin), vmax);
+    simde_mm256_storeu_si256(z, simde_mm256_permute4x64_epi64(simde_mm256_packs_epi32(simde_mm256_cvtps_epi32(fl), simde_mm256_cvtps_epi32(fh)), 0xd8));
+  }
+
+  // equalised symbols have the mean matched-filter gain: constant QAM thresholds for the LLRs
+  const int16_t a = (int16_t)fminf(mean, INT16_MAX);
+  if (qam_mod_order >= 4) {
+    const simde__m256i va = simde_mm256_set1_epi16((a * (qam_mod_order == 4 ? QAM16_n1 : QAM64_n1)) >> 15);
+    for (int b = 0; b < nb_blk; b++)
+      simde_mm256_storeu_si256((simde__m256i *)&ch_maga[8 * b], va);
+  }
+  if (qam_mod_order == 6) {
+    const simde__m256i vb = simde_mm256_set1_epi16((a * QAM64_n2) >> 15);
+    for (int b = 0; b < nb_blk; b++)
+      simde_mm256_storeu_si256((simde__m256i *)&ch_magb[8 * b], vb);
+  }
+}
+
 static void inner_rx(PHY_VARS_gNB *gNB,
                      int slot,
                      NR_DL_FRAME_PARMS *frame_parms,
@@ -249,14 +323,20 @@ static void inner_rx(PHY_VARS_gNB *gNB,
                           output_shift);
 
   if (nb_layer == 1 && rel15_ul->transform_precoding == transformPrecoder_enabled && rel15_ul->qam_mod_order <= 6) {
-    if (rel15_ul->qam_mod_order > 2)
-      nr_freq_equalization(frame_parms,
-                           &rxdataF_comp[0][symbol * buffer_length],
-                           rxF_ch_maga[0],
-                           rxF_ch_magb[0],
-                           symbol,
-                           nb_re_pusch,
-                           rel15_ul->qam_mod_order);
+    // nvar is the mean |LS - interpolated|^2 at the pilots (default DMRS type 1 interpolation): it misses the DMRS
+    // power boost beta^2, the averaging of pilot pairs in the LS estimate (1/2) and the correlation of the residual
+    // with the estimate (3/4), so the noise per data RE in |h|^2 units is nvar * beta^2 * 8/3
+    const float beta = get_beta_dmrs(rel15_ul->num_dmrs_cdm_grps_no_data, rel15_ul->dmrs_config_type == pusch_dmrs_type2);
+    nr_tp_equalization(&rxdataF_comp[0][symbol * buffer_length],
+                       nb_rx_ant,
+                       buffer_length,
+                       chFext[0],
+                       nb_re_pusch,
+                       output_shift,
+                       nvar * beta * beta * 8.0f / 3.0f,
+                       rel15_ul->qam_mod_order,
+                       rxF_ch_maga[0],
+                       rxF_ch_magb[0]);
     nr_idft((int32_t *)&rxdataF_comp[0][symbol * buffer_length], nb_re_pusch);
   }
   if (nb_layer == 2) {
