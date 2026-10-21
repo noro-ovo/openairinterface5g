@@ -102,15 +102,6 @@ void nr_srs_noise_power_estimation(uint16_t ofdm_symbol_size,
                                    uint32_t *noise_power,
                                    int16_t *noise_power_per_rb);
 
-void nr_freq_equalization(NR_DL_FRAME_PARMS *frame_parms,
-                          c16_t *rxdataF_comp,
-                          c16_t *ul_ch_mag,
-                          c16_t *ul_ch_mag_b,
-                          unsigned char symbol,
-                          unsigned short Msc_RS,
-                          unsigned char Qm);
-
-void nr_init_fde(void);
 /* Builds the LMMSE frequency interpolation filters (chest_freq 2) for one subcarrier spacing; no-op for other modes. */
 void nr_ul_chest_lmmse_init(int chest_freq, int subcarrier_spacing);
 
