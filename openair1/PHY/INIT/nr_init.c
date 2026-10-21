@@ -142,7 +142,6 @@ void phy_init_nr_gNB(PHY_VARS_gNB *gNB)
   init_byte2m128i();
   init_pucch2_luts();
 
-  nr_init_fde(); // Init array for frequency equalization of transform precoding of PUSCH
 
   gNB->max_nb_pdsch = NR_MAX_SCHED_PER_SLOT;
   init_delay_table(fp->ofdm_symbol_size, MAX_DELAY_COMP, NR_MAX_OFDM_SYMBOL_SIZE, fp->delay_table);
