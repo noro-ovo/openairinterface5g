@@ -186,7 +186,8 @@ int nr_pusch_lowpaprtype1_dmrs_rx(nr_prefix_type_t Ncp,
                                   unsigned char lp,
                                   unsigned short nb_pusch_rb,
                                   uint32_t re_offset,
-                                  uint8_t dmrs_type)
+                                  uint8_t dmrs_type,
+                                  int16_t dmrs_scaling)
 {
   int8_t w, nb_dmrs;
   int k;
@@ -205,6 +206,7 @@ int nr_pusch_lowpaprtype1_dmrs_rx(nr_prefix_type_t Ncp,
 
           output[k].r = w * dmrs_seq[i].r;
           output[k].i = -w * dmrs_seq[i].i; // conjugate
+          output[k] = c16mulRealShift(output[k], dmrs_scaling, 14);
 
 #ifdef DEBUG_PUSCH
           printf("NR_DMRS_RX: nr_pusch_dmrs_rx dmrs config type %d port %d nb_pusch_rb %d nb_dmrs %d\n",
