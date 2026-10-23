@@ -536,7 +536,7 @@ dft8x8_twiddle_scaled_store(const c16_t *b, int M, c16_t *dst, int R, int first,
 }
 
 static __attribute__((always_inline)) inline void
-dft16x8_twiddle_scaled_store_body(const c16_t *b, int M, c16_t *dst, int R, int first, int valid, dft_dir_t dir)
+dft16x8_twiddle_scaled_store_body(const c16_t *b, int M, c16_t *dst, int R, int first, int valid, const dft_band_t *pout, dft_dir_t dir)
 {
   const simde__m256i zero = simde_mm256_setzero_si256();
 #define LOAD16_ROW(LANE, OFF) \
@@ -583,6 +583,10 @@ dft16x8_twiddle_scaled_store_body(const c16_t *b, int M, c16_t *dst, int R, int 
     simde__m256i z[4];
     dft4x8_raw_q15_256(a[0][k2], a[1][k2], a[2][k2], a[3][k2], z, dir);
     for (int k1 = 0; k1 < 4; k1++) {
+      if (pout) { /* pruned API, NR output (valid == 8); swapped: leaf index (k2 + 4 k1) ^ 8 = k2 + 4 (k1 ^ 2) */
+        dft_band_store8(pout, 16 * R, R * (k2 + 4 * (k1 ^ 2)) + first, k1 < 2, z[k1]);
+        continue;
+      }
       c16_t *out = dst + R * (k2 + 4 * k1) + first;
       if (valid == 8)
         simde_mm256_storeu_si256((simde__m256i *)out, z[k1]);
@@ -597,13 +601,19 @@ static __attribute__((noinline)) void
 dft16x8_twiddle_scaled_store(const c16_t *b, int M, c16_t *dst, int R, int first, int valid, dft_dir_t dir)
 {
   if (dir == DFT_DIR_FORWARD)
-    dft16x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, DFT_DIR_FORWARD);
+    dft16x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, NULL, DFT_DIR_FORWARD);
   else
-    dft16x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, DFT_DIR_INVERSE);
+    dft16x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, NULL, DFT_DIR_INVERSE);
 }
 
-static __attribute__((always_inline)) inline void
-dft32x8_twiddle_scaled_store_body(const c16_t *b, int M, c16_t *dst, int R, int first, int valid, dft_dir_t dir)
+static __attribute__((always_inline)) inline void dft32x8_twiddle_scaled_store_body(const c16_t *b,
+                                                                                    int M,
+                                                                                    c16_t *dst,
+                                                                                    int R,
+                                                                                    int first,
+                                                                                    int valid,
+                                                                                    const dft_band_t *pout,
+                                                                                    dft_dir_t dir)
 {
   const simde__m256i zero = simde_mm256_setzero_si256();
 #define LOAD32_ROW(LANE, OFF) \
@@ -697,6 +707,11 @@ dft32x8_twiddle_scaled_store_body(const c16_t *b, int M, c16_t *dst, int R, int 
 
     const simde__m256i z[8] = {z0, z1, z2, z3, z4, z5, z6, z7};
     for (int k1 = 0; k1 < 8; k1++) {
+      if (pout) { /* pruned API, packed output (valid == 8) */
+        /* swapped: leaf index (k2 + 4 k1) ^ 16 = k2 + 4 (k1 ^ 4) */
+        dft_band_store8(pout, 32 * R, R * (k2 + 4 * (k1 ^ 4)) + first, k1 < 4, z[k1]);
+        continue;
+      }
       c16_t *out = dst + R * (k2 + 4 * k1) + first;
       if (valid == 8)
         simde_mm256_storeu_si256((simde__m256i *)out, z[k1]);
@@ -711,9 +726,9 @@ static __attribute__((noinline)) void
 dft32x8_twiddle_scaled_store(const c16_t *b, int M, c16_t *dst, int R, int first, int valid, dft_dir_t dir)
 {
   if (dir == DFT_DIR_FORWARD)
-    dft32x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, DFT_DIR_FORWARD);
+    dft32x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, NULL, DFT_DIR_FORWARD);
   else
-    dft32x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, DFT_DIR_INVERSE);
+    dft32x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, NULL, DFT_DIR_INVERSE);
 }
 
 static const int16_t dft12_leaf_twiddle_re[12] = {16384, 14189, 8192, 0, -8192, -14189, -16384, -14189, -8192, 0, 8192, 14189};
