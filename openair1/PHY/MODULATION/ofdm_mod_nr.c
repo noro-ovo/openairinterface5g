@@ -8,23 +8,26 @@
 #include "common/utils/LOG/log.h"
 //#define DEBUG_OFDM_MOD
 
-void nr_normal_prefix_mod(c16_t *txdataF,
-                          c16_t *txdata,
-                          uint8_t nsymb,
-                          const NR_DL_FRAME_PARMS *frame_parms,
-                          uint32_t slot,
-                          bool was_symbol_used[NR_SYMBOLS_PER_SLOT])
+/* nbins == 0: txdataF in natural FFT order; nbins > 0: txdataF fftshifted (NR carrier of nbins subcarriers) */
+static void nr_normal_prefix_mod_layout(c16_t *txdataF,
+                                        c16_t *txdata,
+                                        uint8_t nsymb,
+                                        const NR_DL_FRAME_PARMS *frame_parms,
+                                        uint32_t slot,
+                                        bool was_symbol_used[NR_SYMBOLS_PER_SLOT],
+                                        int nbins)
 {
   // This function works only slot wise. For more generic symbol generation refer nr_feptx0()
   if (frame_parms->numerology_index != 0) { // case where numerology != 0
     if (!(slot%(frame_parms->slots_per_subframe/2))) {
       if (was_symbol_used[0]) {
-        PHY_ofdm_mod((int *)txdataF,
-                    (int *)txdata,
-                    frame_parms->ofdm_symbol_size,
-                    1,
-                    frame_parms->nb_prefix_samples0,
-                    CYCLIC_PREFIX);
+        PHY_ofdm_mod_shifted((int *)txdataF,
+                             (int *)txdata,
+                             frame_parms->ofdm_symbol_size,
+                             1,
+                             frame_parms->nb_prefix_samples0,
+                             CYCLIC_PREFIX,
+                             nbins);
       } else {
         memset(txdata, 0, (frame_parms->nb_prefix_samples0 +  frame_parms->ofdm_symbol_size) * sizeof(c16_t));
       }
@@ -32,12 +35,13 @@ void nr_normal_prefix_mod(c16_t *txdataF,
         c16_t* tx_data_ptr = txdata + (i - 1) * (frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples) +
                             frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples0;
         if (was_symbol_used[i]) {
-          PHY_ofdm_mod((int *)txdataF + frame_parms->ofdm_symbol_size * i,
-                      (int *)tx_data_ptr,
-                      frame_parms->ofdm_symbol_size,
-                      1,
-                      frame_parms->nb_prefix_samples,
-                      CYCLIC_PREFIX);
+          PHY_ofdm_mod_shifted((int *)txdataF + frame_parms->ofdm_symbol_size * i,
+                               (int *)tx_data_ptr,
+                               frame_parms->ofdm_symbol_size,
+                               1,
+                               frame_parms->nb_prefix_samples,
+                               CYCLIC_PREFIX,
+                               nbins);
         } else {
           memset(tx_data_ptr, 0, (frame_parms->nb_prefix_samples + frame_parms->ofdm_symbol_size) * sizeof(c16_t));
         }
@@ -47,12 +51,13 @@ void nr_normal_prefix_mod(c16_t *txdataF,
       for (int i = 0; i < nsymb; i++) {
         c16_t* tx_data_ptr = txdata + i * (frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples);
         if (was_symbol_used[i]) {
-          PHY_ofdm_mod((int *)txdataF + frame_parms->ofdm_symbol_size * i,
-                      (int *)tx_data_ptr,
-                      frame_parms->ofdm_symbol_size,
-                      1,
-                      frame_parms->nb_prefix_samples,
-                      CYCLIC_PREFIX);
+          PHY_ofdm_mod_shifted((int *)txdataF + frame_parms->ofdm_symbol_size * i,
+                               (int *)tx_data_ptr,
+                               frame_parms->ofdm_symbol_size,
+                               1,
+                               frame_parms->nb_prefix_samples,
+                               CYCLIC_PREFIX,
+                               nbins);
         } else {
           memset(tx_data_ptr, 0, (frame_parms->nb_prefix_samples + frame_parms->ofdm_symbol_size) * sizeof(c16_t));
         }
@@ -60,33 +65,58 @@ void nr_normal_prefix_mod(c16_t *txdataF,
     }
   }
   else { // numerology = 0, longer CP for every 7th symbol
-      PHY_ofdm_mod((int *)txdataF,
-                   (int *)txdata,
-                   frame_parms->ofdm_symbol_size,
-                   1,
-                   frame_parms->nb_prefix_samples0,
-                   CYCLIC_PREFIX);
-      PHY_ofdm_mod((int *)txdataF + frame_parms->ofdm_symbol_size,
-                  (int *)txdata + frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples0,
-                  frame_parms->ofdm_symbol_size,
-                  6,
-                  frame_parms->nb_prefix_samples,
-                  CYCLIC_PREFIX);
-      PHY_ofdm_mod((int *)txdataF + 7*frame_parms->ofdm_symbol_size,
-                   (int *)txdata + 6*(frame_parms->ofdm_symbol_size+frame_parms->nb_prefix_samples)
-                                 + frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples0,
-                   frame_parms->ofdm_symbol_size,
-                   1,
-                   frame_parms->nb_prefix_samples0,
-                   CYCLIC_PREFIX);
-      PHY_ofdm_mod((int *)txdataF + 8 * frame_parms->ofdm_symbol_size,
-                   (int *)txdata + 6 * (frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples)
-                                 + 2*(frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples0),
-                   frame_parms->ofdm_symbol_size,
-                   6,
-                   frame_parms->nb_prefix_samples,
-                   CYCLIC_PREFIX);
+    PHY_ofdm_mod_shifted((int *)txdataF,
+                         (int *)txdata,
+                         frame_parms->ofdm_symbol_size,
+                         1,
+                         frame_parms->nb_prefix_samples0,
+                         CYCLIC_PREFIX,
+                         nbins);
+    PHY_ofdm_mod_shifted((int *)txdataF + frame_parms->ofdm_symbol_size,
+                         (int *)txdata + frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples0,
+                         frame_parms->ofdm_symbol_size,
+                         6,
+                         frame_parms->nb_prefix_samples,
+                         CYCLIC_PREFIX,
+                         nbins);
+    PHY_ofdm_mod_shifted((int *)txdataF + 7 * frame_parms->ofdm_symbol_size,
+                         (int *)txdata + 6 * (frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples)
+                             + frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples0,
+                         frame_parms->ofdm_symbol_size,
+                         1,
+                         frame_parms->nb_prefix_samples0,
+                         CYCLIC_PREFIX,
+                         nbins);
+    PHY_ofdm_mod_shifted((int *)txdataF + 8 * frame_parms->ofdm_symbol_size,
+                         (int *)txdata + 6 * (frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples)
+                             + 2 * (frame_parms->ofdm_symbol_size + frame_parms->nb_prefix_samples0),
+                         frame_parms->ofdm_symbol_size,
+                         6,
+                         frame_parms->nb_prefix_samples,
+                         CYCLIC_PREFIX,
+                         nbins);
   }
+}
+
+void nr_normal_prefix_mod(c16_t *txdataF,
+                          c16_t *txdata,
+                          uint8_t nsymb,
+                          const NR_DL_FRAME_PARMS *frame_parms,
+                          uint32_t slot,
+                          bool was_symbol_used[NR_SYMBOLS_PER_SLOT])
+{
+  nr_normal_prefix_mod_layout(txdataF, txdata, nsymb, frame_parms, slot, was_symbol_used, 0);
+}
+
+void nr_normal_prefix_mod_shifted(c16_t *txdataF,
+                                  c16_t *txdata,
+                                  uint8_t nsymb,
+                                  const NR_DL_FRAME_PARMS *frame_parms,
+                                  uint32_t slot,
+                                  bool was_symbol_used[NR_SYMBOLS_PER_SLOT],
+                                  int nbins)
+{
+  nr_normal_prefix_mod_layout(txdataF, txdata, nsymb, frame_parms, slot, was_symbol_used, nbins);
 }
 
 /* txdataF is FFT shifted, i.e. the REs of the carrier are contiguous starting at index 0. */
