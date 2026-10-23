@@ -74,6 +74,16 @@ int nr_symbol_fep_ul(const NR_DL_FRAME_PARMS *fp,
                      unsigned char slot,
                      int sample_offset);
 
+/*! nr_symbol_fep_ul() with the output fftshifted for the N_RB_UL carrier: the same buffer as
+    nr_symbol_fep_ul() followed by fftshift_inplace(rxdataF, N_RB_UL * 12, ofdm_symbol_size),
+    the shift being done by the DFT output stores (dft_pruned, DFT_PRUNE_PACKED). */
+void nr_symbol_fep_ul_shifted(const NR_DL_FRAME_PARMS *fp,
+                              const c16_t *rxdata,
+                              c16_t *rxdataF,
+                              unsigned char symbol,
+                              unsigned char slot,
+                              int sample_offset);
+
 /*!
 \brief This function implements the dft transform precoding in PUSCH
 \param z Pointer to output in frequnecy domain
@@ -162,6 +172,17 @@ void nr_normal_prefix_mod(c16_t *txdataF,
                           const NR_DL_FRAME_PARMS *frame_parms,
                           uint32_t slot,
                           bool was_symbol_used[NR_SYMBOLS_PER_SLOT]);
+
+/* nr_normal_prefix_mod() for txdataF in the fftshifted layout of an NR carrier of nbins subcarriers
+   (PHY_ofdm_mod_shifted): replaces fftshift_inverse_inplace() + nr_normal_prefix_mod() when the entries
+   nbins .. ofdm_symbol_size-1 of each symbol are zero; txdataF is not modified. */
+void nr_normal_prefix_mod_shifted(c16_t *txdataF,
+                                  c16_t *txdata,
+                                  uint8_t nsymb,
+                                  const NR_DL_FRAME_PARMS *frame_parms,
+                                  uint32_t slot,
+                                  bool was_symbol_used[NR_SYMBOLS_PER_SLOT],
+                                  int nbins);
 
 // FFT shift routines
 void fftshift(const c16_t *in, c16_t *out, int nbins, int fft_size);

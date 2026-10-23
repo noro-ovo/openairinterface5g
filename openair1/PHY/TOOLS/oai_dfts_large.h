@@ -79,7 +79,10 @@ DEFINE_COLD_Q15_INITIALIZER(
 
 DEFINE_Q15_READY_FAST_PATH(dft3072_r24_init, dft3072_r24_ready, dft3072_r24_init_slow)
 
-static inline void dft3072_r24_r2_to_batches(const c16_t *src, simde__m256i work[3][2][64], dft_dir_t dir)
+static __attribute__((always_inline)) inline void dft3072_r24_r2_to_batches(const c16_t *src,
+                                                                           const dft_band_t *pin,
+                                                                           simde__m256i work[3][2][64],
+                                                                           dft_dir_t dir)
 {
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
   const simde__m256i s24 = simde_mm256_set1_epi16(Q15_INV_SQRT3);
@@ -91,8 +94,8 @@ static inline void dft3072_r24_r2_to_batches(const c16_t *src, simde__m256i work
     const simde__m256i r2_re = simde_mm256_load_si256((const simde__m256i *)(dft3072_r2_re + k0));
     const simde__m256i r2_im = simde_mm256_load_si256((const simde__m256i *)(dft3072_r2_im[ds] + k0));
     simde__m256i z[2][24];
-    raw_radix24_pfa8_q15_256(src, 128, k0, z[0], dir);
-    raw_radix24_pfa8_q15_256(src, 128, k0 + 64, z[1], dir);
+    raw_radix24_pfa8_body(src, pin, 128, k0, z[0], dir);
+    raw_radix24_pfa8_body(src, pin, 128, k0 + 64, z[1], dir);
 
     for (int group = 0; group < 3; group++) {
       simde__m256i row[2][8];
@@ -130,7 +133,7 @@ static void dft3072_r24_dft128x8(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   simde__m256i work[3][2][64] __attribute__((aligned(64)));
   power2_leaf_twiddles_init();
-  dft3072_r24_r2_to_batches(src, work, dir);
+  dft3072_r24_r2_to_batches(src, NULL, work, dir);
   for (int group = 0; group < 3; group++)
     dft3072_dft64x8_pair_store(work[group], dst, 8 * group, dir);
 }
@@ -212,14 +215,17 @@ DEFINE_COLD_Q15_INITIALIZER(
 
 DEFINE_Q15_READY_FAST_PATH(dft6144_leaf256_init, dft6144_leaf256_ready, dft6144_leaf256_init_slow)
 
-static inline void dft6144_r24_parent_to_batches(const c16_t *src, simde__m256i work[3][16][16], dft_dir_t dir)
+static __attribute__((always_inline)) inline void dft6144_r24_parent_to_batches(const c16_t *src,
+                                                                               const dft_band_t *pin,
+                                                                               simde__m256i work[3][16][16],
+                                                                               dft_dir_t dir)
 {
   const simde__m256i s24 = simde_mm256_set1_epi16(Q15_INV_SQRT3);
   r24_6144_parent_init();
 
   for (int off = 0; off < 256; off += 8) {
     simde__m256i z[24];
-    raw_radix24_pfa8_q15_256(src, 256, off, z, dir);
+    raw_radix24_pfa8_body(src, pin, 256, off, z, dir);
 
     for (int group = 0; group < 3; group++) {
       const int first = 8 * group;
@@ -240,7 +246,11 @@ static inline void dft6144_r24_parent_to_batches(const c16_t *src, simde__m256i 
   }
 }
 
-static inline void dft6144_dft256x8_store(simde__m256i stage[16][16], c16_t *dst, int first, dft_dir_t dir)
+static __attribute__((always_inline)) inline void dft6144_dft256x8_store(simde__m256i stage[16][16],
+                                                                        c16_t *dst,
+                                                                        int first,
+                                                                        const dft_band_t *pout,
+                                                                        dft_dir_t dir)
 {
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
 
@@ -264,7 +274,10 @@ static inline void dft6144_dft256x8_store(simde__m256i stage[16][16], c16_t *dst
     simde__m256i y[16];
     dft16x8(stage[r], y, dir);
     for (int k = 0; k < 16; k++) {
-      simde_mm256_storeu_si256((simde__m256i *)(dst + 24 * (16 * k + r) + first), y[k]);
+      if (pout) /* pruned API, NR output; swapped: 16 (k ^ 8) + r */
+        dft_band_store8(pout, 6144, 24 * (16 * (k ^ 8) + r) + first, k < 8, y[k]);
+      else
+        simde_mm256_storeu_si256((simde__m256i *)(dst + 24 * (16 * k + r) + first), y[k]);
     }
   }
 }
@@ -274,9 +287,9 @@ static void dft6144_r24_leaf256(const c16_t *src, c16_t *dst, dft_dir_t dir)
   simde__m256i work[3][16][16] __attribute__((aligned(64)));
   power2_leaf_twiddles_init();
   dft6144_leaf256_init();
-  dft6144_r24_parent_to_batches(src, work, dir);
+  dft6144_r24_parent_to_batches(src, NULL, work, dir);
   for (int group = 0; group < 3; group++)
-    dft6144_dft256x8_store(work[group], dst, 8 * group, dir);
+    dft6144_dft256x8_store(work[group], dst, 8 * group, NULL, dir);
 }
 
 /* A vector lane holds one of eight independent R24 children throughout the
