@@ -124,7 +124,7 @@ int32_t nr_segmentation(unsigned char *input_buffer,
         output_buffers[r][2+((Kprime - L) >> 3)] = ((uint8_t*)&crc)[0];
       }
       if (*F > 0) {
-        for (int k = Kprime >> 3; k < (*K >> 3); k++) {
+        for (int k = Kprime >> 3; k < ((*K + 7) >> 3); k++) {
           output_buffers[r][k] = 0;
           //printf("r %d filler bits [%d] = %d Kprime %d \n", r,k, output_buffers[r][k], Kprime);
         }
