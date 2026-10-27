@@ -70,6 +70,14 @@ typedef struct nrLDPC_dec_params {
     int (*check_crc)(uint8_t* decoded_bytes, uint32_t n, uint8_t crc_type); /**< Parity check function */
     int n_segments; /**Infomation for cuda streaming*/
     int LastTrial; /**Infomation for cuda streaming to create and destroy*/
+    /* LLR-scale hints (appended at the end of the struct so that decoders built against the previous layout, which
+       only read the fields above, keep working; OAI's own decoders ignore them). A caller that zero-initialises the
+       struct and does not set them reports "unknown", which a decoder must treat as "use the default input gain". */
+    uint8_t Qm; /**< Modulation order of the channel LLRs: 1 (pi/2-BPSK), 2, 4, 6 or 8; 0 = unknown / not PHY LLRs
+                     (e.g. ldpctest, whose LLRs are the BPSK reference scale 16*y/sigma) */
+    uint8_t nb_layers; /**< Number of MIMO layers of the transport block (0 = unknown) */
+    uint16_t llr_prescale_q8; /**< Gain the caller applied to its int16 LLRs before the saturating int16->int8 pack,
+                                   Q8 (256 = x1, 128 = x1/2); 0 = not reported (= x1) */
 } t_nrLDPC_dec_params;
 
 /**
