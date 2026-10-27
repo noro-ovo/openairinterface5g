@@ -8,6 +8,7 @@
 // #define POLAR_CODING_DEBUG
 
 #include "PHY/CODING/nrPolar_tools/nr_polar_defs.h"
+#include "common/utils/LOG/log.h"
 #include "assertions.h"
 #include <stdint.h>
 
@@ -477,9 +478,11 @@ static void build_encoder_tables(t_nrPolar_params *pp)
     if (pp->information_bit_pattern[n] != 1)
       continue;
     if (pp->n_pc > 0 && pp->parity_check_bit_pattern[n] == 1) {
-      AssertFatal(npc < 3 && pp->K <= 64, "parity-check bits: n_pc %d, K %d\n", pp->n_pc, pp->K);
-      pp->enc_pc_pos[npc] = n;
-      pp->enc_pc_mask[npc++] = reg[(n + 1) % 5];
+      if (npc < 3) {
+        pp->enc_pc_pos[npc] = n;
+        pp->enc_pc_mask[npc] = reg[(n + 1) % 5];
+      }
+      npc++;
     } else {
       pp->enc_info_mask[n >> 6] |= 1ULL << (n & 63);
       if (k < 64)
@@ -487,13 +490,21 @@ static void build_encoder_tables(t_nrPolar_params *pp)
       k++;
     }
   }
-  AssertFatal(npc == (pp->n_pc > 0 ? pp->n_pc : 0) && k == pp->K, "information bits %d (K %d), parity-check bits %d\n", k, pp->K, npc);
+  pp->enc_rm_src = NULL;
+  pp->enc_rm_byte = NULL;
+  pp->enc_bdep = false;
+  /* K + n_PC larger than the number of usable positions (e.g. K > E): nr_polar_info_bit_pattern() reads outside its
+   * table and the pattern does not hold K information bits; polar_encoder_fast() then outputs zeros */
+  pp->enc_invalid = npc != pp->n_pc || k != pp->K || (pp->n_pc > 0 && pp->K > 64);
+  if (pp->enc_invalid) {
+    LOG_E(PHY, "polar encoder: %d information / %d parity-check positions for K = %d, n_PC = %d (E = %d, N = %d), encoding disabled\n",
+          k, npc, pp->K, pp->n_pc, E, N);
+    return;
+  }
   for (int w = 0, kw = 0; w < N / 64; w++) {
     pp->enc_info_off[w] = kw;
     kw += __builtin_popcountll(pp->enc_info_mask[w]);
   }
-  pp->enc_bdep = false;
-  pp->enc_rm_byte = NULL;
 #if defined(__aarch64__)
   pp->enc_bdep = (getauxval(AT_HWCAP2) & HWCAP2_SVEBITPERM) != 0;
   /* byte / halfword group copy of polar_rate_matching() as TBL indices into the (at most 64) bytes of d: bytes
@@ -516,7 +527,6 @@ static void build_encoder_tables(t_nrPolar_params *pp)
    * of less than 8 bits or the bit interleaver. polar_rate_matching() writes bytes [0, E/8) and ORs the bits of a last
    * partial byte into out (the gather does the same); with the bit interleaver and E not a multiple of 8 (or of 16 with
    * halfword groups), the partial byte also keeps bits of the rate matching stage: polar_rate_matching() is kept. */
-  pp->enc_rm_src = NULL;
   if ((pp->groupsize < 8 && !pp->i_bil) || (pp->i_bil && (E & 7) == 0 && !(pp->groupsize == 16 && (E & 15)))) {
     uint16_t *rm = malloc(sizeof(uint16_t) * E), *src = calloc((E + 7) & ~7, sizeof(uint16_t));
     AssertFatal(rm && src, "malloc\n");
@@ -699,6 +709,11 @@ void polar_encoder_fast(uint64_t *A,
                         uint8_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
+  if (polarParams->enc_invalid) {
+    memset(out, 0, (polarParams->encoderLength + 7) >> 3);
+    polarReturn(polarParams);
+    return;
+  }
 
 #ifdef POLAR_CODING_DEBUG
   printf("polarParams->payloadBits = %i\n", polarParams->payloadBits);
