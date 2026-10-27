@@ -603,6 +603,11 @@ uint32_t polar_decoder_int16(const int16_t *input,
   printf("\n");
 #endif
 
+  if (polarParams->sc.invalid) {
+    out[0] = 0;
+    polarReturn(polarParams);
+    return UINT32_MAX;
+  }
   // rate recovery, SC decoding, information bits (û to ĉ, deinterleaved to b) in B
   uint64_t B[4] = {0};
   nr_polar_sc_decode(polarParams, input, B);
