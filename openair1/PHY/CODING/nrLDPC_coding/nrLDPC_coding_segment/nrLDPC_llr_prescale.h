@@ -24,8 +24,14 @@
 
 #include <stdint.h>
 
-/// default rule (measured on nr_ulsim, OAI develop 9313cbea + PR 356): QPSK x1, 16QAM x1/2, 64QAM x1/2, 256QAM x1
-#define NR_LDPC_LLR_PRESCALE_DEFAULT "1,0.5,0.5,1"
+/* Default rule, measured with OAI's decoder in nr_ulsim/nr_dlsim with develop's (9313cbea) receivers: per (layers, Qm)
+ * the largest tested gain that is not worse than the plain pack at any tested MCS (exact per-TB paired tests).
+ * 1 layer: 16QAM x1/4 (0.1-1.3 dB). 64QAM stays x1: x1/2 gains 0.3-0.4 dB at MCS 17 but costs ~0.02 dB at MCS 22-27.
+ * 256QAM x1/2 raises the error rate.
+ * 2+ layers (34-97 % of the QPSK/16QAM/64QAM LLRs at the int8 rails after a plain pack): QPSK x1/4 (0.5 dB),
+ * 16QAM x1/16 (2.5 dB UL, 4.5 dB DL), 64QAM x1/2 (0.1 dB UL, 1.6 dB DL; x1/4 costs ~0.01 dB at UL MCS 27),
+ * 256QAM x1. Receivers with a different LLR scale need their own rule (config/env). */
+#define NR_LDPC_LLR_PRESCALE_DEFAULT "1,0.25,1,1/0.25,0.0625,0.5,1"
 /// maximum modulation order handled by the table (index = Qm, 0..8)
 #define NR_LDPC_LLR_PRESCALE_MAX_QM 8
 
