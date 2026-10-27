@@ -71,6 +71,11 @@ static KATTR inline __attribute__((always_inline)) void KFN(row_body_)(const ldp
   int8_t *const Rrow = ws + rw->roff;
   int8_t *const Srow = ws + rw->soff;
   const VT lim_ = VLIM;
+#ifdef LDPC_ABSORB
+  const int ABSM = p->absorb; /* absorbed messages: build option -DLDPC_ABSORB plus LDPC_DEC_ABS=1 (README 11) */
+#else
+  const int ABSM = 0; /* (a run-time test here costs the SVE2 kernel register spills) */
+#endif
   /* ISAs with few registers keep the Q of large rows in a stack buffer (explicit two-step per superchunk) instead
      of leaving it to the register allocator's spills */
   const int KQM = NN * KU + 4 * KU + 5 > KREGS;
@@ -81,6 +86,57 @@ static KATTR inline __attribute__((always_inline)) void KFN(row_body_)(const ldp
   KE19(KDQE)
 #define KDS(u) VT m1_##u, m2_##u, sg_##u, m1c_##u, c1_##u, c2_##u, eq_##u;
   KU4S(KDS)
+  if (FIRST >= 2) { /* iteration 1 with still-zero punctured columns (README section 11) */
+    const int ze = FIRST == 3 ? rw->ze : -1, e0 = ze == 0 ? 1 : 0;
+    for (int k = nsc - 1; k >= 0; k--) {
+      const int32_t *const t_ = tb + (size_t)k * NN;
+      int8_t *const R_ = Rrow + (size_t)k * NN * Bq;
+      int8_t *const wk = ws + (size_t)k * Bq;
+      if (FIRST == 2) { /* >= 2 zero columns: every message is 0, the APPs move to the write buffer unchanged */
+#define KCPU(e, u) if ((u) < KU) VST(w_ + (u) * (VW), VLD(ws + t_[e] + (u) * (VW)));
+#define KCP(e)                                                                  \
+  if ((e) < NN) {                                                               \
+    int8_t *const w_ = wk + wo[e];                                              \
+    KU4(KCPU, e)                                                                \
+  }
+        KE19(KCP)
+      } else { /* one zero column (edge ze, Q = 0): it receives sign(others) corr(min |Q| of the others); the other
+                  edges receive 0 (their minimum includes the 0) */
+#define KZ1U(e, u)                                                              \
+  if ((u) < KU && (e) != ze) {                                                  \
+    q_##e##_##u = VLD(ws + t_[e] + (u) * (VW));                                 \
+    const VT ab_ = VABS(q_##e##_##u);                                           \
+    if ((e) == e0) { m1_##u = ab_; sg_##u = q_##e##_##u; }                      \
+    else { m1_##u = VMINU(m1_##u, ab_); sg_##u = VXOR(sg_##u, q_##e##_##u); }   \
+  }
+#define KZ1(e) if ((e) < NN) { KU4(KZ1U, e) }
+        KE19(KZ1)
+#define KZS(u) if ((u) < KU) c1_##u = VNEGS(VCORR(VMINU(m1_##u, lim_)), VSGN(sg_##u));
+        KU4S(KZS)
+#define KZ2U(e, u)                                                              \
+  if ((u) < KU) {                                                               \
+    if ((e) == ze) { VST(R_ + (e) * Bq + (u) * (VW), c1_##u); VST(w_ + (u) * (VW), c1_##u); } \
+    else { VST(R_ + (e) * Bq + (u) * (VW), VZERO); VST(w_ + (u) * (VW), q_##e##_##u); } \
+  }
+#define KZ2(e)                                                                  \
+  if ((e) < NN) {                                                               \
+    int8_t *const w_ = wk + wo[e];                                              \
+    KU4(KZ2U, e)                                                                \
+  }
+        KE19(KZ2)
+      }
+      if (k < ndbl) {
+#define KZC(e, u) if ((u) < KU) VST(w_ + Z + (u) * (VW), VLD(w_ + (u) * (VW)));
+#define KZCE(e)                                                                 \
+  if ((e) < NN) {                                                               \
+    int8_t *const w_ = wk + wo[e];                                              \
+    KU4(KZC, e)                                                                 \
+  }
+        KE19(KZCE)
+      }
+    }
+    return;
+  }
   for (int k = nsc - 1; k >= 0; k--) {
     const int32_t *const t_ = tb + (size_t)k * NN;
     int8_t *const R_ = Rrow + (size_t)k * NN * Bq;
@@ -147,8 +203,9 @@ static KATTR inline __attribute__((always_inline)) void KFN(row_body_)(const ldp
     if (KQM) q_##e##_##u = VLD(qbuf_ + ((e) * KU + (u)) * (VW));               \
     const VT r_ = KAB ? VMSGA(q_##e##_##u, b_##e##_##u, m1c_##u, c1_##u, c2_##u)  \
                       : VMSG(q_##e##_##u, m1c_##u, eq_##u, c1_##u, c2_##u);     \
-    VST(R_ + (e) * Bq + (u) * (VW), r_);                                        \
-    VST(w_ + (u) * (VW), VQADD(q_##e##_##u, r_));                               \
+    const VT an_ = VQADD(q_##e##_##u, r_);                                       \
+    VST(R_ + (e) * Bq + (u) * (VW), ABSM ? VSUBW(an_, q_##e##_##u) : r_); /* absorbed: APP - Q */ \
+    VST(w_ + (u) * (VW), an_);                                                  \
   }
 #define KP2(e)                                                                  \
   if ((e) < NN) {                                                               \
@@ -180,25 +237,33 @@ static KATTR inline __attribute__((always_inline)) void KFN(row_body_)(const ldp
   {                                                                                                            \
     KFN(row_body_)(p, rw, ws, nn, n1, u, ab, f);                                                               \
   }
-#define KROWFN2(nn, n1, u, ab) KROWFN(nn, n1, u, ab, 0) KROWFN(nn, n1, u, ab, 1)
+#define KROWFN2(nn, n1, u, ab) KROWFN(nn, n1, u, ab, 0) KROWFN(nn, n1, u, ab, 1) KROWFN(nn, n1, u, ab, 2) KROWFN(nn, n1, u, ab, 3)
 /* X(nn, n1, U, keep-|x-R|): the first matching entry with the largest U <= umax is used */
 #ifndef KSHAPES
 #if KREGS >= 32
 #define KSHAPES(X)                                                                                             \
   X(2, 1, 4, 0) X(2, 1, 2, 1) X(3, 1, 2, 1) X(4, 1, 2, 1) X(2, 1, 1, 1) X(3, 1, 1, 1) X(4, 1, 1, 1) X(5, 1, 1, 1) X(6, 1, 1, 1) X(7, 1, 1, 1)  \
-  X(8, 1, 1, 1) X(9, 1, 1, 1) X(8, 0, 1, 1) X(10, 0, 1, 1) X(19, 0, 1, 0)
+  X(8, 1, 1, 1) X(9, 1, 1, 1) X(8, 0, 1, 1) X(10, 0, 1, 1) X(19, 0, 1, 0)                                      \
+  /* rows without the removed filler columns (README section 11) */                                          \
+  X(2, 0, 1, 1) X(3, 0, 1, 1) X(4, 0, 1, 1) X(5, 0, 1, 1) X(6, 0, 1, 1) X(7, 0, 1, 1) X(9, 0, 1, 1)             \
+  X(11, 0, 1, 0) X(12, 0, 1, 0) X(13, 0, 1, 0) X(14, 0, 1, 0) X(15, 0, 1, 0) X(16, 0, 1, 0) X(17, 0, 1, 0) X(18, 0, 1, 0)
 #else
 #define KSHAPES(X)                                                                                             \
   X(2, 1, 1, 0) X(3, 1, 1, 0) X(4, 1, 1, 0) X(5, 1, 1, 0) X(6, 1, 1, 0) X(7, 1, 1, 0) X(8, 1, 1, 0) X(9, 1, 1, 0)  \
-  X(19, 0, 1, 0) X(8, 0, 1, 0) X(10, 0, 1, 0)
+  X(19, 0, 1, 0) X(8, 0, 1, 0) X(10, 0, 1, 0)                                                                  \
+  X(2, 0, 1, 0) X(3, 0, 1, 0) X(4, 0, 1, 0) X(5, 0, 1, 0) X(6, 0, 1, 0) X(7, 0, 1, 0) X(9, 0, 1, 0)             \
+  X(11, 0, 1, 0) X(12, 0, 1, 0) X(13, 0, 1, 0) X(14, 0, 1, 0) X(15, 0, 1, 0) X(16, 0, 1, 0) X(17, 0, 1, 0) X(18, 0, 1, 0)
 #endif
 #endif
 KSHAPES(KROWFN2)
 
 static ldpc_rowfn_t KFN(row_fn_)(int nn, int n1, int u, int first)
 {
-#define KSEL(nn_, n1_, u_, ab_) \
-  if (nn == nn_ && n1 == n1_ && u == u_) return first ? KFN(rf_##nn_##_##n1_##_##u_##_##ab_##_1_) : KFN(rf_##nn_##_##n1_##_##u_##_##ab_##_0_);
+#define KSEL(nn_, n1_, u_, ab_)                                                                                \
+  if (nn == nn_ && n1 == n1_ && u == u_)                                                                       \
+    return first == 3 ? (n1 ? NULL : KFN(rf_##nn_##_##n1_##_##u_##_##ab_##_3_))                               \
+         : first == 2 ? (n1 ? NULL : KFN(rf_##nn_##_##n1_##_##u_##_##ab_##_2_))                               \
+         : first ? KFN(rf_##nn_##_##n1_##_##u_##_##ab_##_1_) : KFN(rf_##nn_##_##n1_##_##u_##_##ab_##_0_);
   KSHAPES(KSEL)
 #undef KSEL
   return NULL;
@@ -217,7 +282,7 @@ static int KFN(row_u_)(int nn, int n1, int umax)
    returns 0 at the first unsatisfied row. The valid-lane mask is applied only where padding lanes exist. */
 static KATTR inline __attribute__((always_inline)) int KFN(syn_row_)(const ldpc_plan_t *p, const ldpc_row_t *rw,
                                                                      const int8_t *ws, const int32_t *tab, const int KU,
-                                                                     const int UR)
+                                                                     const int UR, int8_t *mo)
 {
   KSETUP(p);
   const size_t Bq = (size_t)KU * (size_t)(VW), Br = (size_t)UR * (size_t)(VW);
@@ -247,7 +312,10 @@ static KATTR inline __attribute__((always_inline)) int KFN(syn_row_)(const ldpc_
   }
       KU4S(KX2)
     }
-    if (kb + (int)Bq > Z) { /* superchunk with padding lanes */
+    if (mo) { /* batch: per-lane OR of the parities (sign = some check of that lane's block violated) */
+#define KX5(u) if ((u) < KU) VST(mo + kb + (u) * (VW), VOR(VLD(mo + kb + (u) * (VW)), x_##u));
+      KU4S(KX5)
+    } else if (kb + (int)Bq > Z) { /* superchunk with padding lanes */
 #define KX3(u) if ((u) < KU) t_ = VOR(t_, VAND(x_##u, VLD(lm + kb + (u) * (VW))));
       KU4S(KX3)
     } else {
@@ -258,24 +326,35 @@ static KATTR inline __attribute__((always_inline)) int KFN(syn_row_)(const ldpc_
   return !VANYNEG(t_);
 }
 
-static KATTR int KFN(syn_)(const ldpc_plan_t *p, const int8_t *ws, int nrows, const int32_t *tab)
+static KATTR inline __attribute__((always_inline)) int KFN(syn_rows_)(const ldpc_plan_t *p, const int8_t *ws, int r0, int nrows,
+                                                                      const int32_t *tab, int8_t *mo)
 {
   const int U = p->U;
-  for (int r = 0; r < nrows; r++) {
+  for (int r = r0; r < nrows; r++) {
     const ldpc_row_t *rw = &p->row[r];
     const int ur = rw->n1 ? rw->U : 1;
     int ok;
-    if (U == 4) ok = ur == 4 ? KFN(syn_row_)(p, rw, ws, tab, 4, 4) : ur == 2 ? KFN(syn_row_)(p, rw, ws, tab, 4, 2) : KFN(syn_row_)(p, rw, ws, tab, 4, 1);
-    else if (U == 2) ok = ur == 2 ? KFN(syn_row_)(p, rw, ws, tab, 2, 2) : KFN(syn_row_)(p, rw, ws, tab, 2, 1);
-    else ok = KFN(syn_row_)(p, rw, ws, tab, 1, 1);
-    if (!ok) return 0;
+    if (U == 4) ok = ur == 4 ? KFN(syn_row_)(p, rw, ws, tab, 4, 4, mo) : ur == 2 ? KFN(syn_row_)(p, rw, ws, tab, 4, 2, mo) : KFN(syn_row_)(p, rw, ws, tab, 4, 1, mo);
+    else if (U == 2) ok = ur == 2 ? KFN(syn_row_)(p, rw, ws, tab, 2, 2, mo) : KFN(syn_row_)(p, rw, ws, tab, 2, 1, mo);
+    else ok = KFN(syn_row_)(p, rw, ws, tab, 1, 1, mo);
+    if (!ok && !mo) return 0;
   }
   return 1;
+}
+static KATTR int KFN(syn_)(const ldpc_plan_t *p, const int8_t *ws, int r0, int r1, const int32_t *tab)
+{
+  return KFN(syn_rows_)(p, ws, r0, r1, tab, NULL);
+}
+/* batch: per-lane violation mask over rows r0 .. r1-1 (no early exit); mask (zp bytes) zeroed by the caller */
+static KATTR void KFN(synm_)(const ldpc_plan_t *p, const int8_t *ws, int r0, int r1, const int32_t *tab, int8_t *mask)
+{
+  KFN(syn_rows_)(p, ws, r0, r1, tab, mask);
 }
 
 static void KFN(kern_fill_)(ldpc_kernels_t *k)
 {
   k->syndrome = KFN(syn_);
+  k->synmask = KFN(synm_);
   k->row_u = KFN(row_u_);
   k->row_fn = KFN(row_fn_);
 }
