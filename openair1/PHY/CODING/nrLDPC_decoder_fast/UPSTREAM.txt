@@ -1,5 +1,5 @@
 source: /home/user/ldpc_speedup/dec_std_v3
-synced: 2026-10-27T17:02:48Z
+synced: 2026-10-27T18:44:31Z
 files (sha256 of the upstream file, before the patches in patches/):
 5a65f381a9edb01559b508391a3505e1ecb3b6b2a9fbfd91f35c7db459c801f5  README.md
 331d0134cef3323567a76c1e675ea2b5253329cf446fa0686118ba322c215366  include/ldpc_dec.h
