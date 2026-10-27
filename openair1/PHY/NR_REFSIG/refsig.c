@@ -22,16 +22,56 @@ static void gold_entry_free(void *ptr)
   free(e);
 }
 
+/*
+ * Gold sequence 64 bits per step. x1 and x2 (TS 38.211 5.2.1) satisfy their recurrences with the characteristic
+ * polynomials raised to the 4th power as well (f(x)^4 = f(x^4) over GF(2)):
+ *   x1(m + 124) = x1(m + 12) + x1(m)
+ *   x2(m + 124) = x2(m + 12) + x2(m + 8) + x2(m + 4) + x2(m)
+ * so 64-bit word j + 1 of each (bits 64 (j + 1) .. 64 (j + 1) + 63) comes from words j - 1 and j, with the terms at
+ * bit offsets -48, -52, -56, -60. The first 128 bits (after the Nc = 1600 skip) come from gold_generic().
+ */
+static inline uint64_t gold_funnel(uint64_t prev, uint64_t cur, int s)
+{
+  return (prev >> s) | (cur << (64 - s));
+}
+
+static void gold_generate64(uint32_t key, uint32_t *seq, int length)
+{
+  unsigned int x1 = 0, x2 = key;
+  uint32_t a1[4], a2[4];
+  seq[0] = gold_generic(&x1, &x2, 1);
+  a1[0] = x1;
+  a2[0] = x2;
+  for (int n = 1; n < 4; n++) {
+    const uint32_t c = gold_generic(&x1, &x2, 0);
+    if (n < length)
+      seq[n] = c;
+    a1[n] = x1;
+    a2[n] = x2;
+  }
+  uint64_t p1 = a1[0] | (uint64_t)a1[1] << 32, c1 = a1[2] | (uint64_t)a1[3] << 32;
+  uint64_t p2 = a2[0] | (uint64_t)a2[1] << 32, c2 = a2[2] | (uint64_t)a2[3] << 32;
+  for (int n = 4; n < length; n += 2) {
+    const uint64_t n1 = gold_funnel(p1, c1, 16) ^ gold_funnel(p1, c1, 4);
+    const uint64_t n2 = gold_funnel(p2, c2, 16) ^ gold_funnel(p2, c2, 12) ^ gold_funnel(p2, c2, 8) ^ gold_funnel(p2, c2, 4);
+    const uint64_t c = n1 ^ n2;
+    seq[n] = (uint32_t)c;
+    if (n + 1 < length)
+      seq[n + 1] = (uint32_t)(c >> 32);
+    p1 = c1;
+    c1 = n1;
+    p2 = c2;
+    c2 = n2;
+  }
+}
+
 static uint32_t *gold_generate(uint32_t key, int length)
 {
   uint32_t *seq;
   AssertFatal(length > 0, "gold_cache: invalid length=%d\n", length);
   int ret = posix_memalign((void **)&seq, 64, length * sizeof(uint32_t));
   AssertFatal(ret == 0, "gold_generate: out of memory\n");
-  unsigned int x1 = 0, x2 = key;
-  seq[0] = gold_generic(&x1, &x2, 1);
-  for (int n = 1; n < length; n++)
-    seq[n] = gold_generic(&x1, &x2, 0);
+  gold_generate64(key, seq, length);
   return seq;
 }
 
