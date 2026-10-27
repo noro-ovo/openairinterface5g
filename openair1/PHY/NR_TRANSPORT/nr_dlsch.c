@@ -10,6 +10,7 @@
 #include "nr_dci.h"
 #include "nr_sch_dmrs.h"
 #include "PHY/MODULATION/nr_modulation.h"
+#include "PHY/MODULATION/nr_mod_packed.h"
 #include "PHY/NR_REFSIG/dmrs_nr.h"
 #include "PHY/NR_REFSIG/ptrs_nr.h"
 #include "common/utils/nr/nr_common.h"
@@ -1122,18 +1123,36 @@ static int do_one_dlsch(unsigned char *input_ptr, PHY_VARS_gNB *gNB, NR_gNB_DLSC
               rel15->NrOfCodewords,
               NR_MAX_NB_LAYERS);
 
-  START_MEAS_FULL_SLOT(dlsch_scrambling_stats, slot_type, NR_DOWNLINK_SLOT);
-  uint32_t scrambled_output[(encoded_length >> 5) + 4]; // modulator access by 4 bytes in some cases
-  memset(scrambled_output, 0, sizeof(scrambled_output));
-  nr_pdsch_codeword_scrambling(input_ptr, encoded_length, 0 /* q: the only codeword */,
-                               rel15->dataScramblingId, rel15->rnti, scrambled_output);
-  STOP_MEAS_FULL_SLOT(dlsch_scrambling_stats, slot_type, NR_DOWNLINK_SLOT);
+  if (nr_mod_packed_available(Qm, rel15->nrOfLayers)) {
+    /* scrambling, modulation and layer mapping in one pass over the packed codeword (the scrambling stats then only
+       cover the sequence lookup) */
+    START_MEAS_FULL_SLOT(dlsch_scrambling_stats, slot_type, NR_DOWNLINK_SLOT);
+    const uint32_t *scr_seq =
+        nr_codeword_scrambling_seq(encoded_length, 0 /* q: the only codeword */, rel15->dataScramblingId, rel15->rnti);
+    STOP_MEAS_FULL_SLOT(dlsch_scrambling_stats, slot_type, NR_DOWNLINK_SLOT);
 
-  START_MEAS_FULL_SLOT(dlsch_modulation_stats, slot_type, NR_DOWNLINK_SLOT);
-  const bool mapped_ok =
-      nr_modulation_layer_mapping(scrambled_output, encoded_length, Qm, rel15->nrOfLayers, layerSz2, tx_layers);
-  AssertFatal(mapped_ok, "Unsupported modulation/layer mapping for Qm %d, %d layers\n", Qm, rel15->nrOfLayers);
-  STOP_MEAS_FULL_SLOT(dlsch_modulation_stats, slot_type, NR_DOWNLINK_SLOT);
+    START_MEAS_FULL_SLOT(dlsch_modulation_stats, slot_type, NR_DOWNLINK_SLOT);
+    c16_t *layer_ptrs[NR_MAX_NB_LAYERS];
+    for (int l = 0; l < rel15->nrOfLayers; l++)
+      layer_ptrs[l] = tx_layers[l];
+    const bool mapped_ok =
+        nr_mod_packed((const uint32_t *)input_ptr, scr_seq, encoded_length, Qm, rel15->nrOfLayers, layer_ptrs);
+    AssertFatal(mapped_ok, "Unsupported modulation/layer mapping for Qm %d, %d layers\n", Qm, rel15->nrOfLayers);
+    STOP_MEAS_FULL_SLOT(dlsch_modulation_stats, slot_type, NR_DOWNLINK_SLOT);
+  } else {
+    START_MEAS_FULL_SLOT(dlsch_scrambling_stats, slot_type, NR_DOWNLINK_SLOT);
+    uint32_t scrambled_output[(encoded_length >> 5) + 4]; // modulator access by 4 bytes in some cases
+    memset(scrambled_output, 0, sizeof(scrambled_output));
+    nr_pdsch_codeword_scrambling(input_ptr, encoded_length, 0 /* q: the only codeword */,
+                                 rel15->dataScramblingId, rel15->rnti, scrambled_output);
+    STOP_MEAS_FULL_SLOT(dlsch_scrambling_stats, slot_type, NR_DOWNLINK_SLOT);
+
+    START_MEAS_FULL_SLOT(dlsch_modulation_stats, slot_type, NR_DOWNLINK_SLOT);
+    const bool mapped_ok =
+        nr_modulation_layer_mapping(scrambled_output, encoded_length, Qm, rel15->nrOfLayers, layerSz2, tx_layers);
+    AssertFatal(mapped_ok, "Unsupported modulation/layer mapping for Qm %d, %d layers\n", Qm, rel15->nrOfLayers);
+    STOP_MEAS_FULL_SLOT(dlsch_modulation_stats, slot_type, NR_DOWNLINK_SLOT);
+  }
 
   /// Layer Precoding and Antenna port mapping
   // tx_layers 1-8 are mapped on antenna ports 1000-1007
