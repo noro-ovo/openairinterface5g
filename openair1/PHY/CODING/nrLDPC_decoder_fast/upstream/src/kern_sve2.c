@@ -7,9 +7,7 @@
  *   predicated negation for the signs. */
 #include "ldpc_internal.h"
 #if defined(__aarch64__)
-#if !defined(__ARM_FEATURE_SVE2) /* baseline without SVE2 (e.g. armv8.2-a): enable it for this file only */
-#pragma GCC target("arch=armv8.5-a+sve2")
-#endif
+#pragma GCC target("+sve2") /* adds SVE2 to the baseline (an "arch=" target would lower an Armv9 baseline) */
 #include <arm_sve.h>
 
 static inline svint8_t v_corr(svbool_t pg, svint8_t m, int nsh, svuint8_t nshv, svuint8_t vb)
