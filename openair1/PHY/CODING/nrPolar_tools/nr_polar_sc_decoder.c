@@ -34,7 +34,8 @@ enum {
   OP_BX = 24, // partial sums, both children decoded
   OP_BLF = 32, // partial sums, left child frozen
   OP_BRF = 40, // partial sums, right child frozen
-  OP_QUAD = 48, // level-2 node (4 leaves), fused
+  OP_QUAD = 48, // level-2 node (4 leaves), fused, + frozen pattern (0..14)
+  OP_END = 63,
 };
 
 /* ------------------------------------------------------------------------------------------------ scalar helpers */
@@ -61,25 +62,29 @@ static inline int16_t g_sub(int16_t a, int16_t b, int8_t beta)
   return t > SHRT_MAX ? SHRT_MAX : t < SHRT_MIN ? SHRT_MIN : t;
 }
 
-/* level-1 node (leaves 0, 1 of b/u), frozen flags p0, p1 (not both) */
+/* level-1 node (leaves 0, 1 of b/u), frozen flags p0, p1 (not both). Only the signs of the leaf LLRs are needed:
+ *  - f_sc(a0, a1) <= 0  <=>  signs differ, or a0 or a1 is 0 or -32768 (min(|a0|,|a1|) wraps to -32768 then)
+ *  - saturation / clipping of G does not change its sign: g_sub(a0, a1, beta) <= 0 <=> a1 <= (beta > 0 ? a0 : -a0)
+ *    (negation wrapping in int16), g_add_clip(a0, a1) <= 0 <=> a0 + a1 <= 0 */
 __attribute__((always_inline)) static inline void sc_pair(int16_t a0, int16_t a1, int8_t *b, uint8_t *u, const int p0, const int p1)
 {
+  int d0 = 0, d1;
   if (!p0) {
-    const int d = f_sc(a0, a1) <= 0;
-    u[0] = d;
-    b[0] = 2 * d - 1;
+    d0 = ((a0 ^ a1) < 0) | ((a0 & 0x7fff) == 0) | ((a1 & 0x7fff) == 0);
+    u[0] = d0;
   }
-  if (!p1) {
-    const int d = (p0 ? g_add_clip(a0, a1) : g_sub(a0, a1, b[0])) <= 0;
-    u[1] = d;
-    b[1] = 2 * d - 1;
+  if (p1) { // beta = (beta0, -1)
+    b[0] = 2 * d0 - 1;
+    b[1] = -1;
+    return;
   }
   if (p0)
-    b[0] = b[1];
-  else if (p1)
-    b[1] = -1;
+    d1 = a0 + a1 <= 0;
   else
-    b[0] = ~(b[0] ^ b[1]);
+    d1 = a1 <= (d0 ? a0 : (int16_t)-a0);
+  u[1] = d1;
+  b[0] = 2 * (d0 ^ d1) - 1; // left frozen: d0 = 0, beta0 = beta1
+  b[1] = 2 * d1 - 1;
 }
 
 /* level-2 node: 4 LLRs a[0..3] -> 4 decisions and the node's partial sums, frozen pattern pat (bit i: leaf i frozen) */
@@ -111,18 +116,6 @@ __attribute__((always_inline)) static inline void sc_quad(const int16_t *a, int8
     b[0] = ~(b[0] ^ b[2]);
     b[1] = ~(b[1] ^ b[3]);
   }
-}
-
-static void sc_quad_dispatch(const int16_t *a, int8_t *b, uint8_t *u, unsigned pat)
-{
-#define Q(p) \
-  case p:    \
-    sc_quad(a, b, u, p); \
-    break;
-  switch (pat) {
-    Q(0) Q(1) Q(2) Q(3) Q(4) Q(5) Q(6) Q(7) Q(8) Q(9) Q(10) Q(11) Q(12) Q(13) Q(14)
-  }
-#undef Q
 }
 
 /* ------------------------------------------------------------------------------------------------ vector kernels */
@@ -309,7 +302,7 @@ static void sc_build(nr_polar_sc_t *d, const uint8_t *ibp, int l, int f, int roo
     unsigned pat = 0;
     for (int i = 0; i < 4; i++)
       pat |= (ibp[f + i] == 0) << i;
-    sc_emit(d, OP_QUAD, pat, f);
+    sc_emit(d, OP_QUAD + pat, 2, f);
     return;
   }
   const int sz = 1 << (l - 1);
@@ -358,6 +351,7 @@ void nr_polar_build_sc_decoder(t_nrPolar_params *pp)
 
   d->nops = 0;
   sc_build(d, pp->information_bit_pattern, n, 0, 1);
+  sc_emit(d, OP_END, 0, 0);
   AssertFatal(d->nops <= N, "polar SC program too long: %d\n", d->nops);
 
   /* information bits (parity-check bits excluded): the k-th in leaf order is bit K - 1 - interleaving_pattern[k] of the
@@ -438,41 +432,49 @@ __attribute__((always_inline)) static inline void k_bx(int8_t *bv, const int sz)
     op_bxv(bv, bv + sz, sz);
 }
 
+/* runs the program: direct threading (one indirect branch per operation, the program ends with OP_END) */
 static void sc_run(const nr_polar_sc_t *d)
 {
   int16_t *const *A = d->alpha;
   int8_t *const beta = d->beta;
   uint8_t *const u = d->u;
-  const nr_polar_sc_op_t *op = d->ops, *end = d->ops + d->nops;
-  for (; op < end; op++) {
-    const int f = op->f;
-    switch (op->code) {
-#define LEVEL(L)                                                     \
-  case OP_F + L - 3:                                                 \
-    k_f(A[L], A[L - 1], 1 << (L - 1));                               \
-    break;                                                           \
-  case OP_GA + L - 3:                                                \
-    k_ga(A[L], A[L - 1], 1 << (L - 1));                              \
-    break;                                                           \
-  case OP_GS + L - 3:                                                \
-    k_gs(A[L], A[L - 1], beta + f, 1 << (L - 1));                    \
-    break;                                                           \
-  case OP_BX + L - 3:                                                \
-    k_bx(beta + f, 1 << (L - 1));                                    \
-    break;                                                           \
-  case OP_BLF + L - 3:                                               \
-    __builtin_memcpy(beta + f, beta + f + (1 << (L - 1)), 1 << (L - 1));       \
-    break;                                                           \
-  case OP_BRF + L - 3:                                               \
-    __builtin_memset(beta + f + (1 << (L - 1)), -1, 1 << (L - 1));             \
-    break;
-      LEVEL(3) LEVEL(4) LEVEL(5) LEVEL(6) LEVEL(7) LEVEL(8) LEVEL(9) LEVEL(10)
+  const nr_polar_sc_op_t *op = d->ops;
+#define LEVEL_LABELS(L)                                                                                          \
+  [OP_F + L - 3] = &&f##L, [OP_GA + L - 3] = &&ga##L, [OP_GS + L - 3] = &&gs##L, [OP_BX + L - 3] = &&bx##L, \
+  [OP_BLF + L - 3] = &&blf##L, [OP_BRF + L - 3] = &&brf##L,
+#define QUAD_LABEL(P) [OP_QUAD + P] = &&q##P,
+  static const void *const lab[64] = {LEVEL_LABELS(3) LEVEL_LABELS(4) LEVEL_LABELS(5) LEVEL_LABELS(6) LEVEL_LABELS(7)
+                                      LEVEL_LABELS(8) LEVEL_LABELS(9) LEVEL_LABELS(10) QUAD_LABEL(0) QUAD_LABEL(1)
+                                      QUAD_LABEL(2) QUAD_LABEL(3) QUAD_LABEL(4) QUAD_LABEL(5) QUAD_LABEL(6) QUAD_LABEL(7)
+                                      QUAD_LABEL(8) QUAD_LABEL(9) QUAD_LABEL(10) QUAD_LABEL(11) QUAD_LABEL(12)
+                                      QUAD_LABEL(13) QUAD_LABEL(14)[OP_END] = &&end};
+#undef LEVEL_LABELS
+#undef QUAD_LABEL
+#define NEXT goto *lab[(++op)->code]
+  goto *lab[op->code];
+#define LEVEL(L)                                                    \
+  f##L : k_f(A[L], A[L - 1], 1 << (L - 1));                         \
+  NEXT;                                                             \
+  ga##L : k_ga(A[L], A[L - 1], 1 << (L - 1));                       \
+  NEXT;                                                             \
+  gs##L : k_gs(A[L], A[L - 1], beta + op->f, 1 << (L - 1));         \
+  NEXT;                                                             \
+  bx##L : k_bx(beta + op->f, 1 << (L - 1));                         \
+  NEXT;                                                             \
+  blf##L : __builtin_memcpy(beta + op->f, beta + op->f + (1 << (L - 1)), 1 << (L - 1)); \
+  NEXT;                                                             \
+  brf##L : __builtin_memset(beta + op->f + (1 << (L - 1)), -1, 1 << (L - 1)); \
+  NEXT;
+  LEVEL(3) LEVEL(4) LEVEL(5) LEVEL(6) LEVEL(7) LEVEL(8) LEVEL(9) LEVEL(10)
 #undef LEVEL
-      case OP_QUAD:
-        sc_quad_dispatch(A[2], beta + f, u + f, op->arg);
-        break;
-    }
-  }
+#define QUAD(P)                                        \
+  q##P : sc_quad(A[2], beta + op->f, u + op->f, P); \
+  NEXT;
+  QUAD(0) QUAD(1) QUAD(2) QUAD(3) QUAD(4) QUAD(5) QUAD(6) QUAD(7) QUAD(8) QUAD(9) QUAD(10) QUAD(11) QUAD(12) QUAD(13) QUAD(14)
+#undef QUAD
+#undef NEXT
+end:
+  return;
 }
 
 /* rate recovery (TS 38.212 5.4.1, inverse) of E LLRs into the root alpha (N LLRs), as nr_polar_rate_matching_int16() */
