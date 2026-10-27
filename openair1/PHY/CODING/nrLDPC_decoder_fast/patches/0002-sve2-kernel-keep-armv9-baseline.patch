@@ -1,0 +1,16 @@
+SVE2 kernel: set the SVE2 target only when the baseline lacks SVE2. With an Armv9 baseline (OAI on
+Neoverse-V2/N2, -mcpu=native on Cortex-A720) "arch=armv8.5-a" would lower the architecture for this file and
+GCC warns "__ARM_ARCH redefined".
+
+--- a/src/kern_sve2.c
++++ b/src/kern_sve2.c
+@@ -7,7 +7,9 @@
+  *   predicated negation for the signs. */
+ #include "ldpc_internal.h"
+ #if defined(__aarch64__)
++#if !defined(__ARM_FEATURE_SVE2) /* baseline without SVE2 (e.g. armv8.2-a): enable it for this file only */
+ #pragma GCC target("arch=armv8.5-a+sve2")
++#endif
+ #include <arm_sve.h>
+ 
+ static inline svint8_t v_corr(svbool_t pg, svint8_t m, int nsh, svuint8_t nshv, svuint8_t vb)
