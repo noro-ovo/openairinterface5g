@@ -15,3 +15,7 @@ add_library(polar STATIC
   nr_polar_sequence_pattern.c
 )
 target_link_libraries(polar PRIVATE utils)
+
+if (ENABLE_TESTS)
+  add_subdirectory(tests)
+endif()
