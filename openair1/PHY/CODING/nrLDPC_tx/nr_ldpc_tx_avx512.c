@@ -392,8 +392,9 @@ static TGTX void extract_avx512(int qm,
     interleave_avx512(qm, src, L, stage);
     f = stage;
   }
-  if (__builtin_popcount(planes) <= 3) {
-    /* few code blocks: one byte test per code block and 64 positions */
+  if (__builtin_popcount(planes) <= 5) {
+    /* up to 5 code blocks: one byte test per code block and 64 positions (measured cheaper than the 8-plane GFNI
+     * transpose below that) */
     for (int k = 0; k < nw; k++) {
       const __m512i x = L5(f + 64 * k);
       for (int j = 0; j < 8; j++)
