@@ -31,6 +31,7 @@ static inline __m512i z_msg(__m512i q, __m512i m1c, __m512i c1, __m512i c2)
 #define VST(p, v) _mm512_storeu_si512((void *)(p), v)
 #define VQSUB _mm512_subs_epi8
 #define VQADD _mm512_adds_epi8
+#define VSUBW _mm512_sub_epi8 /* wrapping subtraction (absorbed messages) */
 #define VABS _mm512_abs_epi8
 #define VABD(a, b) _mm512_abs_epi8(_mm512_subs_epi8(a, b))
 #define VMINU _mm512_min_epu8
