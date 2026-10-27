@@ -412,31 +412,33 @@ void build_polar_tables(t_nrPolar_params *polarParams)
 
   polarParams->groupsize = mingroupsize;
 
-  if (mingroupsize >= 8) {
-    int shift = 0;
-    switch (mingroupsize) {
-      case 8:
-        shift = 3;
-        break;
-      case 16:
-        shift = 4;
-        break;
-      default:
-        AssertFatal(false, "mingroupsize = %i is not supported\n", mingroupsize);
-        break;
-    }
-    // one entry per group started in [0, E): the last group may be partial when E is not a multiple of the group size
-    polarParams->rm_tab = malloc(sizeof(*polarParams->rm_tab) * ((polarParams->encoderLength + mingroupsize - 1) >> shift));
-    // rerun again to create groups
-    for (int outpos = 0, tcnt = 0; outpos < polarParams->encoderLength; outpos += mingroupsize, tcnt++)
-      polarParams->rm_tab[tcnt] = polarParams->rate_matching_pattern[outpos] >> shift;
-  } else {
-    // groupsize < 8: polar_rate_matching() uses the generic bit-shuffle path,
-    // which indexes rate_matching_pattern directly and needs no rm_tab.
-    polarParams->rm_tab = NULL;
+  int shift = 0;
+  switch (mingroupsize) {
+    case 2:
+      shift = 1;
+      break;
+    case 4:
+      shift = 2;
+      break;
+    case 8:
+      shift = 3;
+      break;
+    case 16:
+      shift = 4;
+      break;
+    default:
+      AssertFatal(false, "mingroupsize = %i is not supported\n", mingroupsize);
+      break;
   }
 
-  build_decoder_tree(polarParams);
+  // one entry per group started in [0, E): the last group may be partial when E is not a multiple of the group size
+  polarParams->rm_tab = malloc(sizeof(*polarParams->rm_tab) * ((polarParams->encoderLength + mingroupsize - 1) >> shift));
+
+  // rerun again to create groups
+  for (int outpos = 0, tcnt = 0; outpos < polarParams->encoderLength; outpos += mingroupsize, tcnt++)
+    polarParams->rm_tab[tcnt] = polarParams->rate_matching_pattern[outpos] >> shift;
+
+  nr_polar_build_sc_decoder(polarParams);
 }
 
 void polar_encoder_fast(uint64_t *A,
