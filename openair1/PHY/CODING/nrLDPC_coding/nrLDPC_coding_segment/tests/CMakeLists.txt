@@ -5,3 +5,9 @@ target_link_libraries(test_nr_rate_matching PRIVATE GTest::gtest minimal_lib)
 add_dependencies(tests test_nr_rate_matching)
 add_test(NAME test_nr_rate_matching
   COMMAND ./test_nr_rate_matching)
+
+add_executable(test_nrLDPC_llr_prescale test_nrLDPC_llr_prescale.cpp ../nrLDPC_llr_prescale.c)
+target_link_libraries(test_nrLDPC_llr_prescale PRIVATE GTest::gtest m)
+add_dependencies(tests test_nrLDPC_llr_prescale)
+add_test(NAME test_nrLDPC_llr_prescale
+  COMMAND ./test_nrLDPC_llr_prescale)
