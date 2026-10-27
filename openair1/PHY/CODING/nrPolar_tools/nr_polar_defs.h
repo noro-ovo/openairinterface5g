@@ -50,6 +50,7 @@ typedef struct {
   uint8_t *u; // hard decision per leaf
   uint16_t *info_src; // leaf decoded as bit t of the decoded word (parity-check bits excluded)
   int n_info;
+  bool invalid; // the information bit pattern does not hold K bits (K too large for E): decoding always fails
   uint8_t rm_mode; // 0 repetition, 1 puncturing, 2 shortening
   uint8_t blk_perm[32]; // sub-block interleaver pattern
   uint16_t *rr_src; // with coded bit interleaving and E <= N: root LLR j = input[rr_src[j]] (E: fill value)
@@ -104,6 +105,7 @@ typedef struct nrPolar_params {
   uint8_t *enc_rm_byte; // aarch64 TBL indices: with enc_rm_src (N <= 256), output bit k = bit enc_rm_byte[k] of d;
                         // otherwise (byte / halfword groups), output byte i = byte enc_rm_byte[i] of d (0xff: 0)
   bool enc_bdep; // aarch64: SVE2 BDEP available
+  bool enc_invalid; // the information bit pattern does not hold K bits (K too large for E): no encoding
   nr_polar_sc_t sc;
 } t_nrPolar_params;
 
