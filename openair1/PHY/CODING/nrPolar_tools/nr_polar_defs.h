@@ -97,9 +97,12 @@ typedef struct nrPolar_params {
    * interleaving composed into one bit gather (enc_rm_src[k]: bit of d sent as output bit k), NULL when the byte /
    * halfword group copy of the rate matching is used alone */
   uint64_t enc_info_mask[Nmax / 64];
+  uint8_t enc_info_off[Nmax / 64]; // index in C' of the first information bit of each word of u
   uint16_t enc_pc_pos[3];
   uint64_t enc_pc_mask[3];
   uint16_t *enc_rm_src;
+  uint8_t *enc_rm_byte; // aarch64, byte / halfword groups: output byte i = byte enc_rm_byte[i] of d (TBL index, 0xff: 0)
+  bool enc_bdep; // aarch64: SVE2 BDEP available
   nr_polar_sc_t sc;
 } t_nrPolar_params;
 
