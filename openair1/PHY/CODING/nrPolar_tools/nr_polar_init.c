@@ -24,6 +24,7 @@ static void nr_polar_delete_list(t_nrPolar_params *polarParams)
 
   // From build_polar_tables()
   free(polarParams->rm_tab);
+  nr_polar_free_sc_decoder(polarParams);
   if (polarParams->crc_generator_matrix)
     free(polarParams->crc_generator_matrix);
   // Polar Coding vectors
@@ -72,7 +73,7 @@ t_nrPolar_params *nr_polar_params(int8_t messageType, uint16_t messageLength, in
   t_nrPolar_params *newPolarInitNode = memalign(32, sizeof(t_nrPolar_params));
 
   AssertFatal(newPolarInitNode, "[nr_polar_init] New t_nrPolar_params * could not be created");
-  *newPolarInitNode = (t_nrPolar_params){.busy = true, .nextPtr = PolarList, .tree_linearization.is_initialized = false};
+  *newPolarInitNode = (t_nrPolar_params){.busy = true, .nextPtr = PolarList};
   PolarList = newPolarInitNode;
   pthread_mutex_unlock(&PolarListMutex);
   //   LOG_D(PHY,"Setting new polarParams index %d, messageType %d, messageLength %d, aggregation_prime %d\n",(messageType *
