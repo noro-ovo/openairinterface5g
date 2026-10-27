@@ -80,7 +80,14 @@ static inline uint64_t tr8x8(uint64_t x)
   return x;
 }
 
-void nr_ldpc_tx_extract_scalar(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes)
+void nr_ldpc_tx_extract_scalar(int qm,
+                               const uint8_t *const src[8],
+                               const uint8_t *const src2[8],
+                               uint8_t m2,
+                               int L,
+                               uint8_t *stage,
+                               uint64_t *w,
+                               unsigned planes)
 {
   const int n = qm * L, nw = (n + 63) >> 6;
   const uint8_t *f = src[0];

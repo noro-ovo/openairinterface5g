@@ -60,8 +60,18 @@ typedef void (*nr_ldpc_tx_tcols_fn)(const uint8_t *const in[8], int z, int ncols
  *   of the chunk of code block j (bit j of the bytes), packed LSB first. Bits past qm L are unspecified, and the
  *   kernel may write up to 7 more words per code block. stage: NR_LDPC_TX_STAGE bytes of scratch, 64-byte aligned.
  *   Only the code blocks of the bit mask planes are needed (kernels may skip the others: small groups).
+ *   src2 (only when the kernel's merge() accepts qm and planes, NULL otherwise): a second set of streams, those of the
+ *   code blocks with the second rate-matched length of a group; the bits of the code blocks in m2 are taken from
+ *   src2[q], the others from src[q], so one pass serves both lengths.
  */
-typedef void (*nr_ldpc_tx_extract_fn)(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes);
+typedef void (*nr_ldpc_tx_extract_fn)(int qm,
+                                      const uint8_t *const src[8],
+                                      const uint8_t *const src2[8],
+                                      uint8_t m2,
+                                      int L,
+                                      uint8_t *stage,
+                                      uint64_t *w,
+                                      unsigned planes);
 
 /* Packed writer: dst[k] = (w[k] << sh) | (w[k-1] >> (64 - sh)) for k = 0 .. n-1 (w[-1] is read; sh in 0..63,
  * w[k-1] >> 64 meaning 0). dst need not be aligned. */
@@ -78,6 +88,7 @@ typedef struct {
   int (*tcols_use)(int z); /* optional finer choice (z % 8 == 0 and z >= tcols_zmin already hold) */
   /* output stage */
   nr_ldpc_tx_extract_fn extract;
+  int (*merge)(int qm, unsigned planes); /* optional: 1 if extract() takes src2 for this Qm and code block set */
   nr_ldpc_tx_write_fn write;
 } nr_ldpc_tx_kern_t;
 
@@ -92,17 +103,39 @@ void nr_ldpc_tx_rows_scalar(const uint8_t *base,
                             int dup);
 void nr_ldpc_tx_transpose_scalar(const uint8_t *const in[8], int nblk, uint8_t *out);
 void nr_ldpc_tx_interleave_scalar(int qm, const uint8_t *const src[8], int L, uint8_t *f);
-void nr_ldpc_tx_extract_scalar(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes);
+void nr_ldpc_tx_extract_scalar(int qm,
+                               const uint8_t *const src[8],
+                               const uint8_t *const src2[8],
+                               uint8_t m2,
+                               int L,
+                               uint8_t *stage,
+                               uint64_t *w,
+                               unsigned planes);
 void nr_ldpc_tx_write_scalar(uint64_t *dst, const uint64_t *w, int n, int sh);
 #if defined(__x86_64__)
 /* AVX2 output-stage kernels, also used by the AVX-512 variant (interleave_sse: positions t .. L-1 only) */
 void nr_ldpc_tx_interleave_sse(int qm, const uint8_t *const src[8], int t, int L, uint8_t *f);
-void nr_ldpc_tx_extract_avx2(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes);
+void nr_ldpc_tx_extract_avx2(int qm,
+                             const uint8_t *const src[8],
+                             const uint8_t *const src2[8],
+                             uint8_t m2,
+                             int L,
+                             uint8_t *stage,
+                             uint64_t *w,
+                             unsigned planes);
 void nr_ldpc_tx_write_avx2(uint64_t *dst, const uint64_t *w, int n, int sh);
 #endif
 #if defined(__aarch64__)
 /* NEON output-stage kernels, also used by the NEON+SHA3 and SVE2 variants */
-void nr_ldpc_tx_extract_neon(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes);
+void nr_ldpc_tx_extract_neon(int qm,
+                             const uint8_t *const src[8],
+                             const uint8_t *const src2[8],
+                             uint8_t m2,
+                             int L,
+                             uint8_t *stage,
+                             uint64_t *w,
+                             unsigned planes);
+int nr_ldpc_tx_merge_neon(int qm, unsigned planes);
 void nr_ldpc_tx_write_neon(uint64_t *dst, const uint64_t *w, int n, int sh);
 #endif
 
