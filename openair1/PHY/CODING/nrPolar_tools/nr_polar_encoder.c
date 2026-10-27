@@ -513,11 +513,12 @@ static void build_encoder_tables(t_nrPolar_params *pp)
 #endif
 
   /* rate matching (+ coded bit interleaving) as one bit gather, where polar_rate_matching() has a slow path: groups
-   * of less than 8 bits or the bit interleaver. Only where polar_rate_matching() writes exactly the E/8 output bytes
-   * (E multiple of 8, and of 16 for halfword groups), otherwise polar_rate_matching() is kept. */
+   * of less than 8 bits or the bit interleaver. polar_rate_matching() writes bytes [0, E/8) and ORs the bits of a last
+   * partial byte into out (the gather does the same); with the bit interleaver and E not a multiple of 8 (or of 16 with
+   * halfword groups), the partial byte also keeps bits of the rate matching stage: polar_rate_matching() is kept. */
   pp->enc_rm_src = NULL;
-  if ((pp->groupsize < 8 || pp->i_bil) && (E & 7) == 0 && !(pp->groupsize == 16 && (E & 15))) {
-    uint16_t *rm = malloc(sizeof(uint16_t) * E), *src = malloc(sizeof(uint16_t) * E);
+  if ((pp->groupsize < 8 && !pp->i_bil) || (pp->i_bil && (E & 7) == 0 && !(pp->groupsize == 16 && (E & 15)))) {
+    uint16_t *rm = malloc(sizeof(uint16_t) * E), *src = calloc((E + 7) & ~7, sizeof(uint16_t));
     AssertFatal(rm && src, "malloc\n");
     for (int i = 0; i < E; i++) // rate matching output bit i <- bit rm[i] of d, as polar_rate_matching()
       rm[i] = pp->groupsize < 8 ? pp->rate_matching_pattern[i]
@@ -537,6 +538,15 @@ static void build_encoder_tables(t_nrPolar_params *pp)
     }
     free(rm);
     pp->enc_rm_src = src;
+#if defined(__aarch64__)
+    if (N <= 256) { // TBL gather indices (N <= 256: one byte), padded to a multiple of 16
+      pp->enc_rm_byte = malloc((E + 15) & ~15);
+      AssertFatal(pp->enc_rm_byte, "malloc\n");
+      memset(pp->enc_rm_byte, 0, (E + 15) & ~15);
+      for (int i = 0; i < E; i++)
+        pp->enc_rm_byte[i] = src[i];
+    }
+#endif
   }
 }
 
@@ -599,7 +609,66 @@ static inline void polar_transform(uint64_t *x, const int nw)
         x[w] ^= x[w + s];
 }
 
-/* out bit k = bit src[k] of d, E multiple of 8 */
+#if defined(__aarch64__)
+/* out bit k = bit idx[k] of d (idx padded to a multiple of 16), N <= 256: the bits of d expanded to bytes
+ * (0x00 / 0xff) form up to 4 TBL4 tables, 16 output bits per TBL4 (+ TBX4 chain), packed with bit weights and pairwise
+ * adds; a last partial byte is ORed into out */
+static inline uint16_t tbl_pack16(uint8x16_t v)
+{
+  const uint8x16_t w = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+  uint8x16_t b = vandq_u8(v, w);
+  b = vpaddq_u8(b, b);
+  b = vpaddq_u8(b, b);
+  b = vpaddq_u8(b, b);
+  return vgetq_lane_u16(vreinterpretq_u16_u8(b), 0);
+}
+static inline void tbl_store(uint8_t *out, int k, int E, uint16_t v)
+{
+  const int r = E - k;
+  if (r >= 16) {
+    __builtin_memcpy(out + (k >> 3), &v, 2);
+  } else if (r >= 8) { // full byte stored, partial byte ORed (as polar_rate_matching())
+    out[k >> 3] = v;
+    if (r > 8)
+      out[(k >> 3) + 1] |= (v >> 8) & ((1 << (r - 8)) - 1);
+  } else {
+    out[k >> 3] |= v & ((1 << r) - 1);
+  }
+}
+static inline void polar_bit_gather_tbl(const uint64_t *d, int N, const uint8_t *idx, int E, uint8_t *out)
+{
+  const uint8x16_t w = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+  const uint8_t *d8 = (const uint8_t *)d;
+  uint8_t ex[256] __attribute__((aligned(16)));
+  for (int i = 0; i < N / 16; i++)
+    vst1q_u8(ex + 16 * i, vtstq_u8(vcombine_u8(vdup_n_u8(d8[2 * i]), vdup_n_u8(d8[2 * i + 1])), w));
+  const uint8x16_t c64 = vdupq_n_u8(64);
+  const uint8x16x4_t t0 = vld1q_u8_x4(ex);
+  if (N <= 64) {
+    for (int k = 0; k < E; k += 16)
+      tbl_store(out, k, E, tbl_pack16(vqtbl4q_u8(t0, vld1q_u8(idx + k))));
+  } else if (N <= 128) {
+    const uint8x16x4_t t1 = vld1q_u8_x4(ex + 64);
+    for (int k = 0; k < E; k += 16) {
+      const uint8x16_t i = vld1q_u8(idx + k);
+      tbl_store(out, k, E, tbl_pack16(vqtbx4q_u8(vqtbl4q_u8(t0, i), t1, vsubq_u8(i, c64))));
+    }
+  } else {
+    const uint8x16x4_t t1 = vld1q_u8_x4(ex + 64), t2 = vld1q_u8_x4(ex + 128), t3 = vld1q_u8_x4(ex + 192);
+    const uint8x16_t c128 = vdupq_n_u8(128), c192 = vdupq_n_u8(192);
+    for (int k = 0; k < E; k += 16) {
+      const uint8x16_t i = vld1q_u8(idx + k);
+      uint8x16_t v = vqtbl4q_u8(t0, i);
+      v = vqtbx4q_u8(v, t1, vsubq_u8(i, c64));
+      v = vqtbx4q_u8(v, t2, vsubq_u8(i, c128));
+      v = vqtbx4q_u8(v, t3, vsubq_u8(i, c192));
+      tbl_store(out, k, E, tbl_pack16(v));
+    }
+  }
+}
+#endif
+
+/* out bit k = bit src[k] of d (src padded to a multiple of 8); a last partial byte is ORed into out */
 static inline void polar_bit_gather(const uint64_t *d, int N, const uint16_t *src, int E, uint8_t *out)
 {
   uint8_t db[Nmax] __attribute__((aligned(16))); // one byte (0/1) per bit of d
@@ -613,7 +682,11 @@ static inline void polar_bit_gather(const uint64_t *d, int N, const uint16_t *sr
     const uint64_t x = (uint64_t)db[src[0]] | (uint64_t)db[src[1]] << 8 | (uint64_t)db[src[2]] << 16 | (uint64_t)db[src[3]] << 24
                        | (uint64_t)db[src[4]] << 32 | (uint64_t)db[src[5]] << 40 | (uint64_t)db[src[6]] << 48
                        | (uint64_t)db[src[7]] << 56;
-    out[k >> 3] = (x * 0x0102040810204080ULL) >> 56;
+    const uint8_t v = (x * 0x0102040810204080ULL) >> 56;
+    if (E - k >= 8)
+      out[k >> 3] = v;
+    else
+      out[k >> 3] |= v & ((1 << (E - k)) - 1);
   }
 }
 
@@ -815,7 +888,12 @@ void polar_encoder_fast(uint64_t *A,
 #endif
 
   if (polarParams->enc_rm_src) { // rate matching (+ bit interleaving) as one bit gather
-    polar_bit_gather(D, polarParams->N, polarParams->enc_rm_src, polarParams->encoderLength, out);
+#if defined(__aarch64__)
+    if (polarParams->enc_rm_byte)
+      polar_bit_gather_tbl(D, polarParams->N, polarParams->enc_rm_byte, polarParams->encoderLength, out);
+    else
+#endif
+      polar_bit_gather(D, polarParams->N, polarParams->enc_rm_src, polarParams->encoderLength, out);
 #if defined(__aarch64__)
   } else if (polarParams->enc_rm_byte) { // byte / halfword groups: 16 output bytes per TBL from the 64 bytes of d
     const uint8x16x4_t t = {{vld1q_u8((uint8_t *)D), vld1q_u8((uint8_t *)D + 16), vld1q_u8((uint8_t *)D + 32), vld1q_u8((uint8_t *)D + 48)}};
