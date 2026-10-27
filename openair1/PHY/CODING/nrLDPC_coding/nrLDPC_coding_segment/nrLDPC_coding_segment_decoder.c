@@ -112,8 +112,8 @@ static void llr_prescale_init(void)
   if (config_get_if() != NULL) {
     paramdef_t params[] = {
         {"llr_prescale",
-         "Qm-dependent gain of the int16 LLRs before the int8 LDPC decoder input: \"g2,g4,g6,g8\" (QPSK..256QAM), \"default\" (" NR_LDPC_LLR_PRESCALE_DEFAULT
-         ") or \"off\"\n",
+         "Qm-dependent gain of the int16 LLRs before the int8 LDPC decoder input: \"g2,g4,g6,g8\" (QPSK..256QAM, any number of layers), "
+         "\"g2,g4,g6,g8/h2,h4,h6,h8\" (1 layer / 2+ layers), \"default\" (" NR_LDPC_LLR_PRESCALE_DEFAULT ") or \"off\"\n",
          0,
          .strptr = &cfg,
          .defstrval = "default",
@@ -129,10 +129,10 @@ static void llr_prescale_init(void)
   if (env)
     src = "env OAI_LDPC_LLR_PRESCALE";
   AssertFatal(nrLDPC_llr_prescale_parse(str, &llr_prescale_rule) == 0,
-              "invalid LDPC LLR pre-scale \"%s\" (%s): expected \"g2,g4,g6,g8\" with gains in [1/16,1) or 1,2,4,8, \"default\" or \"off\"\n",
+              "invalid LDPC LLR pre-scale \"%s\" (%s): expected \"g2,g4,g6,g8\" or \"g2,g4,g6,g8/h2,h4,h6,h8\" with gains in [1/16,1) or 1,2,4,8, \"default\" or \"off\"\n",
               str,
               src);
-  char buf[96];
+  char buf[160];
   nrLDPC_llr_prescale_str(&llr_prescale_rule, buf, sizeof(buf));
   LOG_I(PHY, "LDPC decoder input LLR pre-scale (%s \"%s\"): %s\n", src, str, buf);
 }
@@ -216,7 +216,7 @@ static void nr_process_decode_segment(void *arg)
   memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
   // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
   int8_t l[68 * 384 + 16] __attribute__((aligned(16)));
-  nrLDPC_llr_pack_int8(z, l, ((Kc * rdata->Z) >> 4) + 1, Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? &llr_prescale_rule.qm[Qm] : NULL);
+  nrLDPC_llr_pack_int8(z, l, ((Kc * rdata->Z) >> 4) + 1, nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, p_decoderParms->nb_layers));
   //////////////////////////////////////////////////////////////////////////////////////////
 
   //////////////////////////////////////////////////////////////////////////////////////////
@@ -258,7 +258,8 @@ int nrLDPC_prepare_TB_decoding(nrLDPC_slot_decoding_parameters_t *nrLDPC_slot_de
   const uint8_t Qm = nrLDPC_TB_decoding_parameters->Qm;
   decParams.Qm = Qm;
   decParams.nb_layers = nrLDPC_TB_decoding_parameters->nb_layers;
-  decParams.llr_prescale_q8 = Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? llr_prescale_rule.qm[Qm].q8 : 256;
+  const nr_ldpc_llr_prescale_t *ps = nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, decParams.nb_layers);
+  decParams.llr_prescale_q8 = ps ? ps->q8 : 256;
 
   for (int r = 0; r < nrLDPC_TB_decoding_parameters->C; r++) {
     nrLDPC_decoding_parameters_t *rdata = &((nrLDPC_decoding_parameters_t *)t_info->buf)[t_info->len];
