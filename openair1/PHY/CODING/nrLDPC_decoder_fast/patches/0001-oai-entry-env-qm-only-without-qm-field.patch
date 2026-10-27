@@ -1,0 +1,21 @@
+OAI entry: compile the LDPC_DEC_QM env fallback only when the Qm field is not read
+(with -DLDPC_DEC_OAI_HAS_QM, env_qm() was unused: -Wunused-function).
+
+--- a/src/ldpc_oai_entry.c
++++ b/src/ldpc_oai_entry.c
+@@ -12,6 +12,7 @@
+    decoding thread before LDPCdecoder(); LDPC_DEC_QM=<qm> sets a process-wide default (experiments); else unknown. */
+ static __thread int t_qm = -1;
+ void LDPCdecoder_set_qm(int qm) { t_qm = qm; }
++#ifndef LDPC_DEC_OAI_HAS_QM
+ static int env_qm(void)
+ {
+   static int q = -2;
+@@ -21,6 +22,7 @@
+   }
+   return q;
+ }
++#endif
+ int32_t LDPCshutdown(void) { return 0; }
+ 
+ static int oai_abort_poll(void *ctx)
