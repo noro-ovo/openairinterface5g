@@ -35,26 +35,25 @@ static const uint8_t nr_polar_subblock_interleaver_pattern[32] = {0,  1,  2,  4,
 
 #define uint128_t __uint128_t
 
-#define POLAR_OP_CODE_LEFT 0
-#define POLAR_OP_CODE_RIGHT 1
-#define POLAR_OP_CODE_BETA 2
+/* successive-cancellation decoder of polar_decoder_int16() (nr_polar_sc_decoder.c): flat list of operations */
+typedef struct {
+  uint8_t code;
+  uint8_t arg; // tree level of the node, or the frozen pattern of a 4-leaf node
+  uint16_t f; // first leaf of the node
+} nr_polar_sc_op_t;
 
-typedef struct decoder_node_t_s {
-  struct decoder_node_t_s *left;
-  struct decoder_node_t_s *right;
-  uint64_t level: 16;
-  uint64_t leaf: 16;
-  uint64_t first_leaf_index: 16;
-  uint64_t all_frozen: 1;
-  uint64_t betaInit: 1;
-  uint32_t alpha;
-  uint32_t beta;
-} decoder_node_t;
-
-typedef struct decoder_tree_t_s {
-  decoder_node_t *root;
-  simde__m256i buffer[1024]; // seems enough but to be refined
-} decoder_tree_t;
+typedef struct {
+  nr_polar_sc_op_t *ops;
+  int nops;
+  int16_t *alpha[nmax + 1]; // alpha[l]: LLRs of the active node of tree level l (alpha[n]: rate-recovered input)
+  int8_t *beta; // partial sums (+1: bit 1, -1: bit 0), node (level l, first leaf f) owns beta[f, f + 2^l)
+  uint8_t *u; // hard decision per leaf
+  uint16_t *info_src; // leaf decoded as bit t of the decoded word (parity-check bits excluded)
+  int n_info;
+  uint8_t rm_mode; // 0 repetition, 1 puncturing, 2 shortening
+  uint8_t blk_perm[32]; // sub-block interleaver pattern
+  void *mem;
+} nr_polar_sc_t;
 
 typedef struct nrPolar_params {
   // messageType: 0=PBCH, 1=DCI, -1=UCI
@@ -92,15 +91,7 @@ typedef struct nrPolar_params {
   int *rm_tab;
   uint64_t cprime_tab0[16][256];
   uint64_t cprime_tab1[16][256];
-  decoder_tree_t decoder;
-  struct {
-    int iter;
-    bool is_initialized;
-    struct {
-      int op_code;
-      decoder_node_t *node;
-    } op_list[600];
-  } tree_linearization;
+  nr_polar_sc_t sc;
 } t_nrPolar_params;
 
 void polar_encoder(uint32_t *input, uint32_t *output, int8_t messageType, uint16_t messageLength, uint8_t aggregation_level);
@@ -142,19 +133,9 @@ int8_t polar_decoder_dci(double *input,
                          uint16_t messageLength,
                          uint8_t aggregation_level);
 
-void generic_polar_decoder(t_nrPolar_params *pp, decoder_node_t *node, uint8_t *nr_polar_U);
-
-static inline int16_t *treeAlpha(decoder_node_t *node)
-{
-  return (int16_t *)((uint8_t *)node + node->alpha);
-}
-
-static inline int8_t *treeBeta(decoder_node_t *node)
-{
-  return (int8_t *)node + node->beta;
-}
-
-void build_decoder_tree(t_nrPolar_params *pp);
+void nr_polar_build_sc_decoder(t_nrPolar_params *pp);
+void nr_polar_free_sc_decoder(t_nrPolar_params *pp);
+void nr_polar_sc_decode(const t_nrPolar_params *pp, const int16_t *input, uint64_t *B);
 void build_polar_tables(t_nrPolar_params *polarParams);
 
 void nr_polar_print_polarParams(void);
