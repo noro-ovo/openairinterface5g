@@ -32,10 +32,13 @@
  * 16QAM x1/16 (2.5 dB UL, 4.5 dB DL), 64QAM x1/2 (0.1 dB UL, 1.6 dB DL; x1/4 costs ~0.01 dB at UL MCS 27),
  * 256QAM x1. Receivers with a different LLR scale need their own rule (config/env). */
 #define NR_LDPC_LLR_PRESCALE_DEFAULT "1,0.25,1,1/0.25,0.0625,0.5,1"
-/* Default rule when the fast decoder (nrLDPC_decoder_fast, the default of libldpc.so) is selected: its AGC normalises
- * the LLR scale per code block, so the pre-scale only has to keep the int16 LLRs off the int8 rails (see
- * nrLDPC_decoder_select.h). PROVISIONAL, set from the measurements of the integration (doc/LDPC decoder README). */
-#define NR_LDPC_LLR_PRESCALE_DEFAULT_FAST NR_LDPC_LLR_PRESCALE_DEFAULT
+/* Default rule when the fast decoder (nrLDPC_decoder_fast, the default of libldpc.so) is selected, measured with it in
+ * nr_ulsim/nr_dlsim (same receivers): its AGC normalises the scale per code block, the pre-scale only decides what is
+ * clipped. As for OAI's decoder, except 2+ layers 256QAM x1/2 (DL 2x2 MCS 23: -1.8 dB; UL 2x4 only inside the
+ * receiver's ~13 % BLER floor). 1 layer 64/256QAM stay x1 (x1/2: +0.05..+0.5 dB at MCS 27, the AGC targets were fitted
+ * on clipped LLRs); 2+ layers 64QAM stays x1/2 (DL would gain 0.9 dB with x1/8, UL loses 0.45 dB: a UE can set
+ * "1,0.25,1,1/0.25,0.0625,0.125,0.5"). */
+#define NR_LDPC_LLR_PRESCALE_DEFAULT_FAST "1,0.25,1,1/0.25,0.0625,0.5,0.5"
 /// maximum modulation order handled by the table (index = Qm, 0..8)
 #define NR_LDPC_LLR_PRESCALE_MAX_QM 8
 
