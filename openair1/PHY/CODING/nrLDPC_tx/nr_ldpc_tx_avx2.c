@@ -349,7 +349,14 @@ TGT void nr_ldpc_tx_interleave_sse(int qm, const uint8_t *const src[8], int t, i
 
 /* bit j of 32 bytes -> 32 bits */
 #define MM(x, j) ((uint32_t)_mm256_movemask_epi8((j) == 7 ? (x) : _mm256_slli_epi16(x, 7 - (j))))
-TGT void nr_ldpc_tx_extract_avx2(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes)
+TGT void nr_ldpc_tx_extract_avx2(int qm,
+                                 const uint8_t *const src[8],
+                                 const uint8_t *const src2[8],
+                                 uint8_t m2,
+                                 int L,
+                                 uint8_t *stage,
+                                 uint64_t *w,
+                                 unsigned planes)
 {
   const int n = qm * L, nw = (n + 63) >> 6;
   const uint8_t *f = src[0];
