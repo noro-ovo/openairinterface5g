@@ -8,15 +8,19 @@
 
 // [from gNB coding]
 #include "nr_rate_matching.h"
+#include "nrLDPC_llr_prescale.h"
 #include "PHY/CODING/coding_extern.h"
 #include "PHY/CODING/coding_defs.h"
 #include "PHY/CODING/nrLDPC_coding/nrLDPC_coding_interface.h"
 #include "PHY/CODING/nrLDPC_extern.h"
 #include "defs.h"
 #include "common/utils/LOG/log.h"
+#include "common/config/config_userapi.h"
 
+#include <pthread.h>
 #include <stdalign.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <syscall.h>
 #include <time.h>
 // #define gNB_DEBUG_TRACE
@@ -90,6 +94,48 @@ typedef struct nrLDPC_decoding_parameters_s {
 
   time_stats_t ts_ldpc_decode;
 } nrLDPC_decoding_parameters_t;
+
+/// Qm-dependent gain applied to the int16 LLRs before the int8 pack (see nrLDPC_llr_prescale.h), set once at init
+static nr_ldpc_llr_prescale_rule_t llr_prescale_rule;
+static pthread_once_t llr_prescale_once = PTHREAD_ONCE_INIT;
+
+/* Rule source, highest priority first:
+ *   env OAI_LDPC_LLR_PRESCALE (experiments),
+ *   config parameter nrLDPC_coding_segment.llr_prescale (gNB/UE config file section nrLDPC_coding_segment, or
+ *   --nrLDPC_coding_segment.llr_prescale on the command line, also in the simulators),
+ *   NR_LDPC_LLR_PRESCALE_DEFAULT.
+ * "off" restores the legacy conversion bit-exactly. */
+static void llr_prescale_init(void)
+{
+  char *cfg = NULL;
+  const char *src = "default";
+  if (config_get_if() != NULL) {
+    paramdef_t params[] = {
+        {"llr_prescale",
+         "Qm-dependent gain of the int16 LLRs before the int8 LDPC decoder input: \"g2,g4,g6,g8\" (QPSK..256QAM), \"default\" (" NR_LDPC_LLR_PRESCALE_DEFAULT
+         ") or \"off\"\n",
+         0,
+         .strptr = &cfg,
+         .defstrval = "default",
+         TYPE_STRING,
+         0,
+         NULL},
+    };
+    config_get(config_get_if(), params, sizeofArray(params), "nrLDPC_coding_segment");
+    src = "config";
+  }
+  const char *env = getenv("OAI_LDPC_LLR_PRESCALE");
+  const char *str = env ? env : cfg ? cfg : "default";
+  if (env)
+    src = "env OAI_LDPC_LLR_PRESCALE";
+  AssertFatal(nrLDPC_llr_prescale_parse(str, &llr_prescale_rule) == 0,
+              "invalid LDPC LLR pre-scale \"%s\" (%s): expected \"g2,g4,g6,g8\" with gains in [1/16,1) or 1,2,4,8, \"default\" or \"off\"\n",
+              str,
+              src);
+  char buf[96];
+  nrLDPC_llr_prescale_str(&llr_prescale_rule, buf, sizeof(buf));
+  LOG_I(PHY, "LDPC decoder input LLR pre-scale (%s \"%s\"): %s\n", src, str, buf);
+}
 
 static void nr_process_decode_segment(void *arg)
 {
@@ -168,13 +214,9 @@ static void nr_process_decode_segment(void *arg)
   memcpy(z + 2 * rdata->Z, rdata->d, (Kprime - 2 * rdata->Z) * sizeof(*z));
   // skip filler bits
   memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
-  // Saturate coded bits before decoding into 8 bits values
-  simde__m128i *pv = (simde__m128i *)&z;
+  // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
   int8_t l[68 * 384 + 16] __attribute__((aligned(16)));
-  simde__m128i *pl = (simde__m128i *)&l;
-  for (int i = 0, j = 0; j < ((Kc * rdata->Z) >> 4) + 1; i += 2, j++) {
-    pl[j] = simde_mm_packs_epi16(pv[i], pv[i + 1]);
-  }
+  nrLDPC_llr_pack_int8(z, l, ((Kc * rdata->Z) >> 4) + 1, Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? &llr_prescale_rule.qm[Qm] : NULL);
   //////////////////////////////////////////////////////////////////////////////////////////
 
   //////////////////////////////////////////////////////////////////////////////////////////
@@ -212,9 +254,11 @@ int nrLDPC_prepare_TB_decoding(nrLDPC_slot_decoding_parameters_t *nrLDPC_slot_de
   decParams.numMaxIter = nrLDPC_TB_decoding_parameters->max_ldpc_iterations;
   decParams.outMode = nrLDPC_outMode_BIT;
   // LLR-scale hints for the decoder (OAI's decoder ignores them)
-  decParams.Qm = nrLDPC_TB_decoding_parameters->Qm;
+  pthread_once(&llr_prescale_once, llr_prescale_init);
+  const uint8_t Qm = nrLDPC_TB_decoding_parameters->Qm;
+  decParams.Qm = Qm;
   decParams.nb_layers = nrLDPC_TB_decoding_parameters->nb_layers;
-  decParams.llr_prescale_q8 = 256;
+  decParams.llr_prescale_q8 = Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? llr_prescale_rule.qm[Qm].q8 : 256;
 
   for (int r = 0; r < nrLDPC_TB_decoding_parameters->C; r++) {
     nrLDPC_decoding_parameters_t *rdata = &((nrLDPC_decoding_parameters_t *)t_info->buf)[t_info->len];
@@ -237,7 +281,7 @@ int nrLDPC_prepare_TB_decoding(nrLDPC_slot_decoding_parameters_t *nrLDPC_slot_de
     rdata->Kc = decParams.BG == 2 ? 52 : 68;
     rdata->C = nrLDPC_TB_decoding_parameters->C;
     rdata->A = nrLDPC_TB_decoding_parameters->A;
-    rdata->Qm = nrLDPC_TB_decoding_parameters->Qm;
+    rdata->Qm = Qm;
     rdata->K = nrLDPC_TB_decoding_parameters->K;
     rdata->Z = nrLDPC_TB_decoding_parameters->Z;
     rdata->F = nrLDPC_TB_decoding_parameters->F;
@@ -268,6 +312,7 @@ int nrLDPC_prepare_TB_decoding(nrLDPC_slot_decoding_parameters_t *nrLDPC_slot_de
 
 int32_t nrLDPC_coding_init(int max_num_pxsch)
 {
+  pthread_once(&llr_prescale_once, llr_prescale_init);
   return 0;
 }
 
