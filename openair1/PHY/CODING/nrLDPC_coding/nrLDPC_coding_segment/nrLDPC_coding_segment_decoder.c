@@ -211,6 +211,10 @@ int nrLDPC_prepare_TB_decoding(nrLDPC_slot_decoding_parameters_t *nrLDPC_slot_de
   decParams.Z = nrLDPC_TB_decoding_parameters->Z;
   decParams.numMaxIter = nrLDPC_TB_decoding_parameters->max_ldpc_iterations;
   decParams.outMode = nrLDPC_outMode_BIT;
+  // LLR-scale hints for the decoder (OAI's decoder ignores them)
+  decParams.Qm = nrLDPC_TB_decoding_parameters->Qm;
+  decParams.nb_layers = nrLDPC_TB_decoding_parameters->nb_layers;
+  decParams.llr_prescale_q8 = 256;
 
   for (int r = 0; r < nrLDPC_TB_decoding_parameters->C; r++) {
     nrLDPC_decoding_parameters_t *rdata = &((nrLDPC_decoding_parameters_t *)t_info->buf)[t_info->len];
