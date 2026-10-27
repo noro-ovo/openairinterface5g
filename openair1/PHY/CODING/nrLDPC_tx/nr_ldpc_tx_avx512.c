@@ -312,9 +312,81 @@ static TGTX void interleave_avx512(int qm, const uint8_t *const src[8], int L, u
 /* 8 blocks of 64 positions -> 8 words per code block. Per block: bytes reversed within each qword, GFNI 8x8 bit
  * transpose of every qword (byte j = bits of code block j, LSB = first position), bytes gathered code-block-major
  * (qword j = code block j); then an 8x8 qword transpose across the 8 blocks. */
-static TGTX void extract_avx512(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes)
+/* Qm = 8 and 4, more than 3 code blocks, 512 positions per block: lane registers r_k hold the bytes of positions
+ * 8i + k (i = 0..63), loaded straight from the streams (Qm = 8: stream k; Qm = 4: even / odd bytes of stream k & 3),
+ * then the 8x8 bit transpose across the registers leaves code block j's 512 bits, LSB first, in r_j: no interleaved
+ * staging copy. */
+static TGTX void extract_lanes_avx512(int qm,
+                                      const uint8_t *const src[8],
+                                      const uint8_t *const src2[8],
+                                      uint8_t m2,
+                                      int L,
+                                      uint64_t *w)
+{
+  /* two rate-matched lengths: bits of the code blocks in m2 from the second stream set (vpternlogd select) */
+  const __m512i mv = _mm512_set1_epi8((char)m2);
+#define LDM(p, p2, o) (src2 ? _mm512_ternarylogic_epi32(mv, L5((p2) + (o)), L5((p) + (o)), 0xCA) : L5((p) + (o)))
+  const int nb = (qm * L + 511) >> 9;
+  const __m512i k1 = _mm512_set1_epi8(0x55), k2 = _mm512_set1_epi8(0x33), k4 = _mm512_set1_epi8(0x0f);
+  const __m512i ev = _mm512_set_epi64(0x7e7c7a7876747270ULL,
+                                      0x6e6c6a6866646260ULL,
+                                      0x5e5c5a5856545250ULL,
+                                      0x4e4c4a4846444240ULL,
+                                      0x3e3c3a3836343230ULL,
+                                      0x2e2c2a2826242220ULL,
+                                      0x1e1c1a1816141210ULL,
+                                      0x0e0c0a0806040200ULL);
+  const __m512i od = _mm512_add_epi8(ev, _mm512_set1_epi8(1));
+  for (int b = 0; b < nb; b++) {
+    __m512i r[8];
+    if (qm == 8) {
+      for (int k = 0; k < 8; k++)
+        r[k] = LDM(src[k], src2 ? src2[k] : NULL, 64 * b);
+    } else {
+      for (int k = 0; k < 4; k++) {
+        const __m512i lo = LDM(src[k], src2 ? src2[k] : NULL, 128 * b), hi = LDM(src[k], src2 ? src2[k] : NULL, 128 * b + 64);
+        r[k] = _mm512_permutex2var_epi8(lo, ev, hi);
+        r[k + 4] = _mm512_permutex2var_epi8(lo, od, hi);
+      }
+    }
+    XSW(r[0], r[1], 1, k1);
+    XSW(r[2], r[3], 1, k1);
+    XSW(r[4], r[5], 1, k1);
+    XSW(r[6], r[7], 1, k1);
+    XSW(r[0], r[2], 2, k2);
+    XSW(r[1], r[3], 2, k2);
+    XSW(r[4], r[6], 2, k2);
+    XSW(r[5], r[7], 2, k2);
+    XSW(r[0], r[4], 4, k4);
+    XSW(r[1], r[5], 4, k4);
+    XSW(r[2], r[6], 4, k4);
+    XSW(r[3], r[7], 4, k4);
+    for (int j = 0; j < 8; j++)
+      S5(w + j * NR_LDPC_TX_WS + 8 * b, r[j]);
+  }
+#undef LDM
+}
+
+/* the lane-register path takes a second stream set */
+static int merge_avx512(int qm, unsigned planes)
+{
+  return (qm == 8 || qm == 4) && __builtin_popcount(planes) > 3;
+}
+
+static TGTX void extract_avx512(int qm,
+                                const uint8_t *const src[8],
+                                const uint8_t *const src2[8],
+                                uint8_t m2,
+                                int L,
+                                uint8_t *stage,
+                                uint64_t *w,
+                                unsigned planes)
 {
   const int n = qm * L, nw = (n + 63) >> 6;
+  if ((qm == 8 || qm == 4) && __builtin_popcount(planes) > 3) {
+    extract_lanes_avx512(qm, src, src2, m2, L, w);
+    return;
+  }
   const uint8_t *f = src[0];
   if (qm > 1) {
     interleave_avx512(qm, src, L, stage);
@@ -381,6 +453,7 @@ static nr_ldpc_tx_kern_t k_avx512 = {.name = "avx512",
                                      .tcols = tcols_avx512,
                                      .tcols_zmin = 8,
                                      .extract = extract_avx512,
+                                     .merge = merge_avx512,
                                      .write = write_avx512};
 const nr_ldpc_tx_kern_t *nr_ldpc_tx_kern_avx512(void)
 {
@@ -388,8 +461,10 @@ const nr_ldpc_tx_kern_t *nr_ldpc_tx_kern_avx512(void)
   if (!__builtin_cpu_supports("avx512f") || !__builtin_cpu_supports("avx512bw") || !__builtin_cpu_supports("avx512vl"))
     return 0;
   /* output stage without VBMI/GFNI (Skylake-SP/Cascade Lake): the AVX2 kernels */
-  if (!__builtin_cpu_supports("avx512vbmi") || !__builtin_cpu_supports("gfni"))
+  if (!__builtin_cpu_supports("avx512vbmi") || !__builtin_cpu_supports("gfni")) {
     k_avx512.extract = nr_ldpc_tx_extract_avx2;
+    k_avx512.merge = NULL;
+  }
   return &k_avx512;
 }
 #else
