@@ -316,6 +316,8 @@ __attribute__((always_inline)) static inline void polar_rate_matching(const t_nr
   }
 }
 
+static void build_encoder_tables(t_nrPolar_params *pp);
+
 void build_polar_tables(t_nrPolar_params *polarParams)
 {
   // build table b -> c'
@@ -438,7 +440,125 @@ void build_polar_tables(t_nrPolar_params *polarParams)
   for (int outpos = 0, tcnt = 0; outpos < polarParams->encoderLength; outpos += mingroupsize, tcnt++)
     polarParams->rm_tab[tcnt] = polarParams->rate_matching_pattern[outpos] >> shift;
 
+  build_encoder_tables(polarParams);
   nr_polar_build_sc_decoder(polarParams);
+}
+
+/* polar_encoder_fast() tables (see t_nrPolar_params) */
+static void build_encoder_tables(t_nrPolar_params *pp)
+{
+  const int N = pp->N, E = pp->encoderLength;
+  memset(pp->enc_info_mask, 0, sizeof(pp->enc_info_mask));
+  /* 5.3.1.2: with n_PC > 0, the parity-check bit at position n is the value of the cyclic shift register y0 at n:
+   * the XOR of the information bits placed at the earlier positions m = n (mod 5) */
+  int k = 0, npc = 0;
+  uint64_t reg[5] = {0};
+  for (int n = 0; n < N; n++) {
+    if (pp->information_bit_pattern[n] != 1)
+      continue;
+    if (pp->n_pc > 0 && pp->parity_check_bit_pattern[n] == 1) {
+      AssertFatal(npc < 3 && pp->K <= 64, "parity-check bits: n_pc %d, K %d\n", pp->n_pc, pp->K);
+      pp->enc_pc_pos[npc] = n;
+      pp->enc_pc_mask[npc++] = reg[(n + 1) % 5];
+    } else {
+      pp->enc_info_mask[n >> 6] |= 1ULL << (n & 63);
+      if (k < 64)
+        reg[(n + 1) % 5] |= 1ULL << k;
+      k++;
+    }
+  }
+  AssertFatal(npc == (pp->n_pc > 0 ? pp->n_pc : 0) && k == pp->K, "information bits %d (K %d), parity-check bits %d\n", k, pp->K, npc);
+
+  /* rate matching (+ coded bit interleaving) as one bit gather, where polar_rate_matching() has a slow path: groups
+   * of less than 8 bits or the bit interleaver. Only where polar_rate_matching() writes exactly the E/8 output bytes
+   * (E multiple of 8, and of 16 for halfword groups), otherwise polar_rate_matching() is kept. */
+  pp->enc_rm_src = NULL;
+  if ((pp->groupsize < 8 || pp->i_bil) && (E & 7) == 0 && !(pp->groupsize == 16 && (E & 15))) {
+    uint16_t *rm = malloc(sizeof(uint16_t) * E), *src = malloc(sizeof(uint16_t) * E);
+    AssertFatal(rm && src, "malloc\n");
+    for (int i = 0; i < E; i++) // rate matching output bit i <- bit rm[i] of d, as polar_rate_matching()
+      rm[i] = pp->groupsize < 8 ? pp->rate_matching_pattern[i]
+              : pp->groupsize == 8 ? 8 * pp->rm_tab[i >> 3] + (i & 7) : 16 * pp->rm_tab[i >> 4] + (i & 15);
+    if (pp->i_bil) { // nr_polar_rm_interleaving_cb(): written column by column from the triangle filled row by row
+      int T = ceil((sqrt(8 * E + 1) - 1) / 2);
+      int ko = 0;
+      for (int j = 0; j < T; j++)
+        for (int i = 0; i < T - j; i++) {
+          int kin = i * T - i * (i - 1) / 2 + j; // row-wise index of v[i][j]
+          if (kin < E)
+            src[ko++] = rm[kin];
+        }
+      AssertFatal(ko == E, "bit interleaver %d != %d\n", ko, E);
+    } else {
+      memcpy(src, rm, sizeof(uint16_t) * E);
+    }
+    free(rm);
+    pp->enc_rm_src = src;
+  }
+}
+
+/* u (natural order: position n = bit n & 63 of word n >> 6) from C' (bit k = k-th information bit) */
+static inline void polar_generate_u_nat(const t_nrPolar_params *pp, const uint64_t *Cprime, uint64_t *u)
+{
+  const int nw = pp->N >> 6;
+  int k = 0;
+  for (int w = 0; w < nw; w++) {
+    uint64_t m = pp->enc_info_mask[w], x = 0;
+    if (m) {
+      // next popcount(m) bits of C' (k < 128)
+      uint64_t c = k == 0 ? Cprime[0] : k < 64 ? (Cprime[0] >> k) | (Cprime[1] << (64 - k)) : Cprime[1] >> (k - 64);
+      k += __builtin_popcountll(m);
+#if defined(__BMI2__) && !defined(__znver1__) && !defined(__znver2__)
+      x = _pdep_u64(c, m);
+#else
+      while (m) {
+        x |= (c & 1) << __builtin_ctzll(m);
+        c >>= 1;
+        m &= m - 1;
+      }
+#endif
+    }
+    u[w] = x;
+  }
+  for (int i = 0; i < pp->n_pc; i++)
+    u[pp->enc_pc_pos[i] >> 6] |= (uint64_t)__builtin_parityll(Cprime[0] & pp->enc_pc_mask[i]) << (pp->enc_pc_pos[i] & 63);
+}
+
+/* d = u G_N (5.3.1.2), natural bit order, nw = N / 64 words, in place */
+static inline void polar_transform(uint64_t *x, const int nw)
+{
+  for (int w = 0; w < nw; w++) {
+    uint64_t v = x[w];
+    v ^= (v >> 1) & 0x5555555555555555ULL;
+    v ^= (v >> 2) & 0x3333333333333333ULL;
+    v ^= (v >> 4) & 0x0F0F0F0F0F0F0F0FULL;
+    v ^= (v >> 8) & 0x00FF00FF00FF00FFULL;
+    v ^= (v >> 16) & 0x0000FFFF0000FFFFULL;
+    v ^= (v >> 32) & 0x00000000FFFFFFFFULL;
+    x[w] = v;
+  }
+  for (int s = 1; s < nw; s <<= 1)
+    for (int w = 0; w < nw; w++)
+      if (!(w & s))
+        x[w] ^= x[w + s];
+}
+
+/* out bit k = bit src[k] of d, E multiple of 8 */
+static inline void polar_bit_gather(const uint64_t *d, int N, const uint16_t *src, int E, uint8_t *out)
+{
+  uint8_t db[Nmax] __attribute__((aligned(16))); // one byte (0/1) per bit of d
+  const uint8_t *d8 = (const uint8_t *)d;
+  for (int i = 0; i < N / 8; i++) {
+    uint64_t y = (d8[i] * 0x0101010101010101ULL) & 0x8040201008040201ULL;
+    y = ((y + 0x7F7F7F7F7F7F7F7FULL) >> 7) & 0x0101010101010101ULL;
+    __builtin_memcpy(db + 8 * i, &y, 8);
+  }
+  for (int k = 0; k < E; k += 8, src += 8) {
+    const uint64_t x = (uint64_t)db[src[0]] | (uint64_t)db[src[1]] << 8 | (uint64_t)db[src[2]] << 16 | (uint64_t)db[src[3]] << 24
+                       | (uint64_t)db[src[4]] << 32 | (uint64_t)db[src[5]] << 40 | (uint64_t)db[src[6]] << 48
+                       | (uint64_t)db[src[7]] << 56;
+    out[k >> 3] = (x * 0x0102040810204080ULL) >> 56;
+  }
 }
 
 void polar_encoder_fast(uint64_t *A,
@@ -619,30 +739,10 @@ void polar_encoder_fast(uint64_t *A,
   printf("\n");
 #endif
 
-  uint64_t u[16] = {0};
-  nr_polar_generate_u(u,
-                      Cprime,
-                      polarParams->information_bit_pattern,
-                      polarParams->parity_check_bit_pattern,
-                      polarParams->N,
-                      polarParams->n_pc);
-
-#ifdef POLAR_CODING_DEBUG
-  int N_array = polarParams->N >> 6;
-  printf("u: ");
-  for (int n = 0; n < polarParams->N; n++) {
-    if (n % 4 == 0) {
-      printf(" ");
-    }
-    int n1 = n >> 6;
-    int n2 = n - (n1 << 6);
-    printf("%lu", (u[N_array - 1 - n1] >> (63 - n2)) & 1);
-  }
-  printf("\n");
-#endif
-
-  uint64_t D[8];
-  nr_polar_uxG((uint8_t *)u, polarParams->N, (uint8_t *)D);
+  // u (5.3.1.2) in natural bit order, then d = u G_N in place
+  uint64_t D[Nmax / 64];
+  polar_generate_u_nat(polarParams, Cprime, D);
+  polar_transform(D, polarParams->N >> 6);
 
 #ifdef POLAR_CODING_DEBUG
   printf("d: ");
@@ -658,8 +758,12 @@ void polar_encoder_fast(uint64_t *A,
   fflush(stdout);
 #endif
 
-  memset((void *)out, 0, polarParams->encoderLength >> 3);
-  polar_rate_matching(polarParams, (void *)D, out);
+  if (polarParams->enc_rm_src) { // rate matching (+ bit interleaving) as one bit gather
+    polar_bit_gather(D, polarParams->N, polarParams->enc_rm_src, polarParams->encoderLength, out);
+  } else {
+    memset((void *)out, 0, polarParams->encoderLength >> 3);
+    polar_rate_matching(polarParams, (void *)D, out);
+  }
 
 #ifdef POLAR_CODING_DEBUG
   uint64_t *out64 = (uint64_t *)out;
