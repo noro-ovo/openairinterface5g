@@ -3,6 +3,7 @@
  */
 
 #include "nr_modulation.h"
+#include "nr_mod_packed.h"
 #include "openair1/PHY/TOOLS/tools_defs.h"
 #include "PHY/NR_REFSIG/nr_mod_table.h"
 #include "executables/softmodem-common.h"
@@ -113,6 +114,10 @@ void nr_modulation(const uint32_t *in, uint32_t length, uint16_t mod_order, int1
   uint32_t i = 0;
 
   LOG_D(PHY, "nr_modulation: length %d, mod_order %d\n", length, mod_order);
+
+  c16_t *const o = (c16_t *)out;
+  if (nr_mod_packed(in, NULL, length, mod_order, 1, &o))
+    return;
 
   switch (mod_order) {
     case 2: {
@@ -254,6 +259,12 @@ bool nr_modulation_layer_mapping(const uint32_t *in,
   const uint32_t n_symbs = length / mod_order;
   if ((n_symbs % n_layers) != 0)
     return false;
+
+  c16_t *layers[4];
+  for (int l = 0; l < n_layers; l++)
+    layers[l] = tx_layers[l];
+  if (nr_mod_packed(in, NULL, length, mod_order, n_layers, layers))
+    return true;
 
   // Implementation selection (single entry point, chosen internally):
   // For 1-2 layers the vectorised "modulate then deinterleave" path
