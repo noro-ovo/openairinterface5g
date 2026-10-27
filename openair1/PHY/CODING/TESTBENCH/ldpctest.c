@@ -280,9 +280,10 @@ one_measurement_t test_ldpc(short max_iterations,
     int i = 0;
     for (i = 0; i < ((Kprime + 7) & ~7) / 8; i++)
       test_input[j][i] = (uint8_t)rand();
-    // Mask the last byte in order to keep filler bits to 0
+    // Mask the last byte in order to keep filler bits to 0: bits are MSB first (bit i = byte i/8, mask 128 >> (i & 7)),
+    // so the Kprime % 8 information bits of the last byte are its high bits
     if (Kprime % 8 != 0) {
-      uint8_t last_byte_mask = (1 << (Kprime % 8)) - 1;
+      uint8_t last_byte_mask = (uint8_t)(0xff << (8 - Kprime % 8));
       test_input[j][i - 1] = test_input[j][i - 1] & last_byte_mask;
     }
   }
