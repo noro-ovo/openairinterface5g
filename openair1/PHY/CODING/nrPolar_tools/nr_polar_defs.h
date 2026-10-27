@@ -91,6 +91,14 @@ typedef struct nrPolar_params {
   int *rm_tab;
   uint64_t cprime_tab0[16][256];
   uint64_t cprime_tab1[16][256];
+  /* polar_encoder_fast(): information bit positions (parity-check bits excluded) per 64-bit word of u in natural
+   * order, parity-check bits (position, the bits of C' whose parity they carry), rate matching and coded bit
+   * interleaving composed into one bit gather (enc_rm_src[k]: bit of d sent as output bit k), NULL when the byte /
+   * halfword group copy of the rate matching is used alone */
+  uint64_t enc_info_mask[Nmax / 64];
+  uint16_t enc_pc_pos[3];
+  uint64_t enc_pc_mask[3];
+  uint16_t *enc_rm_src;
   nr_polar_sc_t sc;
 } t_nrPolar_params;
 
