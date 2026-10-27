@@ -425,7 +425,8 @@ void build_polar_tables(t_nrPolar_params *polarParams)
         AssertFatal(false, "mingroupsize = %i is not supported\n", mingroupsize);
         break;
     }
-    polarParams->rm_tab = malloc(sizeof(*polarParams->rm_tab) * (polarParams->encoderLength >> shift));
+    // one entry per group started in [0, E): the last group may be partial when E is not a multiple of the group size
+    polarParams->rm_tab = malloc(sizeof(*polarParams->rm_tab) * ((polarParams->encoderLength + mingroupsize - 1) >> shift));
     // rerun again to create groups
     for (int outpos = 0, tcnt = 0; outpos < polarParams->encoderLength; outpos += mingroupsize, tcnt++)
       polarParams->rm_tab[tcnt] = polarParams->rate_matching_pattern[outpos] >> shift;
