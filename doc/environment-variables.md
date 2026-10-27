@@ -11,7 +11,7 @@ OAI uses/supports a number of environment variables, documented in the following
 - `NVRAM_DIR`: directory to read/write NVRAM data in (5G) `nvram` tool; if not defined, will use `PWD` (working directory)
 - `OAI_CONFIGMODULE`: can be used to pass the configuration file instead of `-O`
 - `OAI_LDPC_LLR_PRESCALE`: overrides the Qm-dependent gain applied to the LLRs before the int8 LDPC decoder input by
-  `libldpc.so`/`libldpc_orig.so` (`default`, `off`, or `g2,g4,g6,g8`; see the configuration parameter
+  `libldpc.so`/`libldpc_orig.so` (`default`, `off`, `g2,g4,g6,g8` or `g2,g4,g6,g8/h2,h4,h6,h8`; see the configuration parameter
   `nrLDPC_coding_segment.llr_prescale` in [LDPCImplementation.md](../openair1/PHY/CODING/DOC/LDPCImplementation.md))
 - `OAI_GDBSTACKS`: if defined when hitting an assertion (`DevAssert()`, `AssertFatal()`, ...), OAI will load `gdb` and provide a backtrace for every thread
 - `OAI_RNGSEED`: provide a fixed seed for random number generators (RNG). If
