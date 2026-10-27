@@ -80,17 +80,18 @@ static uint32_t crc16Table32[256]; /* crcbit(&c, 1, poly16), for crc_fold() */
 
 /* multi-lane PCLMULQDQ / PMULL folding for whole bytes (crc_fold.c), from CRC_FOLD_MIN_BYTES; below, the code of
  * crc24a_base() etc. (crc32_calc_pclmulqdq() / the table). aarch64 builds without the crypto extension, where SIMDe
- * emulates PCLMULQDQ in software: crc_fold() takes everything (the table below 16 bytes); with it, SIMDe's one-lane
- * PMULL code takes up to 255 bytes (fewer instructions there than the 4-lane setup and the final reduction) */
+ * emulates PCLMULQDQ in software: crc_fold() takes everything (the table below 16 bytes). Otherwise the one-lane
+ * crc32_calc_pclmulqdq() keeps short messages, where it is faster than the multi-lane setup and the final reduction
+ * (x86: below 192 bytes, measured; aarch64: below 256, instruction counts); crc16() has only the table. */
 static crc_fold_ctx_t fold24a, fold24b, fold16;
 #if defined(__aarch64__) && !defined(__ARM_FEATURE_AES) && !defined(__ARM_FEATURE_CRYPTO)
 #define CRC_FOLD_MIN_BYTES 1
 #define CRC16_FOLD_MIN_BYTES 1
 #elif defined(__aarch64__)
 #define CRC_FOLD_MIN_BYTES 256
-#define CRC16_FOLD_MIN_BYTES 16 /* crc16() has no PCLMULQDQ code */
+#define CRC16_FOLD_MIN_BYTES 16
 #else
-#define CRC_FOLD_MIN_BYTES 16
+#define CRC_FOLD_MIN_BYTES 192
 #define CRC16_FOLD_MIN_BYTES 16
 #endif
 
