@@ -9,6 +9,7 @@
 // [from gNB coding]
 #include "nr_rate_matching.h"
 #include "nrLDPC_llr_prescale.h"
+#include "nrLDPC_decoder_select.h"
 #include "PHY/CODING/coding_extern.h"
 #include "PHY/CODING/coding_defs.h"
 #include "PHY/CODING/nrLDPC_coding/nrLDPC_coding_interface.h"
@@ -21,6 +22,7 @@
 #include <stdalign.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <strings.h>
 #include <syscall.h>
 #include <time.h>
 // #define gNB_DEBUG_TRACE
@@ -103,7 +105,8 @@ static pthread_once_t llr_prescale_once = PTHREAD_ONCE_INIT;
  *   env OAI_LDPC_LLR_PRESCALE (experiments),
  *   config parameter nrLDPC_coding_segment.llr_prescale (gNB/UE config file section nrLDPC_coding_segment, or
  *   --nrLDPC_coding_segment.llr_prescale on the command line, also in the simulators),
- *   NR_LDPC_LLR_PRESCALE_DEFAULT.
+ *   the default of the selected decoder (nrLDPC_decoder_llr_prescale_default(): NR_LDPC_LLR_PRESCALE_DEFAULT for OAI's
+ *   decoder, NR_LDPC_LLR_PRESCALE_DEFAULT_FAST for the fast decoder); "default" in the env/config means the same.
  * "off" restores the legacy conversion bit-exactly. */
 static void llr_prescale_init(void)
 {
@@ -113,7 +116,8 @@ static void llr_prescale_init(void)
     paramdef_t params[] = {
         {"llr_prescale",
          "Qm-dependent gain of the int16 LLRs before the int8 LDPC decoder input: \"g2,g4,g6,g8\" (QPSK..256QAM, any number of layers), "
-         "\"g2,g4,g6,g8/h2,h4,h6,h8\" (1 layer / 2+ layers), \"default\" (" NR_LDPC_LLR_PRESCALE_DEFAULT ") or \"off\"\n",
+         "\"g2,g4,g6,g8/h2,h4,h6,h8\" (1 layer / 2+ layers), \"default\" (decoder oai: " NR_LDPC_LLR_PRESCALE_DEFAULT
+         ", fast: " NR_LDPC_LLR_PRESCALE_DEFAULT_FAST ") or \"off\"\n",
          0,
          .strptr = &cfg,
          .defstrval = "default",
@@ -128,13 +132,16 @@ static void llr_prescale_init(void)
   const char *str = env ? env : cfg ? cfg : "default";
   if (env)
     src = "env OAI_LDPC_LLR_PRESCALE";
+  const nrLDPC_decoder_id_t dec = nrLDPC_decoder_selected();
+  if (!strcasecmp(str, "default") || !strcasecmp(str, "on"))
+    str = nrLDPC_decoder_llr_prescale_default();
   AssertFatal(nrLDPC_llr_prescale_parse(str, &llr_prescale_rule) == 0,
               "invalid LDPC LLR pre-scale \"%s\" (%s): expected \"g2,g4,g6,g8\" or \"g2,g4,g6,g8/h2,h4,h6,h8\" with gains in [1/16,1) or 1,2,4,8, \"default\" or \"off\"\n",
               str,
               src);
   char buf[160];
   nrLDPC_llr_prescale_str(&llr_prescale_rule, buf, sizeof(buf));
-  LOG_I(PHY, "LDPC decoder input LLR pre-scale (%s \"%s\"): %s\n", src, str, buf);
+  LOG_I(PHY, "LDPC decoder input LLR pre-scale (decoder %s, %s \"%s\"): %s\n", nrLDPC_decoder_name(dec), src, str, buf);
 }
 
 static void nr_process_decode_segment(void *arg)
