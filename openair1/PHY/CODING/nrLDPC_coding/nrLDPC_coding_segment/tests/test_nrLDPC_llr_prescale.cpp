@@ -144,6 +144,27 @@ TEST(nrLDPC_llr_prescale, exhaustive_vs_reference)
   }
 }
 
+TEST(nrLDPC_llr_prescale, odd_and_short_lengths)
+{
+  // the segment decoder converts ((Kc * Z) >> 4) + 1 vectors: odd and even counts, down to 1
+  const auto in = all_int16();
+  nr_ldpc_llr_prescale_rule_t r;
+  ASSERT_EQ(nrLDPC_llr_prescale_parse("2,0.25,0.5,0.75/0.25,0.0625,0.5,1", &r), 0);
+  for (int nv : {1, 2, 3, 5, 1633, 4095}) {
+    for (int ly = 0; ly < 2; ly++)
+      for (int q = 2; q <= 8; q += 2) {
+        alignas(16) static int16_t z[NVEC * 16];
+        alignas(16) static int8_t l[NVEC * 16 + 32];
+        memcpy(z, in.data() + 16 * (NVEC - nv), sizeof(int16_t) * 16 * nv); // the large-magnitude end of the range
+        memset(l, 0x55, sizeof(l));
+        nrLDPC_llr_pack_int8(z, l, nv, &r.qm[ly][q]);
+        for (int i = 0; i < 16 * nv; i++)
+          ASSERT_EQ(l[i], ref(z[i], r.qm[ly][q])) << "nvec " << nv << " Qm " << q << " i " << i;
+        ASSERT_EQ(l[16 * nv], 0x55) << "write past nvec*16, nvec " << nv;
+      }
+  }
+}
+
 TEST(nrLDPC_llr_prescale, half_is_symmetric_rounding)
 {
   nr_ldpc_llr_prescale_rule_t r;
