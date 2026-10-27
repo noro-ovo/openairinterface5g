@@ -25,6 +25,7 @@ static void nr_polar_delete_list(t_nrPolar_params *polarParams)
   // From build_polar_tables()
   free(polarParams->rm_tab);
   free(polarParams->enc_rm_src);
+  free(polarParams->enc_rm_byte);
   nr_polar_free_sc_decoder(polarParams);
   if (polarParams->crc_generator_matrix)
     free(polarParams->crc_generator_matrix);
