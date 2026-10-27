@@ -66,30 +66,39 @@ Libraries implementing the slotwise LDPC coding must be named `libldpc<_version>
 
 The segment layer of `libldpc.so` / `libldpc_orig.so` ([nrLDPC_coding_segment_decoder.c](file://../nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_coding_segment_decoder.c))
 converts the int16 channel LLRs of each code block to the int8 decoder input with a saturating pack. The int16 LLRs
-of the PHY are not on a common scale: 16QAM and 64QAM LLRs are several times larger than QPSK LLRs, and 20-50 % of them
-saturate at +-127 after the pack. Before the pack, the segment layer therefore applies a gain that depends on the
-modulation order Qm ([nrLDPC_llr_prescale.h](file://../nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_llr_prescale.h)):
+of the PHY are not on a common scale: 16QAM and 64QAM LLRs are several times larger than QPSK LLRs, the multi-layer
+receivers produce even larger ones, and up to 97 % of them saturate at +-127 after the pack. Before the pack, the
+segment layer therefore applies a gain that depends on the modulation order Qm and on the number of layers
+([nrLDPC_llr_prescale.h](file://../nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_llr_prescale.h)):
 
-| rule | QPSK | 16QAM | 64QAM | 256QAM |
+| layers | QPSK | 16QAM | 64QAM | 256QAM |
 |---|---|---|---|---|
-| `default` | x1 | x1/2 | x1/2 | x1 |
+| 1 | x1 | x1/4 | x1 | x1 |
+| 2 or more | x1/4 | x1/16 | x1/2 | x1 |
 
-The gain is applied in int16 with symmetric rounding (round half away from zero), so it also removes most of the
-saturation; filler bits stay at +127 and punctured/untransmitted positions stay 0. The rule is selected (highest
-priority first) by:
+This default was measured with OAI's decoder and the receivers of this code base, in `nr_ulsim` and `nr_dlsim`. For
+each entry it is the largest tested gain that was not worse than the plain pack at any tested MCS. The gain is
+applied in int16 with symmetric rounding (round half away from zero), so it also removes most of the saturation.
+Filler bits stay at +127 and punctured/untransmitted positions stay 0. The rule is selected (highest priority first) by:
 
 * the environment variable `OAI_LDPC_LLR_PRESCALE` (for experiments),
 * the configuration parameter `llr_prescale` of the section `nrLDPC_coding_segment`, in the configuration file or on
   the command line, e.g. `--nrLDPC_coding_segment.llr_prescale off` (also in `nr_ulsim`/`nr_dlsim`),
 * the built-in default.
 
-Values: `default`, `off` (legacy conversion, bit-exact), or `g2,g4,g6,g8`, the gains for QPSK, 16QAM, 64QAM and 256QAM,
-each in [1/16, 1) or one of 1, 2, 4, 8 (e.g. `1,0.5,0.5,1` = `default`). The active rule is logged at init. Gains of 1
-use the unmodified conversion, so QPSK and 256QAM decoding is bit-exact with the legacy code under the default rule.
+Values:
+* `default`;
+* `off`: legacy conversion, bit-exact;
+* `g2,g4,g6,g8`: the gains for QPSK, 16QAM, 64QAM and 256QAM, for any number of layers;
+* `g2,g4,g6,g8/h2,h4,h6,h8`: `g` for 1 layer, `h` for 2 or more layers.
+
+Each gain must be in [1/16, 1) or one of 1, 2, 4, 8; for example `1,0.25,1,1/0.25,0.0625,0.5,1` is `default`. The
+active rule is logged at init. A gain of 1 uses the unmodified conversion, so those cases stay bit-exact with the
+legacy code. A receiver with a different LLR scale (e.g. a new multi-layer detector) needs its own rule.
 
 The decoder is told what it receives: `t_nrLDPC_dec_params` carries `Qm` (0 = unknown, e.g. `ldpctest`), `nb_layers`
-and `llr_prescale_q8` (the gain above in Q8, 256 = x1). OAI's decoders ignore these fields; they are appended at the
-end of the structure so that decoders built against the previous layout keep working.
+and `llr_prescale_q8` (the gain above in Q8, 256 = x1). OAI's decoders ignore these fields. They are appended at the
+end of the structure, so decoders built against the previous layout keep working.
 
 ## LDPC segment coding
 The interface of the library is defined in [nrLDPC_defs.h](file://../nrLDPC_defs.h) as typedefs of the functions of the interface.
