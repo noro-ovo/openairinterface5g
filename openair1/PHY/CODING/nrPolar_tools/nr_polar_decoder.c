@@ -590,8 +590,8 @@ uint32_t polar_decoder_int16(const int16_t *input,
                              uint8_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
-  const uint N = polarParams->N;
 #ifdef POLAR_CODING_DEBUG
+  const uint N = polarParams->N;
   printf("\nRX\n");
   printf("rm:");
   for (int i = 0; i < N; i++) {
