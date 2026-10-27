@@ -105,8 +105,9 @@ rows_sve2(const uint8_t *base, const uint16_t *off, const uint8_t *cnt, int nrow
     break;
       switch (nch - c0 >= GMAX ? GMAX : nch - c0) {
         CASE(1)
-        CASE(2) CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8) CASE(9) CASE(10) CASE(11) CASE(12) CASE(13) CASE(14) CASE(15)
-            CASE(16) CASE(17) CASE(18) CASE(19) CASE(20) CASE(21) CASE(22) CASE(23) CASE(24)
+        CASE(2)
+        CASE(3) CASE(4) CASE(5) CASE(6) CASE(7) CASE(8) CASE(9) CASE(10) CASE(11) CASE(12) CASE(13) CASE(14) CASE(15) CASE(16)
+            CASE(17) CASE(18) CASE(19) CASE(20) CASE(21) CASE(22) CASE(23) CASE(24)
       }
 #undef CASE
     }
@@ -138,8 +139,9 @@ static inline __attribute__((always_inline)) void tr_sve(const uint8_t *const in
   A = svsli_n_u8(x, y, 4); \
   B = svsri_n_u8(y, x, 4);
   SW(r0, r1, 1, m1)
-  SW(r2, r3, 1, m1) SW(r4, r5, 1, m1) SW(r6, r7, 1, m1) SW(r0, r2, 2, m2) SW(r1, r3, 2, m2) SW(r4, r6, 2, m2) SW(r5, r7, 2, m2)
-      SW4(r0, r4) SW4(r1, r5) SW4(r2, r6) SW4(r3, r7)
+  SW(r2, r3, 1, m1)
+  SW(r4, r5, 1, m1) SW(r6, r7, 1, m1) SW(r0, r2, 2, m2) SW(r1, r3, 2, m2) SW(r4, r6, 2, m2) SW(r5, r7, 2, m2) SW4(r0, r4)
+      SW4(r1, r5) SW4(r2, r6) SW4(r3, r7)
 #undef SW
 #undef SW4
       /* out[8b+u] = r(7-u)[b]: zip byte pairs, then st4 of 16-bit elements (element i of the low halves = byte b+i) */
@@ -210,6 +212,7 @@ static nr_ldpc_tx_kern_t k_sve2 = {.name = "sve2",
                                    .tcols = tcols_sve2,
                                    .tcols_zmin = NR_LDPC_TX_SVE_TCOLS_ZMIN,
                                    .extract = nr_ldpc_tx_extract_neon,
+                                   .merge = nr_ldpc_tx_merge_neon,
                                    .write = nr_ldpc_tx_write_neon};
 const nr_ldpc_tx_kern_t *nr_ldpc_tx_kern_sve2(void)
 {
