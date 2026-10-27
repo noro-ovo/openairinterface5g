@@ -24,6 +24,16 @@ configurations, with one algorithm and one data layout shared by every SIMD targ
 * an OAI drop-in entry point `LDPCdecoder(t_nrLDPC_dec_params*, int8_t*, uint8_t*, t_nrLDPC_time_stats*,
   decode_abort_t*)` with OAI's conventions (input layout, filler +127, output packing, return code, abort flag).
 
+**v3** (this tree, 2026-10-27) adds, on top of v2: layers in ascending row-degree order in every iteration (not for BG1
+R8/9; -0.08 .. -0.26 dB, fewer CRC-mode iterations), iteration-1 kernels for rows with still-zero punctured columns,
+whole filler columns removed from the graph, the SVE2 byte-SQRDMULH input gain (the gain rounding is redefined in
+`ldpc_gain1()`), a NEON+SHA3 (EOR3) kernel chosen by HWCAP_SHA3, AVX-512 bit packing, and `ldpc_decode_batch()` for
+small Z (lane-interleaved code blocks, results identical to single decodes). Experiment switches: `LDPC_DEC_ORDER=0`
+(natural order), `LDPC_DEC_NOIT1`, `LDPC_DEC_NOFILL` (inexact, debugging), `LDPC_DEC_NOSVEGAIN`, `LDPC_DEC_NOSHA3`,
+`LDPC_DEC_SVEPACK`, `LDPC_DEC_NOBATCH`, `LDPC_DEC_BATCHN`, absorbed messages (`-DLDPC_ABSORB` + `LDPC_DEC_ABS=1`),
+reference-only `LDPC_REF_B2D`, `LDPC_REF_TBL`, `LDPC_REF_ABS`, `LDPC_REF_APP16`. All numbers: top-level README
+section 11.
+
 This is the speed-up version of the decoder delivered in the ldpc_orion package (2026-10-23). What changed, why,
 and all before/after numbers: `/home/user/ldpc_speedup/README.md` (in the orion package: `../README.md`).
 

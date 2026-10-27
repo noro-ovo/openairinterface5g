@@ -75,40 +75,69 @@ void ldpc_plan_free(ldpc_plan_t *p)
   p->tabcap = 0;
 }
 
-int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int W, int U, int nshift, int beta, int rmax,
-                    const ldpc_kernels_t *kt)
+int ldpc_plan_build(ldpc_plan_t *p, int bg, int z0, int rcode, int nact, int fc0, int nb, int W, int U, int nshift, int beta,
+                    int rmax, const ldpc_kernels_t *kt)
 {
+  /* nb > 1: nb code blocks interleaved lane-wise (lane t nb + b), i.e. one code of lifting size z0 nb with shifts
+     P nb (ldpc_decode_batch()) */
+  if (nb < 1) nb = 1;
+  const int z = z0 * nb;
   int32_t *tab = p->rdtab;
   const int tabcap = p->tabcap;
   memset(p, 0, sizeof *p);
   p->rdtab = tab;
   p->tabcap = tabcap;
   const int ncol = ldpc_ncol(bg, rcode);
-  if (!ncol || z < 2 || z > 384 || ldpc_ils_of_z[z] == 255) return -1;
-  const int ils = ldpc_ils_of_z[z];
+  if (!ncol || z0 < 2 || z > 384 || ldpc_ils_of_z[z0] == 255) return -1;
+  const int ils = ldpc_ils_of_z[z0];
   const ldpc_bg_edge_t *etab = bg == 1 ? ldpc_bg1_edges : ldpc_bg2_edges;
   const int ntab = bg == 1 ? LDPC_BG1_EDGES : LDPC_BG2_EDGES;
-  p->bg = bg; p->z = z; p->rcode = rcode; p->ncol = ncol;
+  p->bg = bg; p->z = z; p->z0 = z0; p->nb = nb; p->rcode = rcode; p->ncol = ncol;
   p->kbcols = bg == 1 ? 22 : 10;
   const int nrow_full = ncol - p->kbcols;
   /* active rows only (ldpc_active_rows()): the others are exact no-ops. Every column of rows 0..3 has >= 2 edges in
      rows 0..3 (BG1 and BG2), so the kind and clamp of every column read by an active row is the full graph's; the
      degree-1 columns of the skipped rows become unused columns (channel copy, all zero) */
   p->nrow = nact >= LDPC_NCORE && nact < nrow_full ? nact : nrow_full;
-  int ne_full = 0;
-  for (int k = 0; k < ntab; k++) ne_full += etab[k].row < nrow_full;
+  int ne_full = 0, ncore_full = 0;
+  for (int k = 0; k < ntab; k++) {
+    ne_full += etab[k].row < nrow_full;
+    ncore_full += etab[k].row < LDPC_NCORE;
+  }
+  p->fc0 = fc0 > 0 && fc0 < p->kbcols ? fc0 : p->kbcols;
+#define REMOVED(c) ((c) >= p->fc0 && (c) < p->kbcols)
   p->W = W; p->U = U; p->B = W * U;
   p->zp = rup(z, p->B);
   p->nshift = nshift; p->beta = beta; p->rmax = rmax;
   p->lim = ldpc_corr_lim(nshift, beta, rmax);
   const int B = p->B, zp = p->zp, D = B < z ? B : z;
-  /* column degrees within the rows of this rate; the table is row-major */
-  int lastrow_shift[LDPC_MAXCOL];
+  /* layer order (README section 11): rows by ascending degree (stable), in every iteration; else natural */
+  int ordv[LDPC_MAXROW], rdeg[LDPC_MAXROW] = {0}, rpos[LDPC_MAXROW];
   for (int k = 0; k < ntab; k++)
-    if (etab[k].row < p->nrow) {
+    if (etab[k].row < p->nrow && !REMOVED(etab[k].col)) rdeg[etab[k].row]++;
+  for (int i = 0; i < p->nrow; i++) ordv[i] = i;
+  p->ordered = ldpc_row_order(bg, rcode);
+  p->absorb = ldpc_absorb();
+  if (p->ordered)
+    for (int a = 1; a < p->nrow; a++)
+      for (int b = a; b > 0 && rdeg[ordv[b]] < rdeg[ordv[b - 1]]; b--) { const int tt = ordv[b]; ordv[b] = ordv[b - 1]; ordv[b - 1] = tt; }
+  p->core0 = 0;
+  for (int i = 0; i < p->nrow; i++) {
+    rpos[ordv[i]] = i;
+    if (ordv[i] == 0) p->core0 = i;
+  }
+  /* column degrees within the rows of this rate; frame of a column after an iteration = shift of its last row in
+     the plan order */
+  int lastrow_shift[LDPC_MAXCOL], lastpos[LDPC_MAXCOL];
+  for (int c = 0; c < LDPC_MAXCOL; c++) lastpos[c] = -1;
+  for (int k = 0; k < ntab; k++)
+    if (etab[k].row < p->nrow && !REMOVED(etab[k].col)) {
       if (etab[k].col >= ncol) return -1; /* cannot happen with 38.212 base graphs */
       p->cdeg[etab[k].col]++;
-      lastrow_shift[etab[k].col] = etab[k].v[ils] % z;
+      if (rpos[etab[k].row] > lastpos[etab[k].col]) {
+        lastpos[etab[k].col] = rpos[etab[k].row];
+        lastrow_shift[etab[k].col] = etab[k].v[ils] % z0 * nb;
+      }
     }
   /* workspace layout */
   int off = 0;
@@ -135,13 +164,17 @@ int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int W, i
   int ne = 0, ntb = 0, nyt = 0, nyt_core = 0, ncore_edges = 0;
   int prev_shift[LDPC_MAXCOL], visit[LDPC_MAXCOL] = {0}, ed[LDPC_MAXEDGE], erb[LDPC_MAXEDGE];
   for (int c = 0; c < ncol; c++) prev_shift[c] = p->crho[c]; /* frame at the start of an iteration */
+  int zcol[LDPC_MAXCOL] = {0}; /* iteration 1: columns still exactly zero (punctured columns 0, 1 before any update) */
+  zcol[0] = zcol[1] = 1;
   for (int i = 0; i < p->nrow; i++) {
     ldpc_row_t *rw = &p->row[i];
+    const int nr = ordv[i]; /* natural row index */
+    rw->nat = (uint8_t)nr;
     rw->e0 = (uint16_t)ne;
     for (int pass = 0; pass < 2; pass++)
       for (int k = 0; k < ntab; k++) {
-        if (etab[k].row != i) continue;
-        const int c = etab[k].col, s = etab[k].v[ils] % z;
+        if (etab[k].row != nr || REMOVED(etab[k].col)) continue;
+        const int c = etab[k].col, s = etab[k].v[ils] % z0 * nb;
         const int multi = p->ckind[c] == COL_MULTI;
         if (multi != (pass == 0)) continue;
         p->ecol[ne] = (uint8_t)c;
@@ -165,7 +198,18 @@ int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int W, i
         ne++;
       }
     if (rw->nn < 2 || rw->n1 > 1) return -1; /* cannot happen with 38.212 base graphs */
-    if (i == LDPC_NCORE - 1) { /* view after the core rows (CRC-mode early stop) */
+    { /* iteration-1 kind of the row (rows with a degree-1 edge never see a zero column in the 38.212 graphs) */
+      int nz = 0, ze = 0;
+      for (int e = 0; e < rw->nn; e++)
+        if (zcol[p->ecol[rw->e0 + e]]) { nz++; ze = e; }
+      rw->it1 = (uint8_t)(rw->n1 || !nz ? 0 : nz >= 2 ? 1 : 2);
+      rw->ze = (uint8_t)ze;
+      if (rw->it1 == 2) zcol[p->ecol[rw->e0 + ze]] = 0;
+      if (!nz) /* a row without a zero column that writes a column: it is no longer guaranteed zero */
+        for (int e = 0; e < rw->nn; e++) zcol[p->ecol[rw->e0 + e]] = 0;
+      if (rw->n1) for (int e = 0; e < rw->nn; e++) zcol[p->ecol[rw->e0 + e]] = 0;
+    }
+    if (!p->ordered && i == LDPC_NCORE - 1) { /* view after the core rows (CRC-mode early stop) */
       for (int c = 0; c < ncol; c++)
         if (p->ckind[c] == COL_MULTI) {
           p->cbufm[c] = p->cbuf[c] + rbuf(visit[c], p->cdeg[c]) * p->cbsz;
@@ -199,6 +243,8 @@ int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int W, i
     if (kt) {
       rw->fn[0] = kt->row_fn(rw->nn, rw->n1, u, 0);
       rw->fn[1] = kt->row_fn(rw->nn, rw->n1, u, 1);
+      rw->fn1 = rw->it1 ? kt->row_fn(rw->nn, rw->n1, u, rw->it1 + 1) : rw->fn[1];
+      if (!rw->fn1) { rw->it1 = 0; rw->fn1 = rw->fn[1]; }
       if (!rw->fn[0] || !rw->fn[1]) return -1;
     }
   }
@@ -206,7 +252,15 @@ int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int W, i
   /* CRC-mode early stop (core rows + CRC, also after the core rows of an iteration): worth it only if the core rows
      hold at most 60 % of the edges (BG1 R1/3, R2/3, BG2 R1/5, R1/3; not BG1 R8/9 (76 of 79 edges) or BG2 R2/3 (36 of
      52), which keep the full-syndrome rule) */
-  p->midcheck = p->ncore > 0 && 10 * ncore_edges <= 6 * ne_full; /* decided on the full graph of the rate */
+  (void)ncore_edges;
+  if (p->ordered) { /* the core rows (natural 0..3, the largest degrees) must be consecutive: [core0, core0 + 4) */
+    p->ncore = LDPC_NCORE;
+    for (int r = 0; r < LDPC_NCORE; r++)
+      if (p->core0 + r >= p->nrow || p->row[p->core0 + r].nat >= LDPC_NCORE || p->row[p->core0 + r].n1) p->ncore = 0;
+  }
+  p->crcmode = p->ncore > 0 && 10 * ncore_full <= 6 * ne_full; /* decided on the full graph of the rate */
+  p->midcheck = p->crcmode && !p->ordered; /* the view after the core rows exists only in natural order */
+#undef REMOVED
   p->ws_size = (size_t)rup(off, 64) + 64;
   if (!kt) return 0;
   /* read offsets: superchunk k of a multi edge reads the run buf[(d + k B_r) mod Z ..] of its read buffer */
@@ -232,7 +286,7 @@ int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int W, i
       for (int e = 0; e < rw->nn; e++) {
         const int ge = rw->e0 + e;
         p->sytab[rw->yoff + (size_t)k * rw->nn + e] = p->sb[ge] + (int)(((long)p->so[ge] + (long)k * B) % z);
-        if (i < p->ncore) {
+        if (!p->ordered && i < p->ncore) {
           const int c = p->ecol[ge], om = (p->eshift[ge] - p->crhom[c] + z) % z;
           p->sytabm[rw->yoff + (size_t)k * rw->nn + e] = p->cbufm[c] + (int)(((long)om + (long)k * B) % z);
         }
@@ -398,7 +452,7 @@ static tstate_t *tstate(void)
   return t;
 }
 
-static int get_plan(tstate_t *t, ldpc_impl_t impl, int bg, int z, int rcode, int nact, int nshift, int beta, int rmax,
+static int get_plan(tstate_t *t, ldpc_impl_t impl, int bg, int z, int rcode, int nact, int fc0, int nb, int nshift, int beta, int rmax,
                     const ldpc_plan_t **pp, const ldpc_kernels_t **kp)
 {
   if (t->gen != g_gen) {
@@ -407,7 +461,7 @@ static int get_plan(tstate_t *t, ldpc_impl_t impl, int bg, int z, int rcode, int
   }
   for (int i = 0; i < NPLAN; i++) {
     const ldpc_plan_t *p = &t->plan[i];
-    if (t->valid[i] && p->impl == impl && p->bg == bg && p->z == z && p->rcode == rcode && p->nrow == nact &&
+    if (t->valid[i] && p->impl == impl && p->bg == bg && p->z0 == z && p->nb == nb && p->rcode == rcode && p->nrow == nact && p->fc0 == fc0 && p->ordered == ldpc_row_order(bg, rcode) && p->absorb == ldpc_absorb() &&
         p->nshift == nshift && p->beta == beta && p->rmax == rmax) {
       *pp = p; *kp = &t->kern[i];
       return 0;
@@ -418,8 +472,8 @@ static int get_plan(tstate_t *t, ldpc_impl_t impl, int bg, int z, int rcode, int
   t->valid[slot] = 0;
   int W;
   if (!ldpc_impl_available(impl) || !get_kernels(impl, &t->kern[slot], &W)) return -1;
-  const int U = choose_u(z, W);
-  if (ldpc_plan_build(&t->plan[slot], bg, z, rcode, nact, W, U, nshift, beta, rmax, &t->kern[slot])) return -1;
+  const int U = choose_u(z * nb, W);
+  if (ldpc_plan_build(&t->plan[slot], bg, z, rcode, nact, fc0, nb, W, U, nshift, beta, rmax, &t->kern[slot])) return -1;
   t->plan[slot].impl = impl;
   t->valid[slot] = 1;
   *pp = &t->plan[slot]; *kp = &t->kern[slot];
@@ -451,7 +505,7 @@ static int8_t *get_ws(tstate_t *t, size_t sz)
    (G * x fits int16); x' = sat8((x G + 2^(sh-1)) >> sh); fillers [kprime, K) bypass the gain (+127). The gain is
    chosen with integer arithmetic only (the follow-up used doubles; identical except at exact rounding ties). */
 static void read_env(void);
-static int g_agct, g_agcstat, g_agczero, g_allrows;
+static int g_agct, g_agcstat, g_agczero, g_allrows, g_noit1, g_nofill, g_agcstep, g_nosvegain, g_nopack, g_nobatch, g_batchn, g_svepack, g_order = -1, g_absorb;
 /* AGC statistic: 0 = mean |x|, 1 = mean of |x| over the values below the int8 rails (|x| < 127) */
 static int ldpc_agc_stat(void) { read_env(); return g_agcstat; }
 /* target multipliers in percent per modulation order (index qm 0..8; 0 = unknown, 1 = BPSK-like / ldpctest, the
@@ -531,12 +585,12 @@ static long abs_sum(const int8_t *x, int n, int unsat, int step, long *cnt)
 #elif defined(__x86_64__)
   static int avx2 = -1;
   if (avx2 < 0) avx2 = cpu_avx2();
-  if (avx2) {
+  if (avx2 && step <= 32) {
     long c0;
     int done;
     s = abs_sum_avx2(x, n, unsat, step, &c0, &done);
     for (i = done; i < n; i++) {
-      if (step == 32 && ((i >> 4) & 1)) continue;
+      if ((i >> 4) & (step / 16 - 1)) continue;
       const int a = x[i] < 0 ? -x[i] : x[i];
       if (a > 0 && (!unsat || a < 127)) { s += a; c0++; }
     }
@@ -558,7 +612,7 @@ static long abs_sum(const int8_t *x, int n, int unsat, int step, long *cnt)
   c = _mm_cvtsi128_si64(acn) + _mm_cvtsi128_si64(_mm_srli_si128(acn, 8));
 #endif
   for (; i < n; i++) {
-    if (step == 32 && ((i >> 4) & 1)) continue;
+    if ((i >> 4) & (step / 16 - 1)) continue;
     const int a = x[i] < 0 ? -x[i] : x[i];
     if (a > 0 && (!unsat || a < 127)) { s += a; c++; }
   }
@@ -589,7 +643,9 @@ void ldpc_agc_setup(int z, int ncol, int K, int kprime, int nend, int target, co
   long c1, c2;
   const int n2 = n > K ? n - K : 0; /* parity part up to the last non-zero LLR (the tail beyond it is all zero) */
   const int unsat = ldpc_agc_stat();
-  int step = kp - 2 * z + n2 >= 8192 ? 32 : 16; /* large blocks: every other 16-byte group */
+  const int nst = kp - 2 * z + n2; /* sampled statistic: every other 16-byte group from 8 KB */
+  int step = g_agcstep == 1 ? (nst >= 8192 ? 32 : 16) /* v2 rule (experiments) */
+           : g_agcstep ? g_agcstep : nst >= 8192 ? 32 : 16; /* every 4th group (64): not BLER-neutral, README 11 */
   if (g_agczero) step = ncol * z - 2 * z >= 8192 ? 32 : 16;
   const long den = abs_sum(llr + 2 * z, kp - 2 * z, unsat, step, &c1) + abs_sum(llr + K, n2, unsat, step, &c2);
   if (g_agczero) { /* experiments only (LDPC_DEC_AGCZERO=1): the v1 statistic, zeros counted over the whole input */
@@ -648,9 +704,10 @@ SC16(0) SC16(1) SC16(2) SC16(3)
     for (;; i += 16) {                                                                                  \
       if (i + 16 > n) i = n - 16;                                                                       \
       const int8x16_t v = vld1q_s8(src + i);                                                            \
-      const int16x8_t lo = vmull_s8(vget_low_s8(v), g8), hi = vmull_high_s8(v, g16);                    \
-      const int8x16_t y = t_ <= 8 ? vqrshrn_high_n_s16(vqrshrn_n_s16(lo, t_ <= 8 ? t_ : 8), hi, t_ <= 8 ? t_ : 8) \
-                                  : vcombine_s8(vqmovn_s16(vrshrq_n_s16(lo, t_)), vqmovn_s16(vrshrq_n_s16(hi, t_))); \
+      const int8x16_t vs = t_ < 7 ? vqshlq_n_s8(v, t_ < 7 ? 7 - t_ : 0) : v; /* k = 7 - t >= 0: sat8(x << k) */  \
+      const int16x8_t lo = vmull_s8(vget_low_s8(vs), g8), hi = vmull_high_s8(vs, g16);                  \
+      int8x16_t y = vqrshrn_high_n_s16(vqrshrn_n_s16(lo, 7), hi, 7); /* rdmulh(., G) */                   \
+      if (t_ > 7) y = vrshrq_n_s8(y, t_ > 7 ? t_ - 7 : 1);                                                \
       vst1q_s8(dst + i, vmaxq_s8(vminq_s8(y, c), nc));                                                  \
       if (i + 16 >= n) break;                                                                           \
     }                                                                                                   \
@@ -664,22 +721,40 @@ __attribute__((target("avx2"))) static void copy_cond_avx2(int8_t *restrict dst,
                                                           int cmax, int G, int sh)
 {
   const __m256i c = _mm256_set1_epi8((int8_t)cmax), nc = _mm256_set1_epi8((int8_t)-cmax);
-  const int t = G ? sh + s : s;
+  const int t = G ? sh + s : s, kk = 7 - t; /* gain: the byte-SQRDMULH definition of ldpc_gain1() */
   const __m256i gv = _mm256_set1_epi16((int16_t)(G ? G : 1)), rg = _mm256_set1_epi16((int16_t)(t ? 1 << (t - 1) : 0));
-  const __m128i ct = _mm_cvtsi32_si128(t);
+  const __m128i ct = _mm_cvtsi32_si128(t), c7 = _mm_cvtsi32_si128(7);
+  const __m128i ck = _mm_cvtsi32_si128(kk > 0 ? kk : 0), cr = _mm_cvtsi32_si128(kk < 0 ? -kk : 0);
+  const __m256i r64 = _mm256_set1_epi16(64), rr = _mm256_set1_epi16((int16_t)(kk < 0 ? 1 << (-kk - 1) : 0));
+  const __m256i s127 = _mm256_set1_epi16(127), sm128 = _mm256_set1_epi16(-128);
   int i = 0;
   for (;; i += 32) {
     if (i + 32 > n) i = n - 32;
     const __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
     __m256i lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(v)), hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(v, 1));
-    if (G) { lo = _mm256_mullo_epi16(lo, gv); hi = _mm256_mullo_epi16(hi, gv); }
-    lo = _mm256_sra_epi16(_mm256_add_epi16(lo, rg), ct);
-    hi = _mm256_sra_epi16(_mm256_add_epi16(hi, rg), ct);
+    if (G) {
+      if (kk > 0) {
+        lo = _mm256_max_epi16(_mm256_min_epi16(_mm256_sll_epi16(lo, ck), s127), sm128);
+        hi = _mm256_max_epi16(_mm256_min_epi16(_mm256_sll_epi16(hi, ck), s127), sm128);
+      }
+      lo = _mm256_sra_epi16(_mm256_add_epi16(_mm256_mullo_epi16(lo, gv), r64), c7);
+      hi = _mm256_sra_epi16(_mm256_add_epi16(_mm256_mullo_epi16(hi, gv), r64), c7);
+      if (kk < 0) {
+        lo = _mm256_sra_epi16(_mm256_add_epi16(lo, rr), cr);
+        hi = _mm256_sra_epi16(_mm256_add_epi16(hi, rr), cr);
+      }
+    } else {
+      lo = _mm256_sra_epi16(_mm256_add_epi16(lo, rg), ct);
+      hi = _mm256_sra_epi16(_mm256_add_epi16(hi, rg), ct);
+    }
     const __m256i y = _mm256_permute4x64_epi64(_mm256_packs_epi16(lo, hi), 0xD8);
     _mm256_storeu_si256((__m256i *)(void *)(dst + i), _mm256_max_epi8(_mm256_min_epi8(y, c), nc));
     if (i + 32 >= n) break;
   }
 }
+#endif
+#if defined(__aarch64__)
+static __thread int t_sve_gain;
 #endif
 static void copy_cond(int8_t *restrict dst, const int8_t *restrict src, int n, int s, int cmax, int G, int sh)
 {
@@ -691,6 +766,7 @@ static void copy_cond(int8_t *restrict dst, const int8_t *restrict src, int n, i
   if (n >= 16) {
 #if defined(__aarch64__)
     const int8x16_t c = vdupq_n_s8((int8_t)cmax), nc = vdupq_n_s8((int8_t)-cmax);
+    if (G && t_sve_gain && !g_nosvegain) { ldpc_sve2_gain_run(dst, src, n, cmax, G, sh + s); return; }
     if (G) {
       switch (sh + s) {
         case 3: gain_run_3(dst, src, n, c, nc, G); return;
@@ -714,17 +790,32 @@ static void copy_cond(int8_t *restrict dst, const int8_t *restrict src, int n, i
       }
 #elif defined(__x86_64__) && defined(__SSE4_1__)
     const __m128i c = _mm_set1_epi8((int8_t)cmax), nc = _mm_set1_epi8((int8_t)-cmax);
-    const int t = G ? sh + s : s;
+    const int t = G ? sh + s : s, kk = 7 - t; /* gain: the byte-SQRDMULH definition of ldpc_gain1() */
     const __m128i gv = _mm_set1_epi16((int16_t)(G ? G : 1)), rg = _mm_set1_epi16((int16_t)(t ? 1 << (t - 1) : 0));
-    const __m128i ct = _mm_cvtsi32_si128(t);
+    const __m128i ct = _mm_cvtsi32_si128(t), c7 = _mm_cvtsi32_si128(7), r64 = _mm_set1_epi16(64);
+    const __m128i ck = _mm_cvtsi32_si128(kk > 0 ? kk : 0), cr = _mm_cvtsi32_si128(kk < 0 ? -kk : 0);
+    const __m128i rr = _mm_set1_epi16((int16_t)(kk < 0 ? 1 << (-kk - 1) : 0));
+    const __m128i s127 = _mm_set1_epi16(127), sm128 = _mm_set1_epi16(-128);
     int i = 0;
     for (;; i += 16) {
       if (i + 16 > n) i = n - 16;
       const __m128i v = _mm_loadu_si128((const __m128i *)(const void *)(src + i));
       __m128i lo = _mm_cvtepi8_epi16(v), hi = _mm_cvtepi8_epi16(_mm_srli_si128(v, 8));
-      if (G) { lo = _mm_mullo_epi16(lo, gv); hi = _mm_mullo_epi16(hi, gv); }
-      lo = _mm_sra_epi16(_mm_add_epi16(lo, rg), ct);
-      hi = _mm_sra_epi16(_mm_add_epi16(hi, rg), ct);
+      if (G) {
+        if (kk > 0) {
+          lo = _mm_max_epi16(_mm_min_epi16(_mm_sll_epi16(lo, ck), s127), sm128);
+          hi = _mm_max_epi16(_mm_min_epi16(_mm_sll_epi16(hi, ck), s127), sm128);
+        }
+        lo = _mm_sra_epi16(_mm_add_epi16(_mm_mullo_epi16(lo, gv), r64), c7);
+        hi = _mm_sra_epi16(_mm_add_epi16(_mm_mullo_epi16(hi, gv), r64), c7);
+        if (kk < 0) {
+          lo = _mm_sra_epi16(_mm_add_epi16(lo, rr), cr);
+          hi = _mm_sra_epi16(_mm_add_epi16(hi, rr), cr);
+        }
+      } else {
+        lo = _mm_sra_epi16(_mm_add_epi16(lo, rg), ct);
+        hi = _mm_sra_epi16(_mm_add_epi16(hi, rg), ct);
+      }
       const __m128i y = _mm_packs_epi16(lo, hi); /* sat8 (no-gain path: values already in int8 range) */
       _mm_storeu_si128((__m128i *)(void *)(dst + i), _mm_max_epi8(_mm_min_epi8(y, c), nc));
       if (i + 16 >= n) break;
@@ -743,7 +834,6 @@ void ldpc_test_cond(int8_t *dst, const int8_t *src, int n, int s, int cmax, int 
 static void cond_col_run(int8_t *dst, const int8_t *colsrc, int c, int z, int a, int n, int s, int cmax, const ldpc_agc_t *ag)
 {
   copy_cond(dst, colsrc + a, n, s, cmax, ag->G, ag->sh);
-  if (!ag->G) return;
   const int f0 = ag->kp - c * z, f1 = ag->K - c * z; /* filler range in column coordinates */
   const int lo = f0 > a ? f0 : a, hi = f1 < a + n ? f1 : a + n;
   if (lo < hi) memset(dst + (lo - a), ldpc_scale_in(127, s, cmax), (size_t)(hi - lo));
@@ -751,6 +841,9 @@ static void cond_col_run(int8_t *dst, const int8_t *colsrc, int c, int z, int a,
 
 __attribute__((noinline)) static void load_input(const ldpc_plan_t *p, int8_t *ws, const int8_t *llr, int in_shift, const ldpc_agc_t *ag)
 {
+#if defined(__aarch64__)
+  t_sve_gain = p->impl == LDPC_IMPL_SVE2; /* SVE2 byte SQRDMULH gain and predicate bit packing (same results as NEON) */
+#endif
   const int z = p->z, cm = ldpc_chan_max(p->rmax, 0), cm1 = ldpc_chan_max(p->rmax, 1);
   const int D = p->B < z ? p->B : z;
   for (int c = 0; c < p->ncol; c++) {
@@ -799,10 +892,32 @@ static void get_column(const ldpc_plan_t *p, const int8_t *ws, int c, int8_t *ds
 }
 
 /* sign bits of n int8 values, packed MSB first */
+#if defined(__x86_64__)
+static int cpu_avx512(void);
+/* AVX-512BW: bytes reversed within each group of 8 (VPSHUFB), VPMOVB2M, 64 values -> 8 bytes per step */
+__attribute__((target("avx512bw,avx512f"))) static int pack_bits_avx512(const int8_t *v, int n, uint8_t *out)
+{
+  const __m512i rev = _mm512_set_epi64(0x08090a0b0c0d0e0fLL, 0x0001020304050607LL, 0x08090a0b0c0d0e0fLL, 0x0001020304050607LL,
+                                       0x08090a0b0c0d0e0fLL, 0x0001020304050607LL, 0x08090a0b0c0d0e0fLL, 0x0001020304050607LL);
+  int i = 0;
+  for (; i + 64 <= n; i += 64) {
+    const __mmask64 m = _mm512_movepi8_mask(_mm512_shuffle_epi8(_mm512_loadu_si512((const void *)(v + i)), rev));
+    const uint64_t x = (uint64_t)m;
+    memcpy(out + (i >> 3), &x, 8);
+  }
+  return i;
+}
+#endif
 static void pack_bits(const int8_t *v, int n, uint8_t *out)
 {
   int i = 0;
+#if defined(__x86_64__)
+  static int a512 = -1;
+  if (a512 < 0) a512 = cpu_avx512();
+  if (a512 && !g_nopack) i = pack_bits_avx512(v, n, out);
+#endif
 #if defined(__aarch64__)
+  if (t_sve_gain && g_svepack) i = ldpc_sve2_pack_bits(v, n, out); /* experiments only (README 11: no gain) */
   static const uint8_t wgt[16] = {128, 64, 32, 16, 8, 4, 2, 1, 128, 64, 32, 16, 8, 4, 2, 1};
   const uint8x16_t w = vld1q_u8(wgt);
   for (; i + 64 <= n; i += 64) { /* 64 values -> 8 bytes */
@@ -830,6 +945,23 @@ static void pack_bits(const int8_t *v, int n, uint8_t *out)
     for (int k = 0; i + k < n; k++) b |= (uint8_t)((v[i + k] < 0) << (7 - k));
     out[i >> 3] = b;
   }
+}
+
+/* test hook: bit packing (impl selects the SVE2 path on aarch64 like a decode with that implementation) */
+void ldpc_test_pack(const int8_t *v, int n, uint8_t *out, int sve)
+{
+#if defined(__aarch64__)
+  const int o = t_sve_gain;
+  t_sve_gain = sve && ldpc_impl_available(LDPC_IMPL_SVE2);
+  const int sp = g_svepack;
+  g_svepack = sve;
+  pack_bits(v, n, out);
+  g_svepack = sp;
+  t_sve_gain = o;
+#else
+  (void)sve;
+  pack_bits(v, n, out);
+#endif
 }
 
 __attribute__((noinline)) static void write_output(const ldpc_plan_t *p, const int8_t *ws, const int8_t *ref_app, ldpc_out_t mode,
@@ -877,6 +1009,31 @@ static void read_env(void)
   const char *rs = getenv("LDPC_DEC_RSLOPE");
   int v[6];
   if (rs && sscanf(rs, "%d,%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) memcpy(g_rslope, v, sizeof v);
+  const char *abe = getenv("LDPC_DEC_ABS");
+#ifdef LDPC_ABSORB
+  g_absorb = abe && atoi(abe) != 0;
+#else
+  g_absorb = 0; (void)abe; /* the kernels are built without the option */
+#endif
+  const char *ore = getenv("LDPC_DEC_ORDER"); /* 0: natural layer order (v2 algorithm) */
+  g_order = ore ? atoi(ore) != 0 : 1;
+  const char *bnn = getenv("LDPC_DEC_BATCHN"); /* experiments: blocks per interleaved group */
+  g_batchn = bnn ? atoi(bnn) : 0;
+  const char *nbt = getenv("LDPC_DEC_NOBATCH"); /* measurements: ldpc_decode_batch() decodes one block at a time */
+  g_nobatch = nbt && atoi(nbt) != 0;
+  const char *spk = getenv("LDPC_DEC_SVEPACK"); /* experiments: SVE predicate bit packing */
+  g_svepack = spk && atoi(spk) != 0;
+  const char *npk = getenv("LDPC_DEC_NOPACK"); /* measurements: SSSE3 instead of AVX-512 bit packing */
+  g_nopack = npk && atoi(npk) != 0;
+  const char *nsg = getenv("LDPC_DEC_NOSVEGAIN"); /* measurements: NEON gain path also with SVE2 */
+  g_nosvegain = nsg && atoi(nsg) != 0;
+  const char *ase = getenv("LDPC_DEC_AGCSTEP"); /* experiments: fixed sampling step (16, 32, 64) */
+  g_agcstep = ase ? atoi(ase) : 0;
+  if (g_agcstep != 1 && g_agcstep != 16 && g_agcstep != 32 && g_agcstep != 64) g_agcstep = 0;
+  const char *nfe = getenv("LDPC_DEC_NOFILL"); /* debugging only: keep the filler columns (not exact vs the reference) */
+  g_nofill = nfe && atoi(nfe) != 0;
+  const char *n1e = getenv("LDPC_DEC_NOIT1"); /* measurements: no iteration-1 shortcuts */
+  g_noit1 = n1e && atoi(n1e) != 0;
   const char *ar = getenv("LDPC_DEC_ALLROWS");
   g_allrows = ar && atoi(ar) != 0;
   const char *az = getenv("LDPC_DEC_AGCZERO");
@@ -885,6 +1042,8 @@ static void read_env(void)
   g_agcstat = st ? atoi(st) : LDPC_DEC_AGC_STAT;
   __atomic_store_n(&g_env_alg, ok, __ATOMIC_RELEASE);
 }
+int ldpc_absorb(void) { read_env(); return g_absorb; }
+int ldpc_row_order(int bg, int rcode) { read_env(); return g_order && !(bg == 1 && rcode == 89); }
 int ldpc_agc_default(void)
 {
   read_env();
@@ -926,12 +1085,13 @@ static int crc_view(const ldpc_dec_params_t *prm, const ldpc_plan_t *p, const in
   return prm->check_crc(pk, (uint32_t)(prm->kprime > 0 ? prm->kprime : p->kbcols * p->z), prm->crc_type) != 0;
 }
 
-int ldpc_decode(const ldpc_dec_params_t *prm, const int8_t *llr, uint8_t *out, ldpc_dec_stats_t *st)
+/* per-block setup shared by ldpc_decode() and ldpc_decode_batch(): parameters, AGC, active rows, filler columns */
+typedef struct {
+  int ncol, K, nshift, beta, rmax, in_shift, nact, fc0, pz, max_iter;
+  ldpc_agc_t agc;
+} dsetup_t;
+static int dec_setup(const ldpc_dec_params_t *prm, const int8_t *llr, dsetup_t *d)
 {
-  ldpc_dec_stats_t dummy;
-  if (!st) st = &dummy;
-  memset(st, 0, sizeof *st);
-  st->crc_ok = -1;
   const int ncol = ldpc_ncol(prm->bg, prm->rcode);
   if (!ncol || prm->z < 2 || prm->z > 384 || ldpc_ils_of_z[prm->z] == 255) return -1;
   int nshift = prm->nshift, beta = prm->beta, rmax = prm->rmax, in_shift = prm->in_shift;
@@ -951,7 +1111,6 @@ int ldpc_decode(const ldpc_dec_params_t *prm, const int8_t *llr, uint8_t *out, l
   const int nend = ldpc_nend(llr, ncol * prm->z);
   const int nact = g_allrows ? ncol - (prm->bg == 1 ? 22 : 10) /* measurement only: LDPC_DEC_ALLROWS=1 */
                              : ldpc_active_rows(ncol - (prm->bg == 1 ? 22 : 10), prm->bg == 1 ? 22 : 10, prm->z, nend);
-  st->rows = nact;
   /* code rate of the transmitted part: K' / (non-zero span beyond the punctured 2Z, minus the fillers), Q16 */
   const int kpr = prm->kprime > 0 && prm->kprime <= K ? prm->kprime : K;
   const long span = (long)nend - 2 * prm->z - (K - kpr);
@@ -963,7 +1122,27 @@ int ldpc_decode(const ldpc_dec_params_t *prm, const int8_t *llr, uint8_t *out, l
   if (rmax <= 0 || rmax > 127) rmax = LDPC_DEC_DEFAULT_RMAX;
   if (in_shift < 0) in_shift = 0;
   if (in_shift > 3) in_shift = 3;
-  const int max_iter = prm->max_iter < 1 ? 1 : prm->max_iter;
+  d->ncol = ncol; d->K = K; d->nshift = nshift; d->beta = beta; d->rmax = rmax; d->in_shift = in_shift; d->nact = nact;
+  d->agc = agc;
+  d->fc0 = g_nofill ? K / prm->z : ldpc_filler_col0(prm->z, K / prm->z, agc.kp, agc.K);
+  /* punctured columns all zero (as OAI passes them): iteration-1 shortcuts (README section 11) */
+  d->pz = g_noit1 ? 0 : ldpc_nend(llr, 2 * prm->z) == 0;
+  d->max_iter = prm->max_iter < 1 ? 1 : prm->max_iter;
+  return 0;
+}
+
+int ldpc_decode(const ldpc_dec_params_t *prm, const int8_t *llr, uint8_t *out, ldpc_dec_stats_t *st)
+{
+  ldpc_dec_stats_t dummy;
+  if (!st) st = &dummy;
+  memset(st, 0, sizeof *st);
+  st->crc_ok = -1;
+  dsetup_t d;
+  if (dec_setup(prm, llr, &d)) return -1;
+  const int K = d.K, nshift = d.nshift, beta = d.beta, rmax = d.rmax, in_shift = d.in_shift, nact = d.nact;
+  ldpc_agc_t agc = d.agc;
+  st->rows = nact;
+  const int max_iter = d.max_iter;
   ldpc_impl_t impl = prm->impl == LDPC_IMPL_AUTO ? impl_for_z(ldpc_impl_best(), prm->z) : prm->impl;
   int it = 0, ok = 0, crcok = -1; /* crcok: 1 = the early stop already verified the CRC of the output */
   if (impl == LDPC_IMPL_REF) {
@@ -972,34 +1151,36 @@ int ldpc_decode(const ldpc_dec_params_t *prm, const int8_t *llr, uint8_t *out, l
     it = ldpc_ref_decode(prm->bg, prm->z, prm->rcode, nact, max_iter, prm->no_et, nshift, beta, rmax, in_shift, &agc, llr, app, &ok,
                          prm->check_crc ? ref_crc : NULL, (void *)prm);
     static __thread ldpc_plan_t p; /* geometry only (no table is allocated) */
-    ldpc_plan_build(&p, prm->bg, prm->z, prm->rcode, 0, 8, 1, nshift, beta, rmax, NULL);
+    ldpc_plan_build(&p, prm->bg, prm->z, prm->rcode, 0, 0, 1, 8, 1, nshift, beta, rmax, NULL);
     write_output(&p, NULL, app, prm->out_mode, out, 0);
   } else {
     tstate_t *t = tstate();
     const ldpc_plan_t *p;
     const ldpc_kernels_t *k;
-    if (!t || get_plan(t, impl, prm->bg, prm->z, prm->rcode, nact, nshift, beta, rmax, &p, &k)) return -1;
+    if (!t || get_plan(t, impl, prm->bg, prm->z, prm->rcode, nact, d.fc0, 1, nshift, beta, rmax, &p, &k)) return -1;
     int8_t *ws = get_ws(t, p->ws_size);
     if (!ws) return -1;
     load_input(p, ws, llr, in_shift, &agc);
-    const int crcstop = prm->check_crc && !prm->no_et && p->midcheck; /* CRC-mode early stop (README section 5) */
+    const int crcstop = prm->check_crc && !prm->no_et && p->crcmode; /* CRC-mode early stop (README section 5) */
     int mid = 0;
+    const int pz = d.pz;
     while (it < max_iter) {
       if (prm->abort_poll && prm->abort_poll(prm->abort_ctx)) { st->aborted = 1; st->iterations = it; return 0; }
       const int first = it == 0;
       int r = 0;
-      if (crcstop && !first) { /* core rows, then core parity + CRC */
-        for (; r < p->ncore; r++) p->row[r].fn[0](p, &p->row[r], ws);
-        if (k->syndrome(p, ws, p->ncore, p->sytabm) && crc_view(prm, p, ws, out, 1)) { ok = 1; crcok = 1; mid = 1; it++; st->core_stop = 1; break; }
+      if (crcstop && p->midcheck && !first) { /* core rows, then core parity + CRC */
+        for (; r < p->ncore; r++) p->row[r].fn[pz && it == 1 && p->row[r].it1 == 1](p, &p->row[r], ws);
+        if (k->syndrome(p, ws, 0, p->ncore, p->sytabm) && crc_view(prm, p, ws, out, 1)) { ok = 1; crcok = 1; mid = 1; it++; st->core_stop = 1; break; }
       }
-      for (; r < p->nrow; r++) p->row[r].fn[first](p, &p->row[r], ws);
+      if (first) for (; r < p->nrow; r++) (pz ? p->row[r].fn1 : p->row[r].fn[1])(p, &p->row[r], ws);
+      else for (; r < p->nrow; r++) p->row[r].fn[pz && it == 1 && p->row[r].it1 == 1](p, &p->row[r], ws);
       it++;
       if (prm->no_et) {
-        if (it == max_iter) ok = k->syndrome(p, ws, p->nrow, p->sytab);
+        if (it == max_iter) ok = k->syndrome(p, ws, 0, p->nrow, p->sytab);
       } else if (crcstop) {
-        ok = k->syndrome(p, ws, p->ncore, p->sytab);
+        ok = k->syndrome(p, ws, p->core0, p->core0 + p->ncore, p->sytab);
         if (ok && crc_view(prm, p, ws, out, 0)) { crcok = 1; break; }
-      } else if (k->syndrome(p, ws, p->nrow, p->sytab)) {
+      } else if (k->syndrome(p, ws, 0, p->nrow, p->sytab)) {
         ok = 1;
         break;
       }
@@ -1024,4 +1205,161 @@ int ldpc_decode(const ldpc_dec_params_t *prm, const int8_t *llr, uint8_t *out, l
     return st->crc_ok;
   }
   return ok;
+}
+
+/* ---------------------------------------------------------------- batch (small Z) */
+/* natural-order output of block b of a batch plan (lane t nb + b of the interleaved columns) */
+static void write_output_block(const ldpc_plan_t *p, const int8_t *ws, ldpc_out_t mode, uint8_t *out, int b)
+{
+  const int z0 = p->z0, nb = p->nb, ncols = mode == LDPC_OUT_LLR ? p->ncol : p->kbcols;
+  int8_t col[384], tmp[LDPC_MAXCOL * 384];
+  int8_t *dst = mode == LDPC_OUT_LLR ? (int8_t *)out : tmp;
+  for (int c = 0; c < ncols; c++) {
+    get_column(p, ws, c, col, 0);
+    for (int t = 0; t < z0; t++) dst[c * z0 + t] = col[t * nb + b];
+  }
+  if (mode == LDPC_OUT_BITS) pack_bits(tmp, ncols * z0, out);
+  else if (mode == LDPC_OUT_BYTES)
+    for (int i = 0; i < ncols * z0; i++) out[i] = tmp[i] < 0;
+}
+
+int ldpc_decode_batch(const ldpc_dec_params_t *prm, int nblk, const int8_t *const *llr, uint8_t *const *out,
+                      ldpc_dec_stats_t *st, int *ret)
+{
+  if (nblk <= 0) return 0;
+  const int z = prm->z;
+  ldpc_impl_t impl = prm->impl;
+  if (impl == LDPC_IMPL_AUTO) impl = ldpc_impl_best(); /* (a group spans >= 16 lanes) */
+  /* CRC mode, abort polling, the reference, or no room for 2 blocks: one block at a time (identical results) */
+  if (prm->check_crc || prm->abort_poll || impl == LDPC_IMPL_REF || 2 * z > 384 || nblk == 1 || g_nobatch) {
+    for (int b = 0; b < nblk; b++) {
+      ldpc_dec_params_t q = *prm;
+      q.impl = prm->impl;
+      const int r = ldpc_decode(&q, llr[b], out[b], st ? &st[b] : NULL);
+      if (ret) ret[b] = r;
+    }
+    return 0;
+  }
+  dsetup_t ds[384];
+  if (nblk > 384) { /* (large batches: in slices) */
+    for (int b0 = 0; b0 < nblk; b0 += 384) {
+      const int n = nblk - b0 < 384 ? nblk - b0 : 384;
+      if (ldpc_decode_batch(prm, n, llr + b0, out + b0, st ? st + b0 : NULL, ret ? ret + b0 : NULL)) return -1;
+    }
+    return 0;
+  }
+  for (int b = 0; b < nblk; b++)
+    if (dec_setup(prm, llr[b], &ds[b])) return -1;
+  tstate_t *t = tstate();
+  if (!t) return -1;
+  /* blocks per group: fill L lanes (qemu V-op counts on aarch64: one 16-byte vector, n z = 16, is the minimum;
+     x86 timings: about 128 lanes; README section 11); Z >= L: no gain, one block at a time */
+#if defined(__aarch64__)
+  const int L = impl == LDPC_IMPL_SVE2 && ldpc_sve2_bytes() > 16 ? ldpc_sve2_bytes() : 16;
+#else
+  const int L = 128;
+#endif
+  int nbmax = L / z;
+  if (nbmax > 384 / z) nbmax = 384 / z;
+  if (g_batchn > 0) nbmax = g_batchn < 384 / z ? g_batchn : 384 / z;
+  if (nbmax < 2) {
+    for (int b = 0; b < nblk; b++) {
+      const int r = ldpc_decode(prm, llr[b], out[b], st ? &st[b] : NULL);
+      if (ret) ret[b] = r;
+    }
+    return 0;
+  }
+  static __thread int8_t xin[LDPC_MAXCOL * 384];
+  static __thread int8_t mask[384 + 64];
+  for (int b0 = 0; b0 < nblk;) {
+    /* a group: consecutive blocks with the same active rows and filler columns (OAI: the code blocks of one TB) */
+    int n = 1;
+    while (b0 + n < nblk && n < nbmax && ds[b0 + n].nact == ds[b0].nact && ds[b0 + n].fc0 == ds[b0].fc0) n++;
+    const dsetup_t *d0 = &ds[b0];
+    const ldpc_plan_t *p;
+    const ldpc_kernels_t *k;
+    if (n == 1 || get_plan(t, impl, prm->bg, z, prm->rcode, d0->nact, d0->fc0, n, d0->nshift, d0->beta, d0->rmax, &p, &k)) {
+      for (int b = b0; b < b0 + n; b++) { /* single blocks (or no plan): the normal path */
+        const int r = ldpc_decode(prm, llr[b], out[b], st ? &st[b] : NULL);
+        if (ret) ret[b] = r;
+      }
+      b0 += n;
+      continue;
+    }
+    int8_t *ws = get_ws(t, p->ws_size);
+    if (!ws) return -1;
+    /* conditioned input per block (its own AGC gain, fillers, clamps), interleaved lane-wise */
+    const int ncol = d0->ncol, Zi = p->z;
+    int pz = 1;
+    for (int b = 0; b < n; b++) {
+      const dsetup_t *d = &ds[b0 + b];
+      const int8_t *x = llr[b0 + b];
+      pz &= d->pz;
+      for (int c = 0; c < ncol; c++) {
+        const int cm = ldpc_chan_max(d->rmax, p->ckind[c] == COL_DEG1);
+        for (int tt = 0; tt < z; tt++) {
+          const int i = c * z + tt;
+          int8_t v;
+          if (i >= d->agc.kp && i < d->agc.K) v = ldpc_scale_in(127, d->in_shift, cm);
+          else if (d->agc.G) {
+            v = ldpc_gain1(x[i], d->agc.G, d->agc.sh + d->in_shift);
+            v = (int8_t)(v > cm ? cm : v < -cm ? -cm : v);
+          } else v = ldpc_scale_in(x[i], d->in_shift, cm);
+          xin[c * Zi + tt * n + b] = v;
+        }
+      }
+    }
+    ldpc_agc_t id = {0, 0, d0->K, d0->K}; /* already conditioned: no gain, no filler range */
+    load_input(p, ws, xin, 0, &id);
+    const int max_iter = d0->max_iter;
+    int done[384] = {0}, ndone = 0, it = 0;
+    while (it < max_iter && ndone < n) {
+      const int first = it == 0;
+      if (first) for (int r = 0; r < p->nrow; r++) (pz ? p->row[r].fn1 : p->row[r].fn[1])(p, &p->row[r], ws);
+      else for (int r = 0; r < p->nrow; r++) p->row[r].fn[pz && it == 1 && p->row[r].it1 == 1](p, &p->row[r], ws);
+      it++;
+      if (prm->no_et && it < max_iter) continue;
+      memset(mask, 0, (size_t)p->zp);
+      /* rows one at a time; stop as soon as every unfinished block has a violated check (the usual case before
+         convergence): per-block violation = OR of its lanes t n + b over t */
+      for (int r = 0; r < p->nrow; r++) {
+        k->synmask(p, ws, r, r + 1, p->sytab, mask);
+        if (prm->no_et) continue;
+        int8_t acc[384];
+        memcpy(acc, mask, (size_t)n);
+        for (int tt = 1; tt < z; tt++)
+          for (int b = 0; b < n; b++) acc[b] |= mask[tt * n + b];
+        int all = 1;
+        for (int b = 0; b < n && all; b++) all = done[b] || acc[b] < 0;
+        if (all) break;
+      }
+      for (int b = 0; b < n; b++) {
+        if (done[b]) continue;
+        int bad = 0;
+        for (int tt = 0; tt < z && !bad; tt++) bad = mask[tt * n + b] < 0;
+        if (!bad && !prm->no_et) {
+          done[b] = it; ndone++;
+          write_output_block(p, ws, prm->out_mode, out[b0 + b], b);
+          if (st) { memset(&st[b0 + b], 0, sizeof st[0]); st[b0 + b].iterations = it; st[b0 + b].syndrome_ok = 1;
+                    st[b0 + b].crc_ok = -1; st[b0 + b].rows = d0->nact; }
+          if (ret) ret[b0 + b] = 1;
+        } else if (prm->no_et && it == max_iter) {
+          done[b] = -1;
+          write_output_block(p, ws, prm->out_mode, out[b0 + b], b);
+          if (st) { memset(&st[b0 + b], 0, sizeof st[0]); st[b0 + b].iterations = it; st[b0 + b].syndrome_ok = !bad;
+                    st[b0 + b].crc_ok = -1; st[b0 + b].rows = d0->nact; }
+          if (ret) ret[b0 + b] = !bad;
+        }
+      }
+    }
+    for (int b = 0; b < n; b++)
+      if (!done[b]) { /* not converged within max_iter */
+        write_output_block(p, ws, prm->out_mode, out[b0 + b], b);
+        if (st) { memset(&st[b0 + b], 0, sizeof st[0]); st[b0 + b].iterations = it; st[b0 + b].syndrome_ok = 0;
+                  st[b0 + b].crc_ok = -1; st[b0 + b].rows = d0->nact; }
+        if (ret) ret[b0 + b] = 0;
+      }
+    b0 += n;
+  }
+  return 0;
 }

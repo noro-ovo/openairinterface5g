@@ -72,6 +72,14 @@ typedef struct {
    0 on failure, -1 on invalid parameters. */
 int ldpc_decode(const ldpc_dec_params_t *p, const int8_t *llr, uint8_t *out, ldpc_dec_stats_t *st);
 
+/* Decodes nblk code blocks with the same parameters (bg, z, rcode, kprime, ...; e.g. the code blocks of one TB).
+   For small Z, up to 384/Z blocks are interleaved lane-wise and decoded together (each block keeps its own AGC gain
+   and stops when its own syndrome is satisfied: the outputs and stats equal nblk ldpc_decode() calls bit for bit).
+   With a CRC callback, abort polling or the reference implementation the blocks are decoded one by one.
+   llr[b], out[b]: as ldpc_decode(); st, ret: per block (may be NULL). Returns 0, or -1 on invalid parameters. */
+int ldpc_decode_batch(const ldpc_dec_params_t *p, int nblk, const int8_t *const *llr, uint8_t *const *out,
+                      ldpc_dec_stats_t *st, int *ret);
+
 /* name of an implementation; whether it can run on this CPU */
 const char *ldpc_impl_name(ldpc_impl_t impl);
 int ldpc_impl_available(ldpc_impl_t impl);
