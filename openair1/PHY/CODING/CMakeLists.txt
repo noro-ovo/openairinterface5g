@@ -12,11 +12,16 @@ set_target_properties(coding PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_
 target_link_libraries(coding PRIVATE log_headers)
 
 set(NR_LDPC_SELECT nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_decoder_select.c)
+# packed transmit chain (nrLDPC_tx), which also provides LDPCencoder() for ldpctest
+set(NR_LDPC_TX_PACKED nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_coding_segment_encoder_packed.c
+                      nrLDPC_tx/nr_ldpc_tx_oai_encoder.c)
 
-# OAI's original decoder and encoder (reference of ldpctest)
+# reference library: OAI's original decoder and encoder, and the transmit chain built on LDPCencoder() (byte-per-bit
+# codeword, rate matching and interleaving of 8 code blocks per byte, serial bit-plane extraction)
 add_library(ldpc_orig MODULE
             nrLDPC_decoder/nrLDPC_decoder.c
             nrLDPC_encoder/ldpc_encoder.c
+            nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_coding_segment_encoder.c
             ${NR_LDPC_SELECT}
 )
 set_target_properties(ldpc_orig PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -26,11 +31,11 @@ target_link_libraries(ldpc_orig PRIVATE ldpc_segment)
 # select it with --loader.ldpc.shlibversion _oaidec (softmodems, nr_ulsim, nr_dlsim) or ldpctest -v _oaidec
 add_library(ldpc_oaidec MODULE
             nrLDPC_decoder/nrLDPC_decoder.c
-            nrLDPC_encoder/ldpc_encoder_optim8segmulti.c
+            ${NR_LDPC_TX_PACKED}
             ${NR_LDPC_SELECT}
 )
 set_target_properties(ldpc_oaidec PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-target_link_libraries(ldpc_oaidec PRIVATE ldpc_segment)
+target_link_libraries(ldpc_oaidec PRIVATE ldpc_segment ldpc_tx)
 
 # libldpc.so: segment coding library with the fast decoder (nrLDPC_decoder_fast/) and OAI's decoder, chosen at run time
 # by nrLDPC_coding_segment.decoder = fast|oai (config file section or command line) or env OAI_LDPC_DECODER, default
@@ -41,7 +46,7 @@ set_property(CACHE NR_LDPC_DECODER_DEFAULT PROPERTY STRINGS fast oai)
 if (LDPC_DECODER_FAST)
   add_subdirectory(nrLDPC_decoder_fast)
   add_library(ldpc MODULE
-              nrLDPC_encoder/ldpc_encoder_optim8segmulti.c
+              ${NR_LDPC_TX_PACKED}
               ${NR_LDPC_SELECT}
               nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_decoder_oai_renamed.c
               $<TARGET_OBJECTS:ldpc_decoder_fast>
@@ -51,12 +56,12 @@ if (LDPC_DECODER_FAST)
 else()
   add_library(ldpc MODULE
               nrLDPC_decoder/nrLDPC_decoder.c
-              nrLDPC_encoder/ldpc_encoder_optim8segmulti.c
+              ${NR_LDPC_TX_PACKED}
               ${NR_LDPC_SELECT}
   )
 endif()
 set_target_properties(ldpc PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-target_link_libraries(ldpc PRIVATE ldpc_segment)
+target_link_libraries(ldpc PRIVATE ldpc_segment ldpc_tx)
 
 add_dependencies(ldpctest ldpc ldpc_orig ldpc_oaidec)
 add_dependencies(nr-softmodem ldpc ldpc_orig ldpc_oaidec)
@@ -72,5 +77,6 @@ endif()
 add_library(crc_byte OBJECT crc_byte.c)
 
 add_subdirectory(nrLDPC_coding)
+add_subdirectory(nrLDPC_tx)
 add_subdirectory(nrPolar_tools)
 add_subdirectory(nrSmallBlock)
