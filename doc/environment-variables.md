@@ -13,6 +13,12 @@ OAI uses/supports a number of environment variables, documented in the following
 - `OAI_LDPC_LLR_PRESCALE`: overrides the Qm-dependent gain applied to the LLRs before the int8 LDPC decoder input by
   `libldpc.so`/`libldpc_orig.so` (`default`, `off`, `g2,g4,g6,g8` or `g2,g4,g6,g8/h2,h4,h6,h8`; see the configuration parameter
   `nrLDPC_coding_segment.llr_prescale` in [LDPCImplementation.md](../openair1/PHY/CODING/DOC/LDPCImplementation.md))
+- `OAI_LDPC_DECODER`: decoder of `libldpc.so`, `fast` or `oai` (overrides the configuration parameter
+  `nrLDPC_coding_segment.decoder`, see [LDPCImplementation.md](../openair1/PHY/CODING/DOC/LDPCImplementation.md))
+- `OAI_LDPC_DECODER_STATS`, `OAI_LDPC_DECODER_TRACE`: files for the LDPC decoder statistics (iterations, decode time
+  per code block, call digest) and the per-call success trace of `libldpc.so`
+- `LDPC_DEC_IMPL`: forces a kernel of the fast LDPC decoder (`scalar`, `avx2`, `avx512`, `neon`, `sve2`, `ref`); other
+  `LDPC_DEC_*` variables are experiment switches documented in `openair1/PHY/CODING/nrLDPC_decoder_fast/upstream/README.md`
 - `OAI_GDBSTACKS`: if defined when hitting an assertion (`DevAssert()`, `AssertFatal()`, ...), OAI will load `gdb` and provide a backtrace for every thread
 - `OAI_RNGSEED`: provide a fixed seed for random number generators (RNG). If
   this variable is absent, a random seed will be read (from `/dev/urandom`).
