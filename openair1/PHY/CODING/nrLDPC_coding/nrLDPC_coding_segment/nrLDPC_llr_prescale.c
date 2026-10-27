@@ -108,14 +108,25 @@ void nrLDPC_llr_pack_int8(const int16_t *z, int8_t *l, int nvec, const nr_ldpc_l
 
   if (mode == NR_LDPC_LLR_PRESCALE_FRAC) {
     // y = sign(x) * round(|x| * gain): mulhrs on |x| rounds half away from zero, so the gain is symmetric in the
-    // LLR sign; x = -32768 is first limited to -32767 so that |x| fits in int16
-    const simde__m128i m = simde_mm_set1_epi16(ps->q15);
-    const simde__m128i lo = simde_mm_set1_epi16(-32767);
-    for (int i = 0, j = 0; j < nvec; i += 2, j++) {
-      const simde__m128i x0 = simde_mm_max_epi16(pv[i], lo);
-      const simde__m128i x1 = simde_mm_max_epi16(pv[i + 1], lo);
-      const simde__m128i y0 = simde_mm_sign_epi16(simde_mm_mulhrs_epi16(simde_mm_abs_epi16(x0), m), x0);
-      const simde__m128i y1 = simde_mm_sign_epi16(simde_mm_mulhrs_epi16(simde_mm_abs_epi16(x1), m), x1);
+    // LLR sign; x = -32768 is first limited to -32767 so that |x| fits in int16. 256-bit vectors (the in-lane packs
+    // is reordered by the 64-bit permute), 128-bit tail.
+    const simde__m256i m = simde_mm256_set1_epi16(ps->q15);
+    const simde__m256i lo = simde_mm256_set1_epi16(-32767);
+    int j = 0;
+    for (; j + 2 <= nvec; j += 2) {
+      const simde__m256i x0 = simde_mm256_max_epi16(simde_mm256_loadu_si256((const simde__m256i *)(z + 16 * j)), lo);
+      const simde__m256i x1 = simde_mm256_max_epi16(simde_mm256_loadu_si256((const simde__m256i *)(z + 16 * j + 16)), lo);
+      const simde__m256i y0 = simde_mm256_sign_epi16(simde_mm256_mulhrs_epi16(simde_mm256_abs_epi16(x0), m), x0);
+      const simde__m256i y1 = simde_mm256_sign_epi16(simde_mm256_mulhrs_epi16(simde_mm256_abs_epi16(x1), m), x1);
+      simde_mm256_storeu_si256((simde__m256i *)(l + 16 * j), simde_mm256_permute4x64_epi64(simde_mm256_packs_epi16(y0, y1), 0xd8));
+    }
+    if (j < nvec) {
+      const simde__m128i m1 = simde_mm256_castsi256_si128(m);
+      const simde__m128i lo1 = simde_mm256_castsi256_si128(lo);
+      const simde__m128i x0 = simde_mm_max_epi16(pv[2 * j], lo1);
+      const simde__m128i x1 = simde_mm_max_epi16(pv[2 * j + 1], lo1);
+      const simde__m128i y0 = simde_mm_sign_epi16(simde_mm_mulhrs_epi16(simde_mm_abs_epi16(x0), m1), x0);
+      const simde__m128i y1 = simde_mm_sign_epi16(simde_mm_mulhrs_epi16(simde_mm_abs_epi16(x1), m1), x1);
       pl[j] = simde_mm_packs_epi16(y0, y1);
     }
   } else if (mode == NR_LDPC_LLR_PRESCALE_LSHIFT) {
