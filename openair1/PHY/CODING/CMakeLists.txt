@@ -36,7 +36,7 @@ if (ENABLE_TESTS)
   add_dependencies(tests ldpc ldpc_orig)
 endif()
 
-add_library(crc_byte OBJECT crc_byte.c)
+add_library(crc_byte OBJECT crc_byte.c crc_fold.c)
 
 add_subdirectory(nrLDPC_coding)
 add_subdirectory(nrPolar_tools)
