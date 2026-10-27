@@ -30,8 +30,8 @@ typedef struct {
 
 void crc_fold_init(crc_fold_ctx_t *ctx, uint32_t poly, const uint32_t *table);
 
-/* crc of len bytes; false (nothing computed) when no kernel is available or len < the kernel's minimum */
-bool crc_fold(const crc_fold_ctx_t *ctx, const uint8_t *data, uint32_t len, uint32_t *crc);
+/* crc of len bytes, or -1 (nothing computed) when no kernel is available or len < the kernel's minimum */
+int64_t crc_fold(const crc_fold_ctx_t *ctx, const uint8_t *data, uint32_t len);
 
 /* kernel selection for tests and benchmarks: "off", "pclmul", "vpclmul", "pmull" (best available when NULL);
  * returns false when the kernel is not available on this CPU. Not thread safe. */
