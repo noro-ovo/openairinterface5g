@@ -38,22 +38,29 @@ typedef struct {
   uint16_t q8; ///< gain in Q8 (reported to the decoder in t_nrLDPC_dec_params.llr_prescale_q8)
 } nr_ldpc_llr_prescale_t;
 
-/// per-Qm table, index = Qm (0..8); entries for Qm not in {2,4,6,8} are always x1
+/// per-Qm tables, index [nb_layers > 1][Qm (0..8)]; entries for Qm not in {2,4,6,8} are always x1
 typedef struct {
-  nr_ldpc_llr_prescale_t qm[NR_LDPC_LLR_PRESCALE_MAX_QM + 1];
+  nr_ldpc_llr_prescale_t qm[2][NR_LDPC_LLR_PRESCALE_MAX_QM + 1];
 } nr_ldpc_llr_prescale_rule_t;
 
 /**
  * \brief parse a rule string into a table
- * \param str "g2,g4,g6,g8" (gains for QPSK, 16QAM, 64QAM, 256QAM, e.g. "1,0.5,0.5,1"), "default" (= NR_LDPC_LLR_PRESCALE_DEFAULT),
- *            or "off" / "none" / "0" (all x1 = legacy pack, bit-exact)
+ * \param str "g2,g4,g6,g8" (gains for QPSK, 16QAM, 64QAM, 256QAM, e.g. "1,0.5,0.5,1", for any number of layers),
+ *            "g2,g4,g6,g8/h2,h4,h6,h8" (g for 1 layer, h for 2 or more layers),
+ *            "default" (= NR_LDPC_LLR_PRESCALE_DEFAULT), or "off" / "none" / "0" (all x1 = legacy pack, bit-exact)
  * \param rule output table
  * \return 0 on success, -1 on a syntax error or a gain outside the allowed set (rule then holds all x1)
  */
 int nrLDPC_llr_prescale_parse(const char *str, nr_ldpc_llr_prescale_rule_t *rule);
 
-/// print the rule as "QPSK x.. 16QAM x.. 64QAM x.. 256QAM x.." into buf
+/// print the rule as "1 layer: QPSK x.. 16QAM x.. 64QAM x.. 256QAM x..; 2+ layers: ..." into buf
 void nrLDPC_llr_prescale_str(const nr_ldpc_llr_prescale_rule_t *rule, char *buf, int len);
+
+/// gain for a transport block of modulation order Qm with nb_layers layers (NULL = x1 for Qm > 8)
+static inline const nr_ldpc_llr_prescale_t *nrLDPC_llr_prescale_get(const nr_ldpc_llr_prescale_rule_t *rule, int Qm, int nb_layers)
+{
+  return Qm >= 0 && Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? &rule->qm[nb_layers > 1][Qm] : 0;
+}
 
 /**
  * \brief saturating int16 -> int8 conversion with the gain of one modulation order
