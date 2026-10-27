@@ -52,6 +52,7 @@ typedef struct {
   int n_info;
   uint8_t rm_mode; // 0 repetition, 1 puncturing, 2 shortening
   uint8_t blk_perm[32]; // sub-block interleaver pattern
+  uint16_t *rr_src; // with coded bit interleaving and E <= N: root LLR j = input[rr_src[j]] (E: fill value)
   void *mem;
 } nr_polar_sc_t;
 
