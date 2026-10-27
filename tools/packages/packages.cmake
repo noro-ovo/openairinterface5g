@@ -348,11 +348,11 @@ if(PACKAGING_COMMON)
     telnetsrv: built-in server that lets you remotely monitor and interact with a running softmodem for debugging and testing
     coding: handles all physical-layer channel coding, decoding, and error-checking operations
     rfsimulator: emulates radio front-end to enables simulation of boardless RF transmissions and receptions
-    ldpc and ldpc_orig: two versions of LDPC implementation, first one is optimized but second one is simpler and easier to read
+    ldpc, ldpc_oaidec and ldpc_orig: LDPC implementations; ldpc has the fast decoder (default) and OAI's decoder (nrLDPC_coding_segment.decoder = fast|oai), ldpc_oaidec OAI's decoder only, ldpc_orig is simpler and easier to read
     vrtsim: allows end-to-end PHY/MAC testing, does not requires real hardware")
   if(PACKAGING_RPM)
     set(CPACK_RPM_LIBOAI-COMMON_PACKAGE_REQUIRES "libconfig-devel >= 1.4.9")
-    set(CPACK_RPM_LIBOAI-COMMON_PACKAGE_PROVIDES "libcoding.so()(64bit), libdfts.so()(64bit), libldpc.so()(64bit), libldpc_orig.so()(64bit), liboai_iqplayer.so()(64bit), libparams_libconfig.so()(64bit), libparams_yaml.so()(64bit), librfsimulator.so()(64bit), libtelnetsrv.so()(64bit), libvrtsim.so()(64bit)")
+    set(CPACK_RPM_LIBOAI-COMMON_PACKAGE_PROVIDES "libcoding.so()(64bit), libdfts.so()(64bit), libldpc.so()(64bit), libldpc_oaidec.so()(64bit), libldpc_orig.so()(64bit), liboai_iqplayer.so()(64bit), libparams_libconfig.so()(64bit), libparams_yaml.so()(64bit), librfsimulator.so()(64bit), libtelnetsrv.so()(64bit), libvrtsim.so()(64bit)")
     set(CPACK_RPM_LIBOAI-COMMON_PACKAGE_RELOCATABLE FALSE)
     set(CPACK_RPM_PACKAGE_LIBOAI-COMMON_SUMMARY "OpenAirInterface shared libraries package")
     set(CPACK_RPM_PACKAGE_LIBOAI-COMMON_DESCRIPTION "${COMMON_PACKAGE_DESCRIPTION}")
@@ -401,7 +401,7 @@ if(PACKAGING_COMMON)
 
 
   #Add the targets to the package
-  install(TARGETS params_libconfig dfts oai_iqplayer params_yaml telnetsrv coding rfsimulator ldpc_orig ldpc vrtsim
+  install(TARGETS params_libconfig dfts oai_iqplayer params_yaml telnetsrv coding rfsimulator ldpc_orig ldpc ldpc_oaidec vrtsim
           COMPONENT liboai-common
           RUNTIME DESTINATION /usr/bin
           LIBRARY DESTINATION /usr/lib
