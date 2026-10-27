@@ -312,7 +312,14 @@ static inline __attribute__((always_inline)) uint64_t plane64(const uint8_t *f, 
   return vgetq_lane_u64(vreinterpretq_u64_u8(vpaddq_u8(c, c)), 0);
 }
 
-void nr_ldpc_tx_extract_neon(int qm, const uint8_t *const src[8], int L, uint8_t *stage, uint64_t *w, unsigned planes)
+void nr_ldpc_tx_extract_neon(int qm,
+                             const uint8_t *const src[8],
+                             const uint8_t *const src2[8],
+                             uint8_t m2,
+                             int L,
+                             uint8_t *stage,
+                             uint64_t *w,
+                             unsigned planes)
 {
   if (__builtin_popcount(planes) <= 2) {
     /* few code blocks: natural order, one bit plane at a time */
@@ -333,39 +340,64 @@ void nr_ldpc_tx_extract_neon(int qm, const uint8_t *const src[8], int L, uint8_t
     return;
   }
   const int nb = (qm * L + 127) >> 7;
+  /* two rate-matched lengths: bits of the code blocks in m2 from the second stream set (BSL) */
+  const int mg = src2 != NULL;
+  const uint8x16_t mv = vdupq_n_u8(m2);
+#define MRG(v, p, o) v = vbslq_u8(mv, vld1q_u8((p) + (o)), v)
   switch (qm) {
-    case 8: {
-      const uint8_t *s0 = src[0], *s1 = src[1], *s2 = src[2], *s3 = src[3];
-      const uint8_t *s4 = src[4], *s5 = src[5], *s6 = src[6], *s7 = src[7];
+    case 8:
       for (int b = 0; b < nb; b++) {
-        uint8x16_t r0 = vld1q_u8(s0 + 16 * b), r1 = vld1q_u8(s1 + 16 * b), r2 = vld1q_u8(s2 + 16 * b);
-        uint8x16_t r3 = vld1q_u8(s3 + 16 * b), r4 = vld1q_u8(s4 + 16 * b), r5 = vld1q_u8(s5 + 16 * b);
-        uint8x16_t r6 = vld1q_u8(s6 + 16 * b), r7 = vld1q_u8(s7 + 16 * b);
+        uint8x16_t r0 = vld1q_u8(src[0] + 16 * b), r1 = vld1q_u8(src[1] + 16 * b), r2 = vld1q_u8(src[2] + 16 * b);
+        uint8x16_t r3 = vld1q_u8(src[3] + 16 * b), r4 = vld1q_u8(src[4] + 16 * b), r5 = vld1q_u8(src[5] + 16 * b);
+        uint8x16_t r6 = vld1q_u8(src[6] + 16 * b), r7 = vld1q_u8(src[7] + 16 * b);
+        if (mg) {
+          MRG(r0, src2[0], 16 * b);
+          MRG(r1, src2[1], 16 * b);
+          MRG(r2, src2[2], 16 * b);
+          MRG(r3, src2[3], 16 * b);
+          MRG(r4, src2[4], 16 * b);
+          MRG(r5, src2[5], 16 * b);
+          MRG(r6, src2[6], 16 * b);
+          MRG(r7, src2[7], 16 * b);
+        }
         TR8(r0, r1, r2, r3, r4, r5, r6, r7);
         STALL(r0, r1, r2, r3, r4, r5, r6, r7);
       }
-    } break;
-    case 4: {
-      const uint8_t *s0 = src[0], *s1 = src[1], *s2 = src[2], *s3 = src[3];
+      break;
+    case 4:
       for (int b = 0; b < nb; b++) {
-        const uint8x16x2_t a0 = vld2q_u8(s0 + 32 * b), a1 = vld2q_u8(s1 + 32 * b);
-        const uint8x16x2_t a2 = vld2q_u8(s2 + 32 * b), a3 = vld2q_u8(s3 + 32 * b);
-        uint8x16_t r0 = a0.val[0], r1 = a1.val[0], r2 = a2.val[0], r3 = a3.val[0];
-        uint8x16_t r4 = a0.val[1], r5 = a1.val[1], r6 = a2.val[1], r7 = a3.val[1];
+        uint8x16x2_t a[4];
+        for (int k = 0; k < 4; k++) {
+          a[k] = vld2q_u8(src[k] + 32 * b);
+          if (mg) {
+            const uint8x16x2_t c = vld2q_u8(src2[k] + 32 * b);
+            a[k].val[0] = vbslq_u8(mv, c.val[0], a[k].val[0]);
+            a[k].val[1] = vbslq_u8(mv, c.val[1], a[k].val[1]);
+          }
+        }
+        uint8x16_t r0 = a[0].val[0], r1 = a[1].val[0], r2 = a[2].val[0], r3 = a[3].val[0];
+        uint8x16_t r4 = a[0].val[1], r5 = a[1].val[1], r6 = a[2].val[1], r7 = a[3].val[1];
         TR8(r0, r1, r2, r3, r4, r5, r6, r7);
         STALL(r0, r1, r2, r3, r4, r5, r6, r7);
       }
-    } break;
-    case 2: {
-      const uint8_t *s0 = src[0], *s1 = src[1];
+      break;
+    case 2:
       for (int b = 0; b < nb; b++) {
-        const uint8x16x4_t a = vld4q_u8(s0 + 64 * b), c = vld4q_u8(s1 + 64 * b);
+        uint8x16x4_t a = vld4q_u8(src[0] + 64 * b), c = vld4q_u8(src[1] + 64 * b);
+        if (mg) {
+          const uint8x16x4_t a2 = vld4q_u8(src2[0] + 64 * b), c2 = vld4q_u8(src2[1] + 64 * b);
+          for (int k = 0; k < 4; k++) {
+            a.val[k] = vbslq_u8(mv, a2.val[k], a.val[k]);
+            c.val[k] = vbslq_u8(mv, c2.val[k], c.val[k]);
+          }
+        }
         uint8x16_t r0 = a.val[0], r1 = c.val[0], r2 = a.val[1], r3 = c.val[1];
         uint8x16_t r4 = a.val[2], r5 = c.val[2], r6 = a.val[3], r7 = c.val[3];
         TR8(r0, r1, r2, r3, r4, r5, r6, r7);
         STALL(r0, r1, r2, r3, r4, r5, r6, r7);
       }
-    } break;
+      break;
+#undef MRG
     case 6:
       interleave6_neon(src, L, stage);
       for (int b = 0; b < nb; b++)
@@ -380,6 +412,12 @@ void nr_ldpc_tx_extract_neon(int qm, const uint8_t *const src[8], int L, uint8_t
 #undef STW
 #undef STALL
 #undef TR8
+
+/* the lane-register paths (more than 2 code blocks, Qm 2, 4, 8) take a second stream set */
+int nr_ldpc_tx_merge_neon(int qm, unsigned planes)
+{
+  return (qm == 2 || qm == 4 || qm == 8) && __builtin_popcount(planes) > 2;
+}
 
 void nr_ldpc_tx_write_neon(uint64_t *dst, const uint64_t *w, int n, int sh)
 {
@@ -406,6 +444,7 @@ static const nr_ldpc_tx_kern_t k_neon = {.name = "neon",
                                          .tcols_zmin = NR_LDPC_TX_NEON_TCOLS_ZMIN,
                                          .tcols_use = tcols_use_neon,
                                          .extract = nr_ldpc_tx_extract_neon,
+                                         .merge = nr_ldpc_tx_merge_neon,
                                          .write = nr_ldpc_tx_write_neon};
 static const nr_ldpc_tx_kern_t k_neon3 = {.name = "neon-eor3",
                                           .rows = rows_neon3,
@@ -415,6 +454,7 @@ static const nr_ldpc_tx_kern_t k_neon3 = {.name = "neon-eor3",
                                           .tcols_zmin = NR_LDPC_TX_NEON_TCOLS_ZMIN,
                                           .tcols_use = tcols_use_neon,
                                           .extract = nr_ldpc_tx_extract_neon,
+                                          .merge = nr_ldpc_tx_merge_neon,
                                           .write = nr_ldpc_tx_write_neon};
 const nr_ldpc_tx_kern_t *nr_ldpc_tx_kern_neon(void)
 {

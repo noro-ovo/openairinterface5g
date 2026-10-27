@@ -390,20 +390,36 @@ static inline void or_word(uint64_t *p, uint64_t v)
     __atomic_fetch_or(p, v, __ATOMIC_RELAXED);
 }
 
-/* one pass over the interleaved sequence of length E for the code blocks of mask `planes` */
+/*
+ * One pass over the interleaved sequences of the code blocks of mask `planes`. Their lengths E[j] take one value, or
+ * two values E1 < E2: then either Qm = 1 (the single stream starts at the same rank for both lengths) or the kernel
+ * merges two stream sets (src: the streams of E1, src2: those of E2, m2: the code blocks with E2). Positions past
+ * a code block's own E are dropped.
+ */
 static void out_pass(const nr_ldpc_tx_kern_t *kern,
                      const rm_t *rm,
                      uint32_t rank0,
                      int qm,
-                     uint32_t E,
+                     const uint32_t *E,
                      unsigned planes,
                      const uint32_t *bit0, /* per code block: bit offset relative to out64 */
                      uint64_t *out64)
 {
   uint8_t stage[NR_LDPC_TX_STAGE] __attribute__((aligned(64)));
-  uint8_t scratch[NR_LDPC_TX_CH + 8 * NR_LDPC_TX_OVERREAD] __attribute__((aligned(64)));
+  uint8_t scratch[2][NR_LDPC_TX_CH + 8 * NR_LDPC_TX_OVERREAD] __attribute__((aligned(64)));
   uint64_t W[8][NR_LDPC_TX_WS] __attribute__((aligned(64)));
-  const uint32_t EQm = E / qm;
+  uint32_t E1 = ~0u, E2 = 0;
+  for (int j = 0; j < 8; j++)
+    if (planes >> j & 1) {
+      E1 = E[j] < E1 ? E[j] : E1;
+      E2 = E[j] > E2 ? E[j] : E2;
+    }
+  uint8_t m2 = 0;
+  for (int j = 0; j < 8; j++)
+    if ((planes >> j & 1) && E[j] == E2 && E1 != E2)
+      m2 |= 1 << j;
+  const int merged = m2 && qm > 1;
+  const uint32_t EQm1 = E1 / qm, EQm2 = E2 / qm;
   const int sstride = NR_LDPC_TX_CH / qm + NR_LDPC_TX_OVERREAD;
   uint32_t w0[8], g_lo[8], g_hi[8];
   int sh[8];
@@ -414,23 +430,32 @@ static void out_pass(const nr_ldpc_tx_kern_t *kern,
     w0[j] = bit0[j] >> 6;
     sh[j] = bit0[j] & 63;
     g_lo[j] = sh[j] != 0;
-    g_hi[j] = (sh[j] + E) >> 6;
+    g_hi[j] = (sh[j] + E[j]) >> 6;
   }
-  for (uint32_t i0 = 0; i0 < E; i0 += NR_LDPC_TX_CH) {
-    const int n = E - i0 < NR_LDPC_TX_CH ? (int)(E - i0) : NR_LDPC_TX_CH;
-    const int L = n / qm, nw = (n + 63) >> 6;
+  for (uint32_t i0 = 0; i0 < E2; i0 += NR_LDPC_TX_CH) {
+    const int n = E2 - i0 < NR_LDPC_TX_CH ? (int)(E2 - i0) : NR_LDPC_TX_CH;
+    const int L = n / qm;
     const uint32_t t0 = i0 / qm, g0 = i0 >> 6;
-    const uint8_t *src[8];
-    for (int q = 0; q < qm; q++)
-      src[q] = e_span(rm, rank0 + q * EQm + t0, L, scratch + q * sstride);
-    kern->extract(qm, src, L, stage, &W[0][1], planes);
-    const int last = i0 + n == E;
+    const uint8_t *src[8], *src2[8];
+    for (int q = 0; q < qm; q++) {
+      src[q] = e_span(rm, rank0 + q * EQm1 + t0, L, scratch[0] + q * sstride);
+      if (merged)
+        src2[q] = e_span(rm, rank0 + q * EQm2 + t0, L, scratch[1] + q * sstride);
+    }
+    /* the kernel gets the whole set (it selects its path from it, and merge() was asked for it) */
+    kern->extract(qm, src, merged ? src2 : NULL, m2, L, stage, &W[0][1], planes);
+    unsigned active = 0; /* code blocks with positions left in this chunk */
+    for (int j = 0; j < 8; j++)
+      if ((planes >> j & 1) && E[j] > i0)
+        active |= 1u << j;
     for (int j = 0; j < 8; j++) {
-      if (!(planes >> j & 1))
+      if (!(active >> j & 1))
         continue;
+      const int nj = E[j] - i0 < (uint32_t)n ? (int)(E[j] - i0) : n, nw = (nj + 63) >> 6;
+      const int last = i0 + nj == E[j];
       uint64_t *w = &W[j][1];
-      if (last && (n & 63))
-        w[nw - 1] &= ~0ULL >> (64 - (n & 63));
+      if (last && (nj & 63))
+        w[nw - 1] &= ~0ULL >> (64 - (nj & 63));
       /* words g0 .. g0+nw-1: interior run [a, b) stored by the kernel, the edge words ORed */
       uint32_t a = g_lo[j] > g0 ? g_lo[j] : g0, b = g_hi[j] < g0 + nw ? g_hi[j] : g0 + nw;
       if (b < a)
@@ -501,19 +526,29 @@ int nr_ldpc_tx_encode(const nr_ldpc_tx_params_t *prm,
   uint32_t bit0[8] = {0};
   for (int j = 0; j < n; j++)
     bit0[j] = Eoff[j] + 8 * mis;
-  /* one pass per distinct E (a transport block has at most two values; the 8-code-block extraction costs about the
-   * same per pass as merging the two stream sets byte-wise would) */
+  /* A transport block has at most two E values (nr_get_E). Code blocks with both lengths share a pass when the
+   * kernel can merge the two stream sets in registers (or Qm = 1), otherwise one pass per length. */
   unsigned todo = 0;
   for (int j = 0; j < n; j++)
     if (E[j])
       todo |= 1u << j;
   while (todo) {
-    const uint32_t e = E[__builtin_ctz(todo)];
-    unsigned planes = 0;
+    const uint32_t ea = E[__builtin_ctz(todo)];
+    unsigned pa = 0, pb = 0;
+    uint32_t eb = ea;
     for (int j = 0; j < n; j++)
-      if ((todo >> j & 1) && E[j] == e)
-        planes |= 1u << j;
-    out_pass(g_kern, &rm, rank0, qm, e, planes, bit0, out64);
+      if (todo >> j & 1) {
+        if (E[j] == ea)
+          pa |= 1u << j;
+        else if (eb == ea || E[j] == eb) {
+          eb = E[j];
+          pb |= 1u << j;
+        }
+      }
+    unsigned planes = pa;
+    if (pb && (qm == 1 || (g_kern->merge && g_kern->merge(qm, pa | pb))))
+      planes |= pb;
+    out_pass(g_kern, &rm, rank0, qm, E, planes, bit0, out64);
     todo &= ~planes;
   }
   return 0;
