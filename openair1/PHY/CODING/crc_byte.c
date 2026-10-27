@@ -16,6 +16,7 @@
 
 #include "coding_defs.h"
 #include "assertions.h"
+#include "crc_fold.h"
 /*ref 36-212 v8.6.0 , pp 8-9 */
 /* the highest degree is set by default */
 
@@ -75,6 +76,23 @@ static uint32_t crc12Table[256];
 static uint32_t crc11Table[256];
 static uint32_t crc8Table[256];
 static uint32_t crc6Table[256];
+static uint32_t crc16Table32[256]; /* crc16Table << 16, for crc_fold() */
+
+/* multi-lane PCLMULQDQ / PMULL folding for whole bytes (crc_fold.c) */
+static crc_fold_ctx_t fold24a, fold24b, fold16;
+/* x86: shorter messages stay on crc32_calc_pclmulqdq() / the table; aarch64: crc_fold() takes the table below 16 bytes
+ * (cheaper than SIMDe's PCLMULQDQ emulation in builds without the crypto extension) */
+#if defined(__aarch64__)
+#define CRC_FOLD_MIN_BYTES 1
+#else
+#define CRC_FOLD_MIN_BYTES 64
+#endif
+
+/* table state after the whole bytes from crc_fold(), false when it does not handle them */
+static inline bool crc_fold_bytes(const crc_fold_ctx_t *ctx, const unsigned char *inptr, int octetlen, uint32_t *crc)
+{
+  return octetlen >= CRC_FOLD_MIN_BYTES && crc_fold(ctx, inptr, octetlen, crc);
+}
 
 #if USE_INTEL_CRC
 static const struct crc_pclmulqdq_ctx lte_crc24a_pclmulqdq __attribute__((aligned(16))) = {
@@ -107,7 +125,12 @@ void crcTableInit (void)
     crc11Table[c] = crcbit(&c, 1, poly11) >> 16;
     crc8Table[c] = crcbit(&c, 1, poly8) >> 24;
     crc6Table[c] = crcbit(&c, 1, poly6) >> 24;
+    crc16Table32[c] = crcbit(&c, 1, poly16);
   } while (++c);
+  crc_fold_init(&fold24a, poly24a, crc24aTable);
+  crc_fold_init(&fold24b, poly24b, crc24bTable);
+  crc_fold_init(&fold16, poly16, crc16Table32);
+  (void)crc_fold_variant(); /* kernel selection now rather than on the first call */
 #if defined(__SSE4_1__) || defined(__aarch64__) 
     crc_xmm_be_le_swap128 = simde_mm_setr_epi32(0x0c0d0e0f, 0x08090a0b,
 				    	        0x04050607, 0x00010203);
@@ -125,6 +148,14 @@ can use SIMD optimized Intel CRC for LTE/NR 24a/24b variants
 uint32_t crc24a(unsigned char* inptr, int bitlen)
 {
   int octetlen = bitlen / 8;  /* Change in octets */
+  uint32_t fcrc;
+
+  if (crc_fold_bytes(&fold24a, inptr, octetlen, &fcrc)) {
+    const int resbit = bitlen % 8;
+    if (resbit > 0)
+      fcrc = (fcrc << resbit) ^ crc24aTable[(inptr[octetlen] >> (8 - resbit)) ^ (fcrc >> (32 - resbit))];
+    return fcrc;
+  }
 
   if ( bitlen % 8 || !USE_INTEL_CRC ) {
     uint32_t crc = 0;
@@ -161,6 +192,14 @@ static const struct crc_pclmulqdq_ctx lte_crc24b_pclmulqdq __attribute__((aligne
 uint32_t crc24b(unsigned char* inptr, int bitlen)
 {
   int octetlen = bitlen / 8;  /* Change in octets */
+  uint32_t fcrc;
+
+  if (crc_fold_bytes(&fold24b, inptr, octetlen, &fcrc)) {
+    const int resbit = bitlen % 8;
+    if (resbit > 0)
+      fcrc = (fcrc << resbit) ^ crc24bTable[(inptr[octetlen] >> (8 - resbit)) ^ (fcrc >> (32 - resbit))];
+    return fcrc;
+  }
 
   if ( bitlen % 8 || !USE_INTEL_CRC ) {
     uint32_t crc = 0;
@@ -208,6 +247,11 @@ uint32_t crc16(unsigned char* inptr, int bitlen)
   uint32_t crc = 0;
   octetlen = bitlen / 8;        /* Change in octets */
   resbit = (bitlen % 8);
+
+  if (crc_fold_bytes(&fold16, inptr, octetlen, &crc)) {
+    inptr += octetlen;
+    octetlen = 0;
+  }
 
   while (octetlen-- > 0) {
 
