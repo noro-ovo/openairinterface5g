@@ -117,7 +117,8 @@ int main(int argc, char **argv)
     const int bgx = b < 51 * 6 ? 1 + (b / 51) % 2 : bg;
     const int rcx = b < 51 * 6 ? (bgx == 1 ? R1[(b / 102) % 3] : R2[(b / 102) % 3]) : rc;
     const int ncol = ldpc_ncol(bgx, rcx), K = t_kb(bgx) * z;
-    const int kprime = (rng_next(&rng) & 1) ? K : K - (int)(rng_next(&rng) % (K / 4 + 1));
+    int kprime = (rng_next(&rng) & 1) ? K : K - (int)(rng_next(&rng) % (K / 4 + 1));
+    if (rng_next(&rng) % 8 == 0) kprime = K * 55 / 100 + (int)(rng_next(&rng) % (K / 10 + 1)); /* many filler columns */
     const int kind = (rng_next(&rng) % 10) < 7 ? 0 : (rng_next(&rng) & 1) ? 1 : 2;
     const double snr = -1.0 + (rng_next(&rng) % 81) / 10.0;
     static const int its[8] = {1, 2, 3, 4, 5, 8, 12, 20};
@@ -154,6 +155,8 @@ int main(int argc, char **argv)
       for (int i = nend; i < ncol * z; i++) llr[i] = 0;
       ntail = ncol * z - nend;
     }
+    if (rng_next(&rng) % 8 == 0) /* punctured positions not zero: no iteration-1 shortcuts (they need exact zeros) */
+      for (int i = 0; i < 2 * z; i += 1 + (int)(rng_next(&rng) % 64)) llr[i] = (int8_t)(rng_next(&rng) & 0xFF);
     static const uint8_t qms[6] = {0, 1, 2, 4, 6, 8};
     const uint8_t qmv = qms[rng_next(&rng) % 6];
     static const int8_t agcs[3] = {0, 1, -1};
@@ -255,7 +258,7 @@ int main(int argc, char **argv)
               for (int i = 0; i < lens[li]; i++) {
                 const int8_t x = src[i];
                 int v;
-                if (g) { v = ((int)x * g + (1 << (sh + s - 1))) >> (sh + s); v = v > 127 ? 127 : v < -128 ? -128 : v; }
+                if (g) v = ldpc_gain1(x, g, sh + s); /* (v3: byte-SQRDMULH definition) */
                 else v = s ? ((int)x + (1 << (s - 1))) >> s : x;
                 v = v > cms[ci] ? cms[ci] : v < -cms[ci] ? -cms[ci] : v;
                 nbad += dst[i] != (int8_t)v;
@@ -270,18 +273,27 @@ int main(int argc, char **argv)
     for (int i = 12000; i < 12500; i++) big[i] = 0;                         /* a zero run */
     for (int len = 1; len < 20000; len = len * 3 + 7)
       for (int un = 0; un <= 1; un++)
-        for (int st = 16; st <= 32; st += 16) {
+        for (int st = 16; st <= 64; st *= 2) {
           long c, cs = 0, ss = 0;
           const long sv = ldpc_test_abs_sum(big, len, un, st, &c);
           for (int i = 0; i < len; i++) {
-            if (st == 32 && ((i >> 4) & 1)) continue;
+            if ((i >> 4) & (st / 16 - 1)) continue;
             const int a = big[i] < 0 ? -big[i] : big[i];
             if (a > 0 && (!un || a < 127)) { ss += a; cs++; }
           }
           nbad += sv != ss || c != cs;
           ncfg++;
         }
-    CHECK(nbad == 0, "conditioning kernel / AGC statistic: %d mismatches", nbad);
+    /* hard-decision bit packing (MSB first) vs scalar, all lengths up to 1000, NEON/SSE and SVE2/AVX-512 paths */
+    for (int len = 1; len <= 1000; len += 1 + len / 7)
+      for (int sv = 0; sv <= 1; sv++) {
+        static uint8_t pk[200];
+        memset(pk, 0xA5, sizeof pk);
+        ldpc_test_pack(big, len, pk, sv);
+        for (int i = 0; i < len; i++) nbad += ((pk[i >> 3] >> (7 - (i & 7))) & 1) != (big[i] < 0);
+        ncfg++;
+      }
+    CHECK(nbad == 0, "conditioning kernel / AGC statistic / bit packing: %d mismatches", nbad);
     printf("[4] input conditioning kernel (AGC gain with folded in_shift, in_shift, clamp) and AGC statistic pass vs scalar definitions: %d configurations, %d mismatches\n", ncfg, nbad);
   }
   /* ---- 5. skipped rows are exact no-ops: the reference with the active rows only vs all rows, fixed iterations
@@ -314,6 +326,50 @@ int main(int argc, char **argv)
         }
     CHECK(nbad == 0, "skipped rows are not no-ops: %d column mismatches", nbad);
     printf("[5] rows beyond the last non-zero LLR are exact no-ops (reference, active rows vs all rows): %d cases, %d mismatches\n", ncmp, nbad);
+  }
+  /* ---- 6. batch decoding (small Z, lane-interleaved) == block-by-block decoding: outputs, iterations, syndrome flag */
+  {
+    int nb_cases = 0, nbad = 0;
+    static int8_t bl[24][68 * 384];
+    static uint8_t bo[24][OUTSZ], so[OUTSZ];
+    for (int tc = 0; tc < (quick ? 60 : 240); tc++) {
+      const int bg = 1 + (int)(rng_next(&rng) & 1);
+      const int rc = bg == 1 ? R1[rng_next(&rng) % 3] : R2[rng_next(&rng) % 3];
+      const int z = ldpc_lifting_sizes[rng_next(&rng) % 26]; /* Z <= 48 */
+      const int ncol = ldpc_ncol(bg, rc), K = t_kb(bg) * z;
+      const int nblk = 1 + (int)(rng_next(&rng) % 24);
+      const int kprime = (rng_next(&rng) & 1) ? K : K - (int)(rng_next(&rng) % (K / 3 + 1));
+      const int tail = (rng_next(&rng) % 3 == 0) ? (int)(rng_next(&rng) % (ncol * z - K - 2 * z)) : 0;
+      const int mode = (int)(rng_next(&rng) % 3), maxit = 1 + (int)(rng_next(&rng) % 12), no_et = rng_next(&rng) % 6 == 0;
+      const int8_t *lp[24];
+      uint8_t *op[24];
+      for (int b = 0; b < nblk; b++) {
+        make_block(&rng, bg, z, ncol, kprime, 0, -1.0 + (rng_next(&rng) % 70) / 10.0, cw, bl[b]);
+        if (rng_next(&rng) % 3 == 0) /* other scales: other AGC gains per block */
+          for (int i = 2 * z; i < ncol * z; i++) { const int v = bl[b][i] * (int)(1 + rng_next(&rng) % 4) / 2; if (i < kprime || i >= K) bl[b][i] = (int8_t)(v > 127 ? 127 : v < -128 ? -128 : v); }
+        if (tail && (b % 4 != 3)) memset(bl[b] + ncol * z - tail, 0, (size_t)tail); /* most blocks share the tail */
+        if (rng_next(&rng) % 10 == 0) bl[b][rng_next(&rng) % (2 * z)] = 5; /* punctured not zero: no shortcuts */
+        lp[b] = bl[b]; op[b] = bo[b];
+        memset(bo[b], 0xA5, OUTSZ);
+      }
+      ldpc_dec_params_t p = {.bg = (uint8_t)bg, .z = (uint16_t)z, .rcode = (uint8_t)rc, .max_iter = (uint8_t)maxit,
+                             .no_et = (uint8_t)no_et, .out_mode = (ldpc_out_t)mode, .impl = LDPC_IMPL_AUTO, .kprime = kprime,
+                             .qm = (uint8_t)(rng_next(&rng) % 2 ? 0 : 6)};
+      ldpc_dec_stats_t sb[24], s1;
+      int rb[24];
+      CHECK(ldpc_decode_batch(&p, nblk, lp, op, sb, rb) == 0, "batch returned an error");
+      for (int b = 0; b < nblk; b++) {
+        memset(so, 0xA5, OUTSZ);
+        const int r1 = ldpc_decode(&p, bl[b], so, &s1);
+        const int same = r1 == rb[b] && s1.iterations == sb[b].iterations && s1.syndrome_ok == sb[b].syndrome_ok && !memcmp(so, bo[b], OUTSZ);
+        nbad += !same;
+        if (!same && nbad < 5) printf("FAIL: batch BG%d Z%d R%d nblk %d b %d mode %d it %d no_et %d tail %d kp %d: ret %d/%d it %d/%d\n", bg, z, rc,
+                                      nblk, b, mode, maxit, no_et, tail, kprime, r1, rb[b], s1.iterations, sb[b].iterations);
+        nb_cases++;
+      }
+    }
+    CHECK(nbad == 0, "batch != single: %d blocks", nbad);
+    printf("[6] ldpc_decode_batch == ldpc_decode block by block (Z <= 48, 1-24 blocks, per-block scales, tails, fillers): %d blocks, %d mismatches\n", nb_cases, nbad);
   }
   printf("RESULT: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
   return fails != 0;
