@@ -76,22 +76,39 @@ static uint32_t crc12Table[256];
 static uint32_t crc11Table[256];
 static uint32_t crc8Table[256];
 static uint32_t crc6Table[256];
-static uint32_t crc16Table32[256]; /* crc16Table << 16, for crc_fold() */
+static uint32_t crc16Table32[256]; /* crcbit(&c, 1, poly16), for crc_fold() */
 
-/* multi-lane PCLMULQDQ / PMULL folding for whole bytes (crc_fold.c) */
+/* multi-lane PCLMULQDQ / PMULL folding for whole bytes (crc_fold.c), from CRC_FOLD_MIN_BYTES; below, the code of
+ * crc24a_base() etc. (crc32_calc_pclmulqdq() / the table). aarch64 builds without the crypto extension, where SIMDe
+ * emulates PCLMULQDQ in software: crc_fold() takes everything (the table below 16 bytes); with it, SIMDe's one-lane
+ * PMULL code takes up to 255 bytes (fewer instructions there than the 4-lane setup and the final reduction) */
 static crc_fold_ctx_t fold24a, fold24b, fold16;
-/* x86: shorter messages stay on crc32_calc_pclmulqdq() / the table; aarch64: crc_fold() takes the table below 16 bytes
- * (cheaper than SIMDe's PCLMULQDQ emulation in builds without the crypto extension) */
-#if defined(__aarch64__)
+#if defined(__aarch64__) && !defined(__ARM_FEATURE_AES) && !defined(__ARM_FEATURE_CRYPTO)
 #define CRC_FOLD_MIN_BYTES 1
+#define CRC16_FOLD_MIN_BYTES 1
+#elif defined(__aarch64__)
+#define CRC_FOLD_MIN_BYTES 256
+#define CRC16_FOLD_MIN_BYTES 16 /* crc16() has no PCLMULQDQ code */
 #else
-#define CRC_FOLD_MIN_BYTES 64
+#define CRC_FOLD_MIN_BYTES 16
+#define CRC16_FOLD_MIN_BYTES 16
 #endif
 
-/* table state after the whole bytes from crc_fold(), false when it does not handle them */
-static inline bool crc_fold_bytes(const crc_fold_ctx_t *ctx, const unsigned char *inptr, int octetlen, uint32_t *crc)
+/* crc_fold() for the whole bytes, the table for the bitlen % 8 last bits; base() when crc_fold() has no kernel. Not
+ * inlined, so that the short-message path of crc24a() etc. makes no call. */
+static __attribute__((noinline)) uint32_t crc_fold_or(const crc_fold_ctx_t *ctx,
+                                                       uint32_t (*base)(unsigned char *, int),
+                                                       unsigned char *inptr,
+                                                       int bitlen)
 {
-  return octetlen >= CRC_FOLD_MIN_BYTES && crc_fold(ctx, inptr, octetlen, crc);
+  const int octetlen = bitlen / 8, resbit = bitlen % 8;
+  const int64_t f = crc_fold(ctx, inptr, octetlen);
+  if (f < 0)
+    return base(inptr, bitlen);
+  uint32_t crc = f;
+  if (resbit > 0)
+    crc = (crc << resbit) ^ ctx->table[(inptr[octetlen] >> (8 - resbit)) ^ (crc >> (32 - resbit))];
+  return crc;
 }
 
 #if USE_INTEL_CRC
@@ -145,17 +162,9 @@ assuming initial byte is 0 padded (in MSB) if necessary
 can use SIMD optimized Intel CRC for LTE/NR 24a/24b variants
 *********************************************************/
 
-uint32_t crc24a(unsigned char* inptr, int bitlen)
+static inline __attribute__((always_inline)) uint32_t crc24a_base(unsigned char* inptr, int bitlen)
 {
   int octetlen = bitlen / 8;  /* Change in octets */
-  uint32_t fcrc;
-
-  if (crc_fold_bytes(&fold24a, inptr, octetlen, &fcrc)) {
-    const int resbit = bitlen % 8;
-    if (resbit > 0)
-      fcrc = (fcrc << resbit) ^ crc24aTable[(inptr[octetlen] >> (8 - resbit)) ^ (fcrc >> (32 - resbit))];
-    return fcrc;
-  }
 
   if ( bitlen % 8 || !USE_INTEL_CRC ) {
     uint32_t crc = 0;
@@ -189,17 +198,9 @@ static const struct crc_pclmulqdq_ctx lte_crc24b_pclmulqdq __attribute__((aligne
     0ULL /**< res */
 };
 #endif
-uint32_t crc24b(unsigned char* inptr, int bitlen)
+static inline __attribute__((always_inline)) uint32_t crc24b_base(unsigned char* inptr, int bitlen)
 {
   int octetlen = bitlen / 8;  /* Change in octets */
-  uint32_t fcrc;
-
-  if (crc_fold_bytes(&fold24b, inptr, octetlen, &fcrc)) {
-    const int resbit = bitlen % 8;
-    if (resbit > 0)
-      fcrc = (fcrc << resbit) ^ crc24bTable[(inptr[octetlen] >> (8 - resbit)) ^ (fcrc >> (32 - resbit))];
-    return fcrc;
-  }
 
   if ( bitlen % 8 || !USE_INTEL_CRC ) {
     uint32_t crc = 0;
@@ -223,6 +224,20 @@ uint32_t crc24b(unsigned char* inptr, int bitlen)
 #endif
 }
 
+uint32_t crc24a(unsigned char* inptr, int bitlen)
+{
+  if (bitlen >= 8 * CRC_FOLD_MIN_BYTES)
+    return crc_fold_or(&fold24a, crc24a_base, inptr, bitlen);
+  return crc24a_base(inptr, bitlen);
+}
+
+uint32_t crc24b(unsigned char* inptr, int bitlen)
+{
+  if (bitlen >= 8 * CRC_FOLD_MIN_BYTES)
+    return crc_fold_or(&fold24b, crc24b_base, inptr, bitlen);
+  return crc24b_base(inptr, bitlen);
+}
+
 uint32_t crc24c(unsigned char* inptr, int bitlen)
 {
   int octetlen, resbit;
@@ -241,17 +256,12 @@ uint32_t crc24c(unsigned char* inptr, int bitlen)
   return crc;
 }
 
-uint32_t crc16(unsigned char* inptr, int bitlen)
+static inline __attribute__((always_inline)) uint32_t crc16_base(unsigned char* inptr, int bitlen)
 {
   int             octetlen, resbit;
   uint32_t crc = 0;
   octetlen = bitlen / 8;        /* Change in octets */
   resbit = (bitlen % 8);
-
-  if (crc_fold_bytes(&fold16, inptr, octetlen, &crc)) {
-    inptr += octetlen;
-    octetlen = 0;
-  }
 
   while (octetlen-- > 0) {
 
@@ -262,6 +272,13 @@ uint32_t crc16(unsigned char* inptr, int bitlen)
     crc = (crc << resbit) ^ (((uint32_t)crc16Table[(*inptr) >> (8 - resbit) ^ (crc >> (32 - resbit))]) << 16);
 
   return crc;
+}
+
+uint32_t crc16(unsigned char* inptr, int bitlen)
+{
+  if (bitlen >= 8 * CRC16_FOLD_MIN_BYTES)
+    return crc_fold_or(&fold16, crc16_base, inptr, bitlen);
+  return crc16_base(inptr, bitlen);
 }
 
 uint32_t crc12(unsigned char* inptr, int bitlen)
