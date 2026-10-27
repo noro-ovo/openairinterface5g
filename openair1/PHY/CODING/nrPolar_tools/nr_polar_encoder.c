@@ -438,7 +438,7 @@ void build_polar_tables(t_nrPolar_params *polarParams)
   for (int outpos = 0, tcnt = 0; outpos < polarParams->encoderLength; outpos += mingroupsize, tcnt++)
     polarParams->rm_tab[tcnt] = polarParams->rate_matching_pattern[outpos] >> shift;
 
-  build_decoder_tree(polarParams);
+  nr_polar_build_sc_decoder(polarParams);
 }
 
 void polar_encoder_fast(uint64_t *A,
