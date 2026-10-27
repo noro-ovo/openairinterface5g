@@ -582,65 +582,6 @@ int8_t polar_decoder_dci(double *input,
   return 0;
 }
 
-static inline void nr_polar_rate_matching_int16(const int16_t *input,
-                                                int16_t *output,
-                                                const uint16_t *rmp,
-                                                const uint16_t K,
-                                                const uint16_t N,
-                                                const uint16_t E,
-                                                const uint8_t i_bil)
-{
-  if (E >= N) { // repetition
-    memset(output, 0, N * sizeof(*output));
-    for (int i = 0; i <= E - 1; i++)
-      output[rmp[i]] += input[i];
-  } else {
-    if ((K / (double)E) <= (7.0 / 16))
-      memset(output, 0, N * sizeof(*output)); // puncturing
-    else { // shortening
-      for (int i = 0; i <= N - 1; i++)
-        output[i] = INT16_MAX;
-    }
-
-    for (int i = 0; i <= E - 1; i++)
-      output[rmp[i]] = input[i];
-  }
-}
-
-static inline void nr_polar_info_extraction_from_u(uint64_t *Cprime,
-                                                   const uint8_t *u,
-                                                   const uint8_t *information_bit_pattern,
-                                                   const uint8_t *parity_check_bit_pattern,
-                                                   const uint16_t *interleaving_pattern,
-                                                   uint16_t N,
-                                                   uint8_t n_pc,
-                                                   int K)
-{
-  int k = 0;
-
-  if (n_pc > 0) {
-    for (int n = 0; n < N; n++) {
-      if (information_bit_pattern[n] == 1 && parity_check_bit_pattern[n] == 0) {
-        int targetBit = K - 1 - interleaving_pattern[k];
-        int k1 = targetBit >> 6;
-        int k2 = targetBit & 63;
-        Cprime[k1] |= (uint64_t)u[n] << k2;
-        k++;
-      }
-    }
-  } else {
-    for (int n = 0; n < N; n++) {
-      if (information_bit_pattern[n] == 1) {
-        int targetBit = K - 1 - interleaving_pattern[k];
-        int k1 = targetBit >> 6;
-        int k2 = targetBit & 63;
-        Cprime[k1] |= (uint64_t)u[n] << k2;
-        k++;
-      }
-    }
-  }
-}
-
 uint32_t polar_decoder_int16(const int16_t *input,
                              uint64_t *out,
                              uint8_t ones_flag,
@@ -662,73 +603,9 @@ uint32_t polar_decoder_int16(const int16_t *input,
   printf("\n");
 #endif
 
-  int16_t d_tilde[N];
-  const uint E = polarParams->encoderLength;
-  int16_t inbis[E];
-  const int16_t *input_deinterleaved;
-  if (polarParams->i_bil) {
-    for (int i = 0; i < E; i++)
-      inbis[i] = input[polarParams->i_bil_pattern[i]];
-    input_deinterleaved = inbis;
-  } else {
-    input_deinterleaved = input;
-  }
-
-  nr_polar_rate_matching_int16(input_deinterleaved,
-                               d_tilde,
-                               polarParams->rate_matching_pattern,
-                               polarParams->K,
-                               N,
-                               E,
-                               polarParams->i_bil);
-#ifdef POLAR_CODING_DEBUG
-  printf("d: ");
-  for (int i = 0; i < N; i++) {
-    if (i % 4 == 0) {
-      printf(" ");
-    }
-    printf("%i", d_tilde[i] < 0 ? 1 : 0);
-  }
-  printf("\n");
-#endif
-  uint8_t nr_polar_U[N];
-  memset(nr_polar_U, 0, sizeof(nr_polar_U));
-  memcpy(treeAlpha(polarParams->decoder.root), d_tilde, sizeof(d_tilde));
-  generic_polar_decoder(polarParams, polarParams->decoder.root, nr_polar_U);
-#ifdef POLAR_CODING_DEBUG
-  printf("u: ");
-  for (int i = 0; i < N; i++) {
-    if (i % 4 == 0) {
-      printf(" ");
-    }
-    printf("%i", nr_polar_U[i]);
-  }
-  printf("\n");
-#endif
-
-  // Extract the information bits (û to ĉ)
+  // rate recovery, SC decoding, information bits (û to ĉ, deinterleaved to b) in B
   uint64_t B[4] = {0};
-  nr_polar_info_extraction_from_u(B,
-                                  nr_polar_U,
-                                  polarParams->information_bit_pattern,
-                                  polarParams->parity_check_bit_pattern,
-                                  polarParams->interleaving_pattern,
-                                  N,
-                                  polarParams->n_pc,
-                                  polarParams->K);
-
-#ifdef POLAR_CODING_DEBUG
-  printf("c: ");
-  for (int n = 0; n < polarParams->K; n++) {
-    if (n % 4 == 0) {
-      printf(" ");
-    }
-    int n1 = n >> 6;
-    int n2 = n - (n1 << 6);
-    printf("%lu", (B[n1] >> n2) & 1);
-  }
-  printf("\n");
-#endif
+  nr_polar_sc_decode(polarParams, input, B);
 
   int len = polarParams->payloadBits;
   // int len_mod64=len&63;
