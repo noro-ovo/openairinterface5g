@@ -38,10 +38,29 @@ static int set_gain(nr_ldpc_llr_prescale_t *p, double g)
   return -1;
 }
 
+static void set_all_x1(nr_ldpc_llr_prescale_rule_t *r)
+{
+  for (int l = 0; l < 2; l++)
+    for (int q = 0; q <= NR_LDPC_LLR_PRESCALE_MAX_QM; q++)
+      set_gain(&r->qm[l][q], 1.0);
+}
+
+// "g2,g4,g6,g8" into the Qm 2/4/6/8 entries of t; returns the number of characters consumed, -1 on error
+static int parse_set(const char *s, nr_ldpc_llr_prescale_t *t)
+{
+  double g[4];
+  int n = 0;
+  if (sscanf(s, " %lf ,%lf ,%lf ,%lf %n", &g[0], &g[1], &g[2], &g[3], &n) != 4 || n == 0)
+    return -1;
+  for (int i = 0; i < 4; i++)
+    if (set_gain(&t[2 * (i + 1)], g[i]) != 0)
+      return -1;
+  return n;
+}
+
 int nrLDPC_llr_prescale_parse(const char *str, nr_ldpc_llr_prescale_rule_t *rule)
 {
-  for (int q = 0; q <= NR_LDPC_LLR_PRESCALE_MAX_QM; q++)
-    set_gain(&rule->qm[q], 1.0);
+  set_all_x1(rule);
   if (str == NULL)
     return -1;
   while (*str == ' ')
@@ -50,16 +69,22 @@ int nrLDPC_llr_prescale_parse(const char *str, nr_ldpc_llr_prescale_rule_t *rule
     return 0;
   if (!strcasecmp(str, "default") || !strcasecmp(str, "on"))
     str = NR_LDPC_LLR_PRESCALE_DEFAULT;
-  double g[4];
-  char tail;
-  if (sscanf(str, "%lf,%lf,%lf,%lf %c", &g[0], &g[1], &g[2], &g[3], &tail) != 4)
-    return -1;
   nr_ldpc_llr_prescale_rule_t r;
-  for (int q = 0; q <= NR_LDPC_LLR_PRESCALE_MAX_QM; q++)
-    set_gain(&r.qm[q], 1.0);
-  for (int i = 0; i < 4; i++)
-    if (set_gain(&r.qm[2 * (i + 1)], g[i]) != 0)
+  set_all_x1(&r);
+  int n = parse_set(str, r.qm[0]);
+  if (n < 0)
+    return -1;
+  str += n;
+  if (*str == '/') {
+    n = parse_set(str + 1, r.qm[1]);
+    if (n < 0)
       return -1;
+    str += 1 + n;
+  } else {
+    memcpy(r.qm[1], r.qm[0], sizeof(r.qm[1]));
+  }
+  if (*str != 0)
+    return -1;
   *rule = r;
   return 0;
 }
@@ -67,10 +92,12 @@ int nrLDPC_llr_prescale_parse(const char *str, nr_ldpc_llr_prescale_rule_t *rule
 void nrLDPC_llr_prescale_str(const nr_ldpc_llr_prescale_rule_t *rule, char *buf, int len)
 {
   static const char *name[4] = {"QPSK", "16QAM", "64QAM", "256QAM"};
+  static const char *lay[2] = {"1 layer:", "; 2+ layers:"};
   int o = 0;
   buf[0] = 0;
-  for (int i = 0; i < 4 && o < len; i++)
-    o += snprintf(buf + o, len - o, "%s%s x%g", i ? " " : "", name[i], rule->qm[2 * (i + 1)].q8 / 256.0);
+  for (int l = 0; l < 2; l++)
+    for (int i = 0; i < 4 && o < len; i++)
+      o += snprintf(buf + o, len - o, "%s %s x%g", i ? "" : lay[l], name[i], rule->qm[l][2 * (i + 1)].q8 / 256.0);
 }
 
 void nrLDPC_llr_pack_int8(const int16_t *z, int8_t *l, int nvec, const nr_ldpc_llr_prescale_t *ps)
