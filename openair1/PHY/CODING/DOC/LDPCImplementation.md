@@ -62,6 +62,35 @@ Libraries implementing the slotwise LDPC coding must be named `libldpc<_version>
 
 `libldpc_aal.so` is completed.
 
+### Decoder input LLR scale (`libldpc.so`, `libldpc_orig.so`)
+
+The segment layer of `libldpc.so` / `libldpc_orig.so` ([nrLDPC_coding_segment_decoder.c](file://../nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_coding_segment_decoder.c))
+converts the int16 channel LLRs of each code block to the int8 decoder input with a saturating pack. The int16 LLRs
+of the PHY are not on a common scale: 16QAM and 64QAM LLRs are several times larger than QPSK LLRs, and 20-50 % of them
+saturate at +-127 after the pack. Before the pack, the segment layer therefore applies a gain that depends on the
+modulation order Qm ([nrLDPC_llr_prescale.h](file://../nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_llr_prescale.h)):
+
+| rule | QPSK | 16QAM | 64QAM | 256QAM |
+|---|---|---|---|---|
+| `default` | x1 | x1/2 | x1/2 | x1 |
+
+The gain is applied in int16 with symmetric rounding (round half away from zero), so it also removes most of the
+saturation; filler bits stay at +127 and punctured/untransmitted positions stay 0. The rule is selected (highest
+priority first) by:
+
+* the environment variable `OAI_LDPC_LLR_PRESCALE` (for experiments),
+* the configuration parameter `llr_prescale` of the section `nrLDPC_coding_segment`, in the configuration file or on
+  the command line, e.g. `--nrLDPC_coding_segment.llr_prescale off` (also in `nr_ulsim`/`nr_dlsim`),
+* the built-in default.
+
+Values: `default`, `off` (legacy conversion, bit-exact), or `g2,g4,g6,g8`, the gains for QPSK, 16QAM, 64QAM and 256QAM,
+each in [1/16, 1) or one of 1, 2, 4, 8 (e.g. `1,0.5,0.5,1` = `default`). The active rule is logged at init. Gains of 1
+use the unmodified conversion, so QPSK and 256QAM decoding is bit-exact with the legacy code under the default rule.
+
+The decoder is told what it receives: `t_nrLDPC_dec_params` carries `Qm` (0 = unknown, e.g. `ldpctest`), `nb_layers`
+and `llr_prescale_q8` (the gain above in Q8, 256 = x1). OAI's decoders ignore these fields; they are appended at the
+end of the structure so that decoders built against the previous layout keep working.
+
 ## LDPC segment coding
 The interface of the library is defined in [nrLDPC_defs.h](file://../nrLDPC_defs.h) as typedefs of the functions of the interface.
 The name of the functions implementing these typedefs can be found in [nrLDPC_extern.h](file://../nrLDPC_extern.h).
