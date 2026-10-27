@@ -101,7 +101,8 @@ typedef struct nrPolar_params {
   uint16_t enc_pc_pos[3];
   uint64_t enc_pc_mask[3];
   uint16_t *enc_rm_src;
-  uint8_t *enc_rm_byte; // aarch64, byte / halfword groups: output byte i = byte enc_rm_byte[i] of d (TBL index, 0xff: 0)
+  uint8_t *enc_rm_byte; // aarch64 TBL indices: with enc_rm_src (N <= 256), output bit k = bit enc_rm_byte[k] of d;
+                        // otherwise (byte / halfword groups), output byte i = byte enc_rm_byte[i] of d (0xff: 0)
   bool enc_bdep; // aarch64: SVE2 BDEP available
   nr_polar_sc_t sc;
 } t_nrPolar_params;
