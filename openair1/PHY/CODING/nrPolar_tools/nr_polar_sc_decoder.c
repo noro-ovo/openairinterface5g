@@ -22,6 +22,7 @@
 
 #include "PHY/CODING/nrPolar_tools/nr_polar_defs.h"
 #include "assertions.h"
+#include "common/utils/LOG/log.h"
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -358,13 +359,22 @@ void nr_polar_build_sc_decoder(t_nrPolar_params *pp)
    * decoded word; info_src[t] = leaf of bit t (a permutation of [0, K)), padded to a multiple of 8 with leaf N (u[N] = 0) */
   int k = 0;
   for (int i = 0; i < N; i++)
-    if (pp->information_bit_pattern[i] == 1 && (pp->n_pc == 0 || pp->parity_check_bit_pattern[i] == 0)) {
-      const int t = pp->K - 1 - pp->interleaving_pattern[k];
-      AssertFatal(t >= 0 && t < 128, "information bit %d\n", t);
-      d->info_src[t] = i;
+    if (pp->information_bit_pattern[i] == 1 && (pp->n_pc == 0 || pp->parity_check_bit_pattern[i] == 0))
       k++;
-    }
-  AssertFatal(k == pp->K, "%d information bits, K = %d\n", k, pp->K);
+  /* K + n_PC larger than the number of usable positions (e.g. K > E): nr_polar_info_bit_pattern() reads outside its
+   * table and the pattern does not hold K information bits; such a parameter set always fails decoding */
+  d->invalid = k != pp->K || pp->K > 128;
+  if (d->invalid) {
+    LOG_E(PHY, "polar decoder: %d information positions for K = %d (E = %d, N = %d), decoding disabled\n", k, pp->K, pp->encoderLength, N);
+    k = 0;
+  } else {
+    k = 0;
+    for (int i = 0; i < N; i++)
+      if (pp->information_bit_pattern[i] == 1 && (pp->n_pc == 0 || pp->parity_check_bit_pattern[i] == 0)) {
+        d->info_src[pp->K - 1 - pp->interleaving_pattern[k]] = i;
+        k++;
+      }
+  }
   d->n_info = k;
   for (; k < ((d->n_info + 7) & ~7); k++)
     d->info_src[k] = N;
