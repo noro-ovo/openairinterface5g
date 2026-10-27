@@ -154,16 +154,16 @@ static inline int16x8_t f_v8(int16x8_t a, int16x8_t b)
   int16x8_t m = vminq_s16(vabsq_s16(a), vabsq_s16(b));
   int16x8_t s = vshrq_n_s16(veorq_s16(a, b), 15);
   int16x8_t r = vsubq_s16(veorq_s16(m, s), s);
-  uint16x8_t nz = vandq_u16(vtstq_s16(a, a), vtstq_s16(b, b));
-  return vandq_s16(r, vreinterpretq_s16_u16(nz));
+  uint16x8_t z = vminq_u16(vreinterpretq_u16_s16(a), vreinterpretq_u16_s16(b)); // 0 where a or b is 0
+  return vandq_s16(r, vreinterpretq_s16_u16(vtstq_u16(z, z)));
 }
 static inline int16x4_t f_v4(int16x4_t a, int16x4_t b)
 {
   int16x4_t m = vmin_s16(vabs_s16(a), vabs_s16(b));
   int16x4_t s = vshr_n_s16(veor_s16(a, b), 15);
   int16x4_t r = vsub_s16(veor_s16(m, s), s);
-  uint16x4_t nz = vand_u16(vtst_s16(a, a), vtst_s16(b, b));
-  return vand_s16(r, vreinterpret_s16_u16(nz));
+  uint16x4_t z = vmin_u16(vreinterpret_u16_s16(a), vreinterpret_u16_s16(b));
+  return vand_s16(r, vreinterpret_s16_u16(vtst_u16(z, z)));
 }
 static inline void op_f4(const int16_t *av, int16_t *ac)
 {
@@ -387,10 +387,23 @@ void nr_polar_build_sc_decoder(t_nrPolar_params *pp)
     int m = d->rm_mode == 0 ? i % N : d->rm_mode == 1 ? i + N - E : i;
     AssertFatal(pp->rate_matching_pattern[i] == d->blk_perm[m / bs] * bs + m % bs, "rate matching pattern\n");
   }
+  /* coded bit interleaving without repetition: bit de-interleaving and rate recovery composed into one gather,
+   * root LLR j = input[rr_src[j]], index E = the fill value (0 punctured, INT16_MAX shortened) */
+  d->rr_src = NULL;
+  if (pp->i_bil && E <= N) {
+    d->rr_src = malloc(sizeof(uint16_t) * N);
+    AssertFatal(d->rr_src, "malloc\n");
+    for (int j = 0; j < N; j++)
+      d->rr_src[j] = E;
+    for (int i = 0; i < E; i++)
+      d->rr_src[pp->rate_matching_pattern[i]] = pp->i_bil_pattern[i];
+  }
 }
 
 void nr_polar_free_sc_decoder(t_nrPolar_params *pp)
 {
+  free(pp->sc.rr_src);
+  pp->sc.rr_src = NULL;
   free(pp->sc.mem);
   pp->sc.mem = NULL;
 }
@@ -467,6 +480,15 @@ static void sc_rate_recovery(const t_nrPolar_params *pp, const int16_t *in, int1
 {
   const nr_polar_sc_t *d = &pp->sc;
   const int N = pp->N, E = pp->encoderLength, bs = N / 32;
+  if (d->rr_src) {
+    int16_t x[E + 1];
+    __builtin_memcpy(x, in, sizeof(int16_t) * E);
+    x[E] = d->rm_mode == 2 ? INT16_MAX : 0;
+    const uint16_t *src = d->rr_src;
+    for (int j = 0; j < N; j++)
+      out[j] = x[src[j]];
+    return;
+  }
   int16_t s[N] __attribute__((aligned(32)));
   int16_t tmp[pp->i_bil ? E : 1];
   if (pp->i_bil) {
