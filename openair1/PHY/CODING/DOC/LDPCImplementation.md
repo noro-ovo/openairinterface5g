@@ -62,6 +62,32 @@ Libraries implementing the slotwise LDPC coding must be named `libldpc<_version>
 
 `libldpc_aal.so` is completed.
 
+### Decoders of `libldpc.so`
+
+`libldpc.so` contains two LDPC decoders behind the same segment layer and the same `LDPCdecoder()` entry point:
+
+| `nrLDPC_coding_segment.decoder` | decoder | source |
+|---|---|---|
+| `fast` (default) | layered offset/normalised min-sum, int8, input AGC per code block from `Qm` and the code rate, early stop on the core rows + CRC (OAI's CRC callback), only the transmitted rows decoded; kernels for AVX2, AVX-512BW, NEON, SVE2 and portable C, selected at run time (`LDPC decoder: fast (...; implementation sve2)` in the log) | [nrLDPC_decoder_fast](file://../nrLDPC_decoder_fast/README.md) (vendored, `sync_from_upstream.sh`) |
+| `oai` | OAI's flooding min-sum decoder, unchanged | [nrLDPC_decoder.c](file://../nrLDPC_decoder/nrLDPC_decoder.c) |
+
+The decoder is chosen once per process, highest priority first, by the environment variable `OAI_LDPC_DECODER`, the
+configuration parameter `decoder` of the section `nrLDPC_coding_segment` (configuration file, or
+`--nrLDPC_coding_segment.decoder oai` on the command line of `nr-softmodem`, `nr-uesoftmodem`, `nr_ulsim`, `nr_dlsim`
+and `ldpctest`), and the CMake cache variable `NR_LDPC_DECODER_DEFAULT` (`fast`). Other libraries:
+`libldpc_oaidec.so` (`--loader.ldpc.shlibversion _oaidec`, `ldpctest -v _oaidec`) is the segment library with OAI's
+decoder only, `libldpc_orig.so` is unchanged; `cmake -DLDPC_DECODER_FAST=OFF` builds `libldpc.so` without the fast
+decoder. With `decoder = oai`, `libldpc.so` produces the same results as before, call by call.
+
+`max_ldpc_iterations` (`-I` in the simulators) counts **layered** iterations for the fast decoder; one layered
+iteration converges about as far as two flooding iterations of OAI's decoder at the same cost per iteration.
+The return value keeps OAI's convention (`< numMaxIter` on success).
+
+For measurements, `OAI_LDPC_DECODER_STATS=<file>` appends per (decoder, Qm, layers, BG, R) the number of code blocks,
+the decoded ones, the iterations and the decode time per code block (mean and percentiles, `clock_gettime` around the
+decoder call) and an order-independent digest of all decoder inputs/outputs; `OAI_LDPC_DECODER_TRACE=<file>` writes one
+byte per call (`1` decoded, `0` failed).
+
 ### Decoder input LLR scale (`libldpc.so`, `libldpc_orig.so`)
 
 The segment layer of `libldpc.so` / `libldpc_orig.so` ([nrLDPC_coding_segment_decoder.c](file://../nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_coding_segment_decoder.c))
@@ -71,13 +97,19 @@ receivers produce even larger ones, and up to 97 % of them saturate at +-127 aft
 segment layer therefore applies a gain that depends on the modulation order Qm and on the number of layers
 ([nrLDPC_llr_prescale.h](file://../nrLDPC_coding/nrLDPC_coding_segment/nrLDPC_llr_prescale.h)):
 
-| layers | QPSK | 16QAM | 64QAM | 256QAM |
-|---|---|---|---|---|
-| 1 | x1 | x1/4 | x1 | x1 |
-| 2 or more | x1/4 | x1/16 | x1/2 | x1 |
+| decoder | layers | QPSK | 16QAM | 64QAM | 256QAM |
+|---|---|---|---|---|---|
+| `oai` | 1 | x1 | x1/4 | x1 | x1 |
+| `oai` | 2 or more | x1/4 | x1/16 | x1/2 | x1 |
+| `fast` | 1 | x1 | x1/4 | x1 | x1 |
+| `fast` | 2 or more | x1/4 | x1/16 | x1/2 | x1/2 |
 
-This default was measured with OAI's decoder and the receivers of this code base, in `nr_ulsim` and `nr_dlsim`. For
-each entry it is the largest tested gain that was not worse than the plain pack at any tested MCS. The gain is
+The default depends on the selected decoder (`NR_LDPC_LLR_PRESCALE_DEFAULT` / `NR_LDPC_LLR_PRESCALE_DEFAULT_FAST`). It
+was measured with each decoder and the receivers of this code base, in `nr_ulsim` and `nr_dlsim`. For OAI's decoder
+each entry is the largest tested gain that was not worse than the plain pack at any tested MCS. The fast decoder
+normalises the scale itself (AGC) and differs only for 2+ layers 256QAM (DL -1.8 dB; UL only inside the receiver's
+error floor); with 2+ layers 64QAM a UE gains another 0.9 dB with `1,0.25,1,1/0.25,0.0625,0.125,0.5`, which costs
+0.45 dB on the gNB side. The gain is
 applied in int16 with symmetric rounding (round half away from zero), so it also removes most of the saturation.
 Filler bits stay at +127 and punctured/untransmitted positions stay 0. The rule is selected (highest priority first) by:
 
@@ -92,7 +124,7 @@ Values:
 * `g2,g4,g6,g8`: the gains for QPSK, 16QAM, 64QAM and 256QAM, for any number of layers;
 * `g2,g4,g6,g8/h2,h4,h6,h8`: `g` for 1 layer, `h` for 2 or more layers.
 
-Each gain must be in [1/16, 1) or one of 1, 2, 4, 8; for example `1,0.25,1,1/0.25,0.0625,0.5,1` is `default`. The
+Each gain must be in [1/16, 1) or one of 1, 2, 4, 8; for example `1,0.25,1,1/0.25,0.0625,0.5,1` is `default` with `decoder = oai`. The
 active rule is logged at init. A gain of 1 uses the unmodified conversion, so those cases stay bit-exact with the
 legacy code. A receiver with a different LLR scale (e.g. a new multi-layer detector) needs its own rule.
 
