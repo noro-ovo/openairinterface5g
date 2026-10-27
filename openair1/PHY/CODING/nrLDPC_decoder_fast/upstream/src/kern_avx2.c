@@ -32,6 +32,7 @@ static inline __m256i y_msg(__m256i q, __m256i m1c, __m256i c1, __m256i c2)
 #define VST(p, v) _mm256_storeu_si256((__m256i *)(void *)(p), v)
 #define VQSUB _mm256_subs_epi8
 #define VQADD _mm256_adds_epi8
+#define VSUBW _mm256_sub_epi8 /* wrapping subtraction (absorbed messages) */
 #define VABS _mm256_abs_epi8
 #define VABD(a, b) _mm256_abs_epi8(_mm256_subs_epi8(a, b))
 #define VMINU _mm256_min_epu8
