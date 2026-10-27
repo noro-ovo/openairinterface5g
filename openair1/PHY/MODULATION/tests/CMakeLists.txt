@@ -5,3 +5,9 @@ target_link_libraries(test_nr_modulation PRIVATE PHY_NR GTest::gtest minimal_lib
 add_dependencies(tests test_nr_modulation)
 add_test(NAME test_nr_modulation
   COMMAND ./test_nr_modulation)
+
+add_executable(test_nr_mod_packed test_nr_mod_packed.cpp)
+target_link_libraries(test_nr_mod_packed PRIVATE PHY_NR ds GTest::gtest minimal_lib)
+add_dependencies(tests test_nr_mod_packed)
+add_test(NAME test_nr_mod_packed
+  COMMAND ./test_nr_mod_packed)
