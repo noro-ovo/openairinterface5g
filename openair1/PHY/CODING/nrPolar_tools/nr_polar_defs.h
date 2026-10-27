@@ -292,9 +292,8 @@ static inline void nr_polar_rm_deinterleaving_lut(uint16_t *out, const uint E)
 extern pthread_mutex_t PolarListMutex;
 static inline void polarReturn(t_nrPolar_params *polarParams)
 {
-  pthread_mutex_lock(&PolarListMutex);
-  polarParams->busy = false;
-  pthread_mutex_unlock(&PolarListMutex);
+  // release: the next user of this node (nr_polar_params(), acquire) sees everything written to it
+  __atomic_store_n(&polarParams->busy, false, __ATOMIC_RELEASE);
 }
 
 #endif
