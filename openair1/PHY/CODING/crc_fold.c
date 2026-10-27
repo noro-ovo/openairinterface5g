@@ -119,27 +119,30 @@ TGT128 static inline uint32_t reduce_x86(const crc_fold_ctx_t *ctx, __m128i x)
 
 TGT128 static bool fold_pclmul(const crc_fold_ctx_t *ctx, const uint8_t *data, uint32_t len, uint32_t *crc)
 {
-  if (len < 64)
+  if (len < 16)
     return false;
   const __m128i rev = _mm_load_si128((const __m128i *)rev_shift);
 #define LD(p) _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(p)), rev)
   const uint32_t h = (16 - (len & 15)) & 15, nb = (len + h) / 16;
   const uint8_t *p = data + 16 - h;
-  __m128i x0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)data), _mm_loadu_si128((const __m128i *)(rev_shift + h)));
-  __m128i x1 = LD(p), x2 = LD(p + 16), x3 = LD(p + 32);
-  p += 48;
-  uint32_t left = nb - 4;
-  const __m128i k4 = _mm_loadu_si128((const __m128i *)ctx->k512);
-  for (; left >= 4; left -= 4, p += 64) {
-    x0 = _mm_xor_si128(FOLD128(x0, k4), LD(p));
-    x1 = _mm_xor_si128(FOLD128(x1, k4), LD(p + 16));
-    x2 = _mm_xor_si128(FOLD128(x2, k4), LD(p + 32));
-    x3 = _mm_xor_si128(FOLD128(x3, k4), LD(p + 48));
+  __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)data), _mm_loadu_si128((const __m128i *)(rev_shift + h)));
+  uint32_t left = nb - 1;
+  if (nb >= 4) {
+    __m128i x0 = x, x1 = LD(p), x2 = LD(p + 16), x3 = LD(p + 32);
+    p += 48;
+    left = nb - 4;
+    const __m128i k4 = _mm_loadu_si128((const __m128i *)ctx->k512);
+    for (; left >= 4; left -= 4, p += 64) {
+      x0 = _mm_xor_si128(FOLD128(x0, k4), LD(p));
+      x1 = _mm_xor_si128(FOLD128(x1, k4), LD(p + 16));
+      x2 = _mm_xor_si128(FOLD128(x2, k4), LD(p + 32));
+      x3 = _mm_xor_si128(FOLD128(x3, k4), LD(p + 48));
+    }
+    x0 = FOLD128(x0, _mm_loadu_si128((const __m128i *)ctx->kc4[0]));
+    x1 = FOLD128(x1, _mm_loadu_si128((const __m128i *)ctx->kc4[1]));
+    x2 = FOLD128(x2, _mm_loadu_si128((const __m128i *)ctx->kc4[2]));
+    x = _mm_xor_si128(_mm_xor_si128(x0, x1), _mm_xor_si128(x2, x3));
   }
-  x0 = FOLD128(x0, _mm_loadu_si128((const __m128i *)ctx->kc4[0]));
-  x1 = FOLD128(x1, _mm_loadu_si128((const __m128i *)ctx->kc4[1]));
-  x2 = FOLD128(x2, _mm_loadu_si128((const __m128i *)ctx->kc4[2]));
-  __m128i x = _mm_xor_si128(_mm_xor_si128(x0, x1), _mm_xor_si128(x2, x3));
   const __m128i k1 = _mm_loadu_si128((const __m128i *)ctx->k128);
   for (; left; left--, p += 16)
     x = _mm_xor_si128(FOLD128(x, k1), LD(p));
@@ -395,10 +398,11 @@ const char *crc_fold_variant(void)
   return kernel_name;
 }
 
-bool crc_fold(const crc_fold_ctx_t *ctx, const uint8_t *data, uint32_t len, uint32_t *crc)
+int64_t crc_fold(const crc_fold_ctx_t *ctx, const uint8_t *data, uint32_t len)
 {
   if (!__atomic_load_n(&kernel_set, __ATOMIC_ACQUIRE))
     select_default();
   const fold_fn_t k = kernel;
-  return k && k(ctx, data, len, crc);
+  uint32_t crc;
+  return k && k(ctx, data, len, &crc) ? (int64_t)crc : -1;
 }
