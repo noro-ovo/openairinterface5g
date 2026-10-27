@@ -30,6 +30,13 @@ typedef struct ldpc_row {
   uint32_t toff; /* index of the row's read-offset table in rdtab: [k][e] for the multi edges */
   uint32_t yoff; /* index of the row's syndrome table in sytab: [k][e], superchunks of the plan's B = U*W bytes */
   ldpc_rowfn_t fn[2]; /* row kernel: [0] general, [1] first iteration (messages taken as 0) */
+  /* iteration 1 with zero punctured columns (input LLRs of columns 0 and 1 all zero, as OAI passes them):
+     it1 = 0 normal (fn[1]); 1 = the row sees >= 2 still-zero columns: every message is 0, the APPs are only moved to
+     the write buffer (fn1, no message store; iteration 2 then uses fn[1], since its messages are all 0);
+     2 = exactly one still-zero column (multi edge index ze): only that edge gets a non-zero message (fn1) */
+  uint8_t it1, ze;
+  uint8_t nat;   /* natural (base-graph) row index */
+  ldpc_rowfn_t fn1;
 } ldpc_row_t;
 
 /*
@@ -47,7 +54,8 @@ typedef struct ldpc_row {
  *  - valid-lane mask (zp bytes), messages and row states per row.
  */
 typedef struct ldpc_plan {
-  int bg, z, rcode, ncol, nrow, kbcols;
+  int bg, z, rcode, ncol, nrow, kbcols, fc0; /* fc0: columns [fc0, kbcols) are removed filler columns */
+  int z0, nb;      /* batch: nb code blocks of lifting size z0 interleaved lane-wise (z = z0 nb); nb = 1: single */
   int W, U, B;     /* vector bytes, maximum vectors per step, B = W*U */
   int zp;          /* Z rounded up to B */
   int nedge;
@@ -70,7 +78,10 @@ typedef struct ldpc_plan {
   int32_t *sytab;             /* syndrome read offsets into the final buffers (B-byte superchunks), after rdtab */
   /* CRC-mode early stop (README section 5): view of the multi columns after the core rows 0 .. ncore-1 of an
      iteration (buffer, frame) and the syndrome offsets of the core rows in that view (indexed like sytab) */
-  int ncore, midcheck;        /* midcheck: CRC-mode early stop used (core rows <= 60 % of the edges) */
+  int ncore, midcheck;        /* midcheck: check after the core rows (natural order only) */
+  int absorb;      /* store absorbed messages R = APP_new - Q (option LDPC_DEC_ABS=1) */
+  int crcmode, ordered, core0; /* crcmode: CRC-mode stop used (core rows <= 60 % of the edges); ordered: rows by
+                                  ascending degree; core0: plan slot of the first core row (rows core0..core0+3) */
   int32_t cbufm[LDPC_MAXCOL];
   uint16_t crhom[LDPC_MAXCOL];
   int32_t *sytabm;
@@ -83,16 +94,24 @@ typedef struct ldpc_plan {
 typedef struct {
   /* 1 if the hard decision satisfies all checks */
   /* rows 0 .. nrows-1 with the syndrome table tab (p->sytab: end of an iteration; p->sytabm: after the core rows) */
-  int (*syndrome)(const ldpc_plan_t *p, const int8_t *ws, int nrows, const int32_t *tab);
+  int (*syndrome)(const ldpc_plan_t *p, const int8_t *ws, int r0, int r1, const int32_t *tab); /* plan rows r0..r1-1 */
+  /* batch: OR of the check parities per lane over rows r0 .. r1-1 into mask (zp bytes, zeroed by the caller) */
+  void (*synmask)(const ldpc_plan_t *p, const int8_t *ws, int r0, int r1, const int32_t *tab, int8_t *mask);
   /* largest U (1, 2, 4) <= umax the kernels support for a row with nn multi and n1 degree-1 edges (0: none) */
   int (*row_u)(int nn, int n1, int umax);
-  /* row kernel for a shape (NULL: not provided) */
+  /* row kernel for a shape (NULL: not provided); first: 0 general, 1 first iteration, 2 iteration-1 copy row,
+     3 iteration-1 row with one zero column (rw->ze) */
   ldpc_rowfn_t (*row_fn)(int nn, int n1, int u, int first);
 } ldpc_kernels_t;
 
+/* layer order: 1 = ascending row degree in every iteration (default; not for BG1 R8/9, where it gains nothing and
+   costs iterations), 0 = natural (LDPC_DEC_ORDER=0) */
+int ldpc_row_order(int bg, int rcode);
+/* 1: absorbed messages (R = APP_new - Q, the increment actually applied after saturation; LDPC_DEC_ABS=1) */
+int ldpc_absorb(void);
 /* builds the plan; k = NULL: geometry only (U = 1 per row, no read-offset table, no row kernels) */
 /* nact: rows processed (ldpc_active_rows(); 0 or >= the rate's rows: all) */
-int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int W, int U, int nshift, int beta, int rmax,
+int ldpc_plan_build(ldpc_plan_t *p, int bg, int z, int rcode, int nact, int fc0, int nb, int W, int U, int nshift, int beta, int rmax,
                     const ldpc_kernels_t *k);
 void ldpc_plan_free(ldpc_plan_t *p);
 
@@ -104,6 +123,10 @@ int ldpc_kern_sve2(ldpc_kernels_t *k, int *W);
 int ldpc_kern_avx2(ldpc_kernels_t *k, int *W);
 int ldpc_kern_avx512(ldpc_kernels_t *k, int *W);
 int ldpc_sve2_bytes(void); /* SVE vector length in bytes; call only if SVE2 is available */
+/* SVE2 input gain run (ldpc_gain1() definition + clamp to +-cmax), dst[i] for i < n; call only if SVE2 is available */
+void ldpc_sve2_gain_run(int8_t *dst, const int8_t *src, int n, int cmax, int G, int t);
+/* SVE predicate packing of hard decisions (MSB first), returns the values done; call only if SVE2 is available */
+int ldpc_sve2_pack_bits(const int8_t *v, int n, uint8_t *out);
 
 /* input conditioning shared by every implementation: AGC gain (G = 0: off) and filler range [kp, K) */
 typedef struct {
@@ -117,6 +140,17 @@ int ldpc_nend(const int8_t *llr, int n);
 /* rows processed for a block whose LLRs end at nend: rows 0..3 always, row r >= 4 only if its degree-1 column
    (kbcols + r) holds a non-zero LLR position at or before nend - 1 (beyond the last non-zero LLR a row is an exact
    no-op: its degree-1 Q is 0, so every message to the other columns is 0) */
+/* first removed filler column: columns [c0, kbcols) hold only filler bits (positions [kp, K)) and are removed from
+   the graph; kbcols if there is none (kp <= 0 or kp >= K: no fillers). c0 is at least 15 (BG1) / 7 (BG2): removing
+   more columns would leave a row with fewer than 2 edges to multi-degree columns (the kernels need 2) */
+static inline int ldpc_filler_col0(int z, int kbcols, int kp, int K)
+{
+  if (kp <= 0 || kp >= K) return kbcols;
+  int c0 = (kp + z - 1) / z;
+  const int cmin = kbcols == 22 ? 15 : 7;
+  if (c0 < cmin) c0 = cmin;
+  return c0 < kbcols ? c0 : kbcols;
+}
 static inline int ldpc_active_rows(int nrow, int kbcols, int z, int nend)
 {
   const int lastcol = nend > 0 ? (nend - 1) / z : -1;
@@ -126,14 +160,26 @@ static inline int ldpc_active_rows(int nrow, int kbcols, int z, int nend)
 }
 /* conditioned channel LLR with the AGC on: in_shift is folded into the gain (one rounding):
    sat8((x G + 2^(t-1)) >> t), t = sh + in_shift, then the channel clamp */
+/* v3 definition (byte SQRDMULH form, README section 11): gain G / 2^t = G * 2^(k-7), k = 7 - t;
+   k >= 0: y = rdmulh(sat8(x << k), G); k < 0: y = rshr(rdmulh(x, G), -k), rdmulh(a, b) = (2 a b + 128) >> 8,
+   rshr(a, n) = (a + 2^(n-1)) >> n. Identical to sat8((x G + 2^(t-1)) >> t) except where x << k saturates (|y| >= 63)
+   and the double rounding for t > 7. */
 static inline int8_t ldpc_gain1(int8_t x, int G, int t)
 {
-  const int v = ((int)x * G + (1 << (t - 1))) >> t;
-  return (int8_t)(v > 127 ? 127 : v < -128 ? -128 : v);
+  const int k = 7 - t;
+  int v = x;
+  if (k >= 0) {
+    v = v * (1 << k);
+    v = v > 127 ? 127 : v < -128 ? -128 : v;
+    return (int8_t)((2 * v * G + 128) >> 8);
+  }
+  v = (2 * v * G + 128) >> 8;
+  return (int8_t)((v + (1 << (-k - 1))) >> -k);
 }
 
 void ldpc_test_cond(int8_t *dst, const int8_t *src, int n, int s, int cmax, int G, int sh); /* test hooks */
 long ldpc_test_abs_sum(const int8_t *x, int n, int unsat, int step, long *cnt);
+void ldpc_test_pack(const int8_t *v, int n, uint8_t *out, int sve);
 
 /* scalar reference decoder, natural indexing (src/ldpc_ref.c), rows 0 .. nact-1 (ldpc_active_rows()); returns iterations, *ok = syndrome ok (CRC mode: the
    parity of the core rows); app_out (ncol*Z) receives the final a-posteriori LLRs in input order.

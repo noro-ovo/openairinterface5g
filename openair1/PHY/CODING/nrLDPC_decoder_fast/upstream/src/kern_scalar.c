@@ -22,6 +22,7 @@ static inline int8_t s_sat(int x) { return (int8_t)(x > 127 ? 127 : x < -128 ? -
   }
 S_OP2(s_qsub, s_sat(x - y))
 S_OP2(s_qadd, s_sat(x + y))
+S_OP2(s_wsub, (int8_t)(x - y))
 S_OP2(s_minu, ux < uy ? ux : uy)
 S_OP2(s_maxu, ux > uy ? ux : uy)
 S_OP2(s_xor, x ^ y)
@@ -59,6 +60,7 @@ static inline int s_anyneg(v8_t t) { for (int i = 0; i < SW; i++) if (t.v[i] < 0
 #define VST(p, v) s_st((int8_t *)(p), v)
 #define VQSUB s_qsub
 #define VQADD s_qadd
+#define VSUBW s_wsub /* wrapping subtraction (absorbed messages) */
 #define VABS s_abs
 #define VABD s_abd
 #define VMINU s_minu
