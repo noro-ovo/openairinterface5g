@@ -222,6 +222,26 @@ void polar_encoder_dci(uint32_t *in,
   polarReturn(polarParams);
 }
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#include <sys/auxv.h>
+#ifndef HWCAP2_SVEBITPERM
+#define HWCAP2_SVEBITPERM (1 << 4)
+#endif
+/* only this function is compiled for SVE2 (BitPerm), selected at run time */
+#pragma GCC push_options
+#pragma GCC target("+sve2-bitperm")
+#include <arm_sve.h>
+static void polar_bdep_words(const uint64_t *c, const uint64_t *m, uint64_t *u, int nw)
+{
+  for (int w = 0; w < nw; w += svcntd()) {
+    svbool_t pg = svwhilelt_b64_s32(w, nw);
+    svst1_u64(pg, u + w, svbdep_u64(svld1_u64(pg, c + w), svld1_u64(pg, m + w)));
+  }
+}
+#pragma GCC pop_options
+#endif
+
 /*
  * Interleaving of coded bits implementation
  * TS 138.212: Section 5.4.1.3 - Interleaving of coded bits
@@ -468,6 +488,29 @@ static void build_encoder_tables(t_nrPolar_params *pp)
     }
   }
   AssertFatal(npc == (pp->n_pc > 0 ? pp->n_pc : 0) && k == pp->K, "information bits %d (K %d), parity-check bits %d\n", k, pp->K, npc);
+  for (int w = 0, kw = 0; w < N / 64; w++) {
+    pp->enc_info_off[w] = kw;
+    kw += __builtin_popcountll(pp->enc_info_mask[w]);
+  }
+  pp->enc_bdep = false;
+  pp->enc_rm_byte = NULL;
+#if defined(__aarch64__)
+  pp->enc_bdep = (getauxval(AT_HWCAP2) & HWCAP2_SVEBITPERM) != 0;
+  /* byte / halfword group copy of polar_rate_matching() as TBL indices into the (at most 64) bytes of d: bytes
+   * [0, E/8) as polar_rate_matching() writes them (halfword groups: the last byte stays 0 when E/8 is odd) */
+  if (!pp->i_bil && pp->groupsize >= 8 && N <= 512) {
+    const int nb = E >> 3;
+    pp->enc_rm_byte = malloc((nb + 15) & ~15);
+    AssertFatal(pp->enc_rm_byte, "malloc\n");
+    memset(pp->enc_rm_byte, 0xff, (nb + 15) & ~15);
+    if (pp->groupsize == 8)
+      for (int i = 0; i < nb; i++)
+        pp->enc_rm_byte[i] = pp->rm_tab[i];
+    else
+      for (int i = 0; i < 2 * (E >> 4); i++)
+        pp->enc_rm_byte[i] = 2 * pp->rm_tab[i >> 1] + (i & 1);
+  }
+#endif
 
   /* rate matching (+ coded bit interleaving) as one bit gather, where polar_rate_matching() has a slow path: groups
    * of less than 8 bits or the bit interleaver. Only where polar_rate_matching() writes exactly the E/8 output bytes
@@ -501,6 +544,19 @@ static void build_encoder_tables(t_nrPolar_params *pp)
 static inline void polar_generate_u_nat(const t_nrPolar_params *pp, const uint64_t *Cprime, uint64_t *u)
 {
   const int nw = pp->N >> 6;
+#if defined(__aarch64__)
+  if (pp->enc_bdep) { // u word w = BDEP(next bits of C', information bit mask of word w)
+    uint64_t c[Nmax / 64];
+    for (int w = 0; w < nw; w++) {
+      const int k = pp->enc_info_off[w];
+      c[w] = k == 0 ? Cprime[0] : k < 64 ? (Cprime[0] >> k) | (Cprime[1] << (64 - k)) : Cprime[1] >> (k - 64);
+    }
+    polar_bdep_words(c, pp->enc_info_mask, u, nw);
+    for (int i = 0; i < pp->n_pc; i++)
+      u[pp->enc_pc_pos[i] >> 6] |= (uint64_t)__builtin_parityll(Cprime[0] & pp->enc_pc_mask[i]) << (pp->enc_pc_pos[i] & 63);
+    return;
+  }
+#endif
   int k = 0;
   for (int w = 0; w < nw; w++) {
     uint64_t m = pp->enc_info_mask[w], x = 0;
@@ -760,6 +816,21 @@ void polar_encoder_fast(uint64_t *A,
 
   if (polarParams->enc_rm_src) { // rate matching (+ bit interleaving) as one bit gather
     polar_bit_gather(D, polarParams->N, polarParams->enc_rm_src, polarParams->encoderLength, out);
+#if defined(__aarch64__)
+  } else if (polarParams->enc_rm_byte) { // byte / halfword groups: 16 output bytes per TBL from the 64 bytes of d
+    const uint8x16x4_t t = {{vld1q_u8((uint8_t *)D), vld1q_u8((uint8_t *)D + 16), vld1q_u8((uint8_t *)D + 32), vld1q_u8((uint8_t *)D + 48)}};
+    const int nb = polarParams->encoderLength >> 3;
+    const uint8_t *idx = polarParams->enc_rm_byte;
+    uint8_t *o = out;
+    int i = 0;
+    for (; i + 16 <= nb; i += 16)
+      vst1q_u8(o + i, vqtbl4q_u8(t, vld1q_u8(idx + i)));
+    if (i < nb) {
+      uint8_t tail[16];
+      vst1q_u8(tail, vqtbl4q_u8(t, vld1q_u8(idx + i)));
+      __builtin_memcpy(o + i, tail, nb - i);
+    }
+#endif
   } else {
     memset((void *)out, 0, polarParams->encoderLength >> 3);
     polar_rate_matching(polarParams, (void *)D, out);
