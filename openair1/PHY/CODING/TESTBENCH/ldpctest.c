@@ -368,6 +368,10 @@ one_measurement_t test_ldpc(short max_iterations,
       decParams[j].outMode = nrLDPC_outMode_BIT;
       decParams[j].Kprime = Kprime;
       decParams[j].n_segments = n_segments;
+      // BPSK LLRs at the reference scale 16*y/sigma, not PHY LLRs: Qm 0 = "unknown", decoders use their default gain
+      decParams[j].Qm = 0;
+      decParams[j].nb_layers = 1;
+      decParams[j].llr_prescale_q8 = 256;
     }
 
     // Decoder
