@@ -1,15 +1,14 @@
-NEON+SHA3 kernel (v3): set the SHA3 target only when the baseline lacks SHA3 (same reason as 0002). Skipped by
-the sync script for upstream versions without src/kern_neon3.c.
+NEON+SHA3 kernel (v3): add SHA3 to the baseline ("+sha3") instead of "arch=armv8.2-a+sha3" (same reason as
+0002; the Neoverse-N2/V2 flag sets have no SHA3 in the baseline). Skipped for versions without src/kern_neon3.c.
 
 --- a/src/kern_neon3.c
 +++ b/src/kern_neon3.c
-@@ -1,7 +1,9 @@
+@@ -1,7 +1,7 @@
  /* NEON kernel compiled for ARMv8.2-A + SHA3 (EOR3): selected at run time by ldpc_kern_neon() when HWCAP_SHA3 is
     set; the armv8-a build of everything else is unchanged. */
  #if defined(__aarch64__)
-+#if !defined(__ARM_FEATURE_SHA3) /* baseline without SHA3 (e.g. armv8.2-a): enable it for this file only */
- #pragma GCC target("arch=armv8.2-a+sha3")
-+#endif
+-#pragma GCC target("arch=armv8.2-a+sha3")
++#pragma GCC target("+sha3") /* adds SHA3 (EOR3) to the baseline instead of setting the architecture */
  #define LDPC_NEON_SHA3 1
  #include "kern_neon.c"
  #endif
