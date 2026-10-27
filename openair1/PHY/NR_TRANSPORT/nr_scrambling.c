@@ -6,6 +6,11 @@
 #include "PHY/NR_REFSIG/nr_refsig.h"
 #define DEBUG_SCRAMBLING(a)
 //#define DEBUG_SCRAMBLING(a) a
+const uint32_t *nr_codeword_scrambling_seq(uint32_t size, uint8_t q, uint32_t Nid, uint32_t n_RNTI)
+{
+  return gold_cache((n_RNTI << 15) + (q << 14) + Nid, (size + 31) / 32);
+}
+
 void nr_codeword_scrambling(uint8_t *in,
                             uint32_t size,
                             uint8_t q,
@@ -14,7 +19,7 @@ void nr_codeword_scrambling(uint8_t *in,
                             uint32_t* out)
 {
   const int roundedSz = (size + 31) / 32;
-  uint32_t *seq = gold_cache((n_RNTI << 15) + (q << 14) + Nid, roundedSz);
+  const uint32_t *seq = nr_codeword_scrambling_seq(size, q, Nid, n_RNTI);
   unsigned int i_32 = 0;
 #ifdef __AVX2__
   for (; i_32 < ((roundedSz >> 3) << 3); i_32 += 8) {
