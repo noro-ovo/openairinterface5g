@@ -32,6 +32,10 @@
  * 16QAM x1/16 (2.5 dB UL, 4.5 dB DL), 64QAM x1/2 (0.1 dB UL, 1.6 dB DL; x1/4 costs ~0.01 dB at UL MCS 27),
  * 256QAM x1. Receivers with a different LLR scale need their own rule (config/env). */
 #define NR_LDPC_LLR_PRESCALE_DEFAULT "1,0.25,1,1/0.25,0.0625,0.5,1"
+/* Default rule when the fast decoder (nrLDPC_decoder_fast, the default of libldpc.so) is selected: its AGC normalises
+ * the LLR scale per code block, so the pre-scale only has to keep the int16 LLRs off the int8 rails (see
+ * nrLDPC_decoder_select.h). PROVISIONAL, set from the measurements of the integration (doc/LDPC decoder README). */
+#define NR_LDPC_LLR_PRESCALE_DEFAULT_FAST NR_LDPC_LLR_PRESCALE_DEFAULT
 /// maximum modulation order handled by the table (index = Qm, 0..8)
 #define NR_LDPC_LLR_PRESCALE_MAX_QM 8
 
@@ -53,7 +57,9 @@ typedef struct {
  * \brief parse a rule string into a table
  * \param str "g2,g4,g6,g8" (gains for QPSK, 16QAM, 64QAM, 256QAM, e.g. "1,0.5,0.5,1", for any number of layers),
  *            "g2,g4,g6,g8/h2,h4,h6,h8" (g for 1 layer, h for 2 or more layers),
- *            "default" (= NR_LDPC_LLR_PRESCALE_DEFAULT), or "off" / "none" / "0" (all x1 = legacy pack, bit-exact)
+ *            "default" (= NR_LDPC_LLR_PRESCALE_DEFAULT; the segment decoder passes the default of the selected
+ *            decoder instead, see nrLDPC_decoder_llr_prescale_default()), or "off" / "none" / "0" (all x1 = legacy
+ *            pack, bit-exact)
  * \param rule output table
  * \return 0 on success, -1 on a syntax error or a gain outside the allowed set (rule then holds all x1)
  */
