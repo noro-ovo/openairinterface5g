@@ -10,6 +10,7 @@ add_library(polar STATIC
   nr_polar_interleaving_pattern.c
   nr_polar_kernal_operation.c
   nr_polar_kronecker_power_matrices.c
+  nr_polar_sc_decoder.c
   nr_polar_matrix_and_array.c
   nr_polar_procedures.c
   nr_polar_sequence_pattern.c
