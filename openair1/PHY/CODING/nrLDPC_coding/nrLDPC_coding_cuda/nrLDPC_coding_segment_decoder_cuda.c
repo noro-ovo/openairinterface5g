@@ -234,6 +234,10 @@ void nr_process_decode_segment_cuda(nrLDPC_TB_decoding_parameters_t *segs)
   decParams.n_segments = C;
   decParams.outMode = nrLDPC_outMode_BIT;
   decParams.numMaxIter = segs->max_ldpc_iterations;
+  // LLR-scale hints (this path packs int16 -> int8 without a Qm-dependent gain)
+  decParams.Qm = segs->Qm;
+  decParams.nb_layers = segs->nb_layers;
+  decParams.llr_prescale_q8 = 256;
 
   LOG_D(NR_PHY, "decoder (llr %p): %d segments, Z %d, R %d \n", segs->llr, C, Z, segs->R);
 
