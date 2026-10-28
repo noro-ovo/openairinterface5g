@@ -53,7 +53,17 @@ static __attribute__((always_inline)) inline void dft8x8_q15_256_core(const simd
     *raw_s02 = simde_mm256_adds_epi16(s04, s26);
     *raw_s13 = simde_mm256_adds_epi16(s15, s37);
   }
-  if (mid_scale) {
+  if (mid_scale == Q15_HALF) {
+    /* (x0 - x4) / 2 = (x0 + x4) / 2 - x4: one rounding per pair. */
+    s04 = half_odd_q15_256(s04);
+    d04 = simde_mm256_subs_epi16(s04, x4);
+    s15 = half_odd_q15_256(s15);
+    d15 = simde_mm256_subs_epi16(s15, x5);
+    s26 = half_odd_q15_256(s26);
+    d26 = simde_mm256_subs_epi16(s26, x6);
+    s37 = half_odd_q15_256(s37);
+    d37 = simde_mm256_subs_epi16(s37, x7);
+  } else if (mid_scale) {
     const simde__m256i h = simde_mm256_set1_epi16(mid_scale);
     s04 = simde_mm256_mulhrs_epi16(s04, h);
     d04 = simde_mm256_mulhrs_epi16(d04, h);
@@ -224,7 +234,7 @@ static inline void dft64_avx(const c16_t *src, c16_t *dst, dft_dir_t dir)
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
   const simde__m256i *C64_RE = g_dft64_re;
   const simde__m256i *C64_IM = g_dft64_im[ds];
-  H0 = simde_mm256_mulhrs_epi16(H0, simde_mm256_set1_epi16(Q15_HALF / 2));
+  H0 = quarter_q15_256(H0);
 
   /* C64 carries 1/4. */
   H1 = complex_mul8_prepack_small_q15_256(H1, C64_RE[1], C64_IM[1]);
@@ -503,7 +513,7 @@ static inline simde__m128i dft4_avx(simde__m128i x, dft_dir_t dir)
    * lo = [x0 x1 x0 x1]
    * hi = [x2 x3 x2 x3]
    */
-  x = simde_mm_srai_epi16(x, 1);
+  x = half_q15_128(x);
   const simde__m128i lo = simde_mm_shuffle_epi32(x, _MM_SHUFFLE(1, 0, 1, 0));
   const simde__m128i hi = simde_mm_shuffle_epi32(x, _MM_SHUFFLE(3, 2, 3, 2));
 
@@ -566,9 +576,10 @@ static inline void dft8_avx(const c16_t *src, c16_t *dst, dft_dir_t dir)
 
   /* W8/sqrt(2), with each real coefficient duplicated and imaginary
    * coefficients packed as [-wi, wi] for complex multiplication. */
-  const simde__m128i W8_RE_RE = simde_mm_setr_epi16(23170, 23170, Q15_HALF, Q15_HALF, 0, 0, -Q15_HALF, -Q15_HALF);
+  const simde__m128i W8_RE_RE = simde_mm_setr_epi16(23170, 23170, Q15_HALF_TW, Q15_HALF_TW, 0, 0, -Q15_HALF_TW, -Q15_HALF_TW);
 
-  const simde__m128i W8_IM_SIGNED_FWD = simde_mm_setr_epi16(0, 0, Q15_HALF, -Q15_HALF, 23170, -23170, Q15_HALF, -Q15_HALF);
+  const simde__m128i W8_IM_SIGNED_FWD =
+      simde_mm_setr_epi16(0, 0, Q15_HALF_TW, -Q15_HALF_TW, 23170, -23170, Q15_HALF_TW, -Q15_HALF_TW);
 
   const simde__m128i W8_IM_SIGNED = twiddle_im_dir_128(W8_IM_SIGNED_FWD, dir);
 
@@ -615,15 +626,15 @@ static const int16_t W16_3_RE_RE[8] __attribute__((
 static const int16_t W16_3_IM_SIGNED[8]
     __attribute__((aligned(16))) = {0, 0, Q15_COS_PI_8, -Q15_COS_PI_8, Q15_INV_SQRT2, -Q15_INV_SQRT2, -Q15_SIN_PI_8, Q15_SIN_PI_8};
 
-/* Shift each input before the saturating DFT4 sums, for either SIMD width. */
+/* Halve each input before the saturating DFT4 sums, for either SIMD width. */
 #define DEFINE_UNITARY_DFT4(FN, ATTR, VEC, SHIFT, ADD, SUB, WADD, WSUB, PMJ)                                    \
   static ATTR inline void                                                                                       \
   FN(const VEC x0, const VEC x1, const VEC x2, const VEC x3, VEC *Y0, VEC *Y1, VEC *Y2, VEC *Y3, dft_dir_t dir) \
   {                                                                                                             \
-    const VEC x0s = SHIFT(x0, 1);                                                                               \
-    const VEC x1s = SHIFT(x1, 1);                                                                               \
-    const VEC x2s = SHIFT(x2, 1);                                                                               \
-    const VEC x3s = SHIFT(x3, 1);                                                                               \
+    const VEC x0s = SHIFT(x0);                                                                                  \
+    const VEC x1s = SHIFT(x1);                                                                                  \
+    const VEC x2s = SHIFT(x2);                                                                                  \
+    const VEC x3s = SHIFT(x3);                                                                                  \
                                                                                                                 \
     /* Halved inputs: the first-layer sums fit in 16 bits, so they use wrapping adds. */                        \
     const VEC s02 = WADD(x0s, x2s);                                                                             \
@@ -639,7 +650,7 @@ static const int16_t W16_3_IM_SIGNED[8]
 DEFINE_UNITARY_DFT4(dft4x4_q15_128,
                     ,
                     simde__m128i,
-                    simde_mm_srai_epi16,
+                    half_q15_128,
                     simde_mm_adds_epi16,
                     simde_mm_subs_epi16,
                     simde_mm_add_epi16,
@@ -746,15 +757,15 @@ static inline void dft16_q15_128(const c16_t *src, c16_t *dst, dft_dir_t dir)
 /* W12^k, k = 0..3 */
 static const int16_t W12_R3_W1_RE_RE[8] __attribute__((aligned(16))) = {Q15_INV_SQRT3,
                                                                         Q15_INV_SQRT3, /* 1 / sqrt3 */
-                                                                        Q15_HALF,
-                                                                        Q15_HALF, /* cos(pi/6) / sqrt3 = 1/2 */
+                                                                        Q15_HALF_TW,
+                                                                        Q15_HALF_TW, /* cos(pi/6) / sqrt3 = 1/2 */
                                                                         Q15_INV_2SQRT3,
                                                                         Q15_INV_2SQRT3, /* cos(pi/3) / sqrt3 */
                                                                         0,
                                                                         0};
 
-static const int16_t W12_R3_W1_IM_SIGNED[8]
-    __attribute__((aligned(16))) = {0, 0, Q15_INV_2SQRT3, -Q15_INV_2SQRT3, Q15_HALF, -Q15_HALF, Q15_INV_SQRT3, -Q15_INV_SQRT3};
+static const int16_t W12_R3_W1_IM_SIGNED[8] __attribute__((
+    aligned(16))) = {0, 0, Q15_INV_2SQRT3, -Q15_INV_2SQRT3, Q15_HALF_TW, -Q15_HALF_TW, Q15_INV_SQRT3, -Q15_INV_SQRT3};
 
 /* W12^(2k), k = 0..3 */
 static const int16_t W12_R3_W2_RE_RE[8] __attribute__((aligned(16))) = {Q15_INV_SQRT3,
@@ -766,7 +777,8 @@ static const int16_t W12_R3_W2_RE_RE[8] __attribute__((aligned(16))) = {Q15_INV_
                                                                         -Q15_INV_SQRT3,
                                                                         -Q15_INV_SQRT3};
 
-static const int16_t W12_R3_W2_IM_SIGNED[8] __attribute__((aligned(16))) = {0, 0, Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF, 0, 0};
+static const int16_t W12_R3_W2_IM_SIGNED[8]
+    __attribute__((aligned(16))) = {0, 0, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, 0, 0};
 
 static inline simde__m128i pack3_complex_plus_zero_c16(const c16_t a, const c16_t b, const c16_t c)
 {
@@ -874,7 +886,7 @@ static inline simde__m256i join_m128_lanes(simde__m128i lo, simde__m128i hi)
 DEFINE_UNITARY_DFT4(dft4x4_q15_256_lanes,
                     ,
                     simde__m256i,
-                    simde_mm256_srai_epi16,
+                    half_q15_256,
                     simde_mm256_adds_epi16,
                     simde_mm256_subs_epi16,
                     simde_mm256_add_epi16,
@@ -924,7 +936,7 @@ static inline void dft12_q15_256_batch2_strided(const c16_t *src0,
   const simde__m256i S = simde_mm256_adds_epi16(B, C);
   const simde__m256i D = simde_mm256_subs_epi16(B, C);
   const simde__m256i Y0 = simde_mm256_adds_epi16(As, S);
-  const simde__m256i halfS = simde_mm256_mulhrs_epi16(S, simde_mm256_set1_epi16(Q15_HALF));
+  const simde__m256i halfS = half_q15_256(S);
   const simde__m256i base = simde_mm256_subs_epi16(As, halfS);
   /* (-j)^dir sqrt(3)/2 (B - C), rotation folded into the multiply */
   const simde__m256i c3D_mj = mul_minus_j_scaled_dir_i16_256(D, Q15_SQRT3_OVER_2, dir);
@@ -1056,9 +1068,9 @@ static const int16_t W32_3_IM_SIGNED_HI[8] __attribute__((aligned(16))) = {Q15_I
     const VEC E2s = SCALE(E2);                                                                      \
     const VEC E3s = SCALE(E3);                                                                      \
     const VEC T0 = SCALE(O0);                                                                       \
-    const VEC T1 = CMUL(O1, Q15_HALF, twiddle_im_scalar_dir_i16(-Q15_HALF, dir));                   \
+    const VEC T1 = CMUL(O1, Q15_HALF_TW, twiddle_im_scalar_dir_i16(-Q15_HALF_TW, dir));             \
     const VEC T2 = CMUL(O2, 0, twiddle_im_scalar_dir_i16(-Q15_INV_SQRT2, dir));                     \
-    const VEC T3 = CMUL(O3, -Q15_HALF, twiddle_im_scalar_dir_i16(-Q15_HALF, dir));                  \
+    const VEC T3 = CMUL(O3, -Q15_HALF_TW, twiddle_im_scalar_dir_i16(-Q15_HALF_TW, dir));            \
     OUTPUT(0) = ADD(E0s, T0);                                                                       \
     OUTPUT(4) = SUB(E0s, T0);                                                                       \
     OUTPUT(1) = ADD(E1s, T1);                                                                       \
@@ -1602,7 +1614,7 @@ static __attribute__((always_inline)) inline void dft64x8_store_body(const simde
     simde__m256i h[8];
     const simde__m256i xq[8] = {x[0], x[8], x[16], x[24], x[32], x[40], x[48], x[56]};
     dft8x8_q15_256_half_dir(xq, h, dir);
-    t[0][0] = simde_mm256_mulhrs_epi16(h[0], simde_mm256_set1_epi16(Q15_HALF / 2));
+    t[0][0] = quarter_q15_256(h[0]);
     for (int r = 1; r < 8; r++)
       t[r][0] = simde_mm256_mulhrs_epi16(h[r], dft64_re[r][0]);
   }
@@ -1611,7 +1623,7 @@ static __attribute__((always_inline)) inline void dft64x8_store_body(const simde
     simde__m256i h[8];
     const simde__m256i xq[8] = {x[q], x[q + 8], x[q + 16], x[q + 24], x[q + 32], x[q + 40], x[q + 48], x[q + 56]};
     dft8x8_q15_256_half_dir(xq, h, dir);
-    t[0][q] = simde_mm256_mulhrs_epi16(h[0], simde_mm256_set1_epi16(Q15_HALF / 2));
+    t[0][q] = quarter_q15_256(h[0]);
     for (int r = 1; r < 8; r++)
       t[r][q] = complex_mul8_prepack_small_q15_256(h[r], dft64_re[r][q], dft64_im[ds][r][q]);
   }
@@ -1668,7 +1680,7 @@ static inline void dft64x8_store(const simde__m256i x[64], c16_t *dst, int outpu
     sum_lo = simde_mm256_add_epi32(sum_lo, simde_mm256_madd_epi16(simde_mm256_unpacklo_epi16(s02, s13), ones16));                 \
     sum_hi = simde_mm256_add_epi32(sum_hi, simde_mm256_madd_epi16(simde_mm256_unpackhi_epi16(s02, s13), ones16));                 \
                                                                                                                                   \
-    t[0][q] = simde_mm256_mulhrs_epi16(h[0], simde_mm256_set1_epi16(Q15_HALF / 2));                                               \
+    t[0][q] = quarter_q15_256(h[0]);                                                                                              \
     if (q == 0) {                                                                                                                 \
       for (int r = 1; r < 8; r++)                                                                                                 \
         t[r][0] = simde_mm256_mulhrs_epi16(h[r], dft64_re[r][0]);                                                                 \
@@ -1901,10 +1913,9 @@ DEFINE_SELECTED_DFT16X8(dft16x8_w16folded, const simde__m256i d = simde_mm256_su
 static __attribute__((always_inline)) inline void dft16x8_prescaled(const simde__m256i x[16], simde__m256i y[16], dft_dir_t dir)
 {
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
-  const simde__m256i h = simde_mm256_set1_epi16(Q15_HALF);
   simde__m256i a[8], b[8], e[8], o[8];
   for (int q = 0; q < 8; q++) {
-    const simde__m256i lo = simde_mm256_mulhrs_epi16(x[q], h), hi = simde_mm256_mulhrs_epi16(x[q + 8], h);
+    const simde__m256i lo = half_q15_256(x[q]), hi = half_q15_256(x[q + 8]);
     a[q] = simde_mm256_adds_epi16(lo, hi);
     b[q] = simde_mm256_subs_epi16(lo, hi);
     if (q)
@@ -2533,14 +2544,14 @@ static inline void radix3_combine4_q15_128_fast(simde__m128i A,
   const simde__m128i Bs = complex_mul4_prepack_small_q15_128(X1, w1_re_re, w1_im_im);
   const simde__m128i Cs = complex_mul4_prepack_small_q15_128(X2, w2_re_re, w2_im_im);
 
-  /* The half-sum below truncates (arithmetic shift) instead of rounding. */
+  /* The half-sum below is rounded without bias (half_q15_128). */
   const simde__m128i As = q15_mul_i16_128(A, Q15_INV_SQRT3);
   const simde__m128i S = simde_mm_adds_epi16(Bs, Cs);
   const simde__m128i D = simde_mm_subs_epi16(Bs, Cs);
   *Y0 = simde_mm_adds_epi16(As, S);
 
   /* Bs/Cs are already normalized. */
-  const simde__m128i Sh = simde_mm_srai_epi16(S, 1);
+  const simde__m128i Sh = half_q15_128(S);
 
   const simde__m128i base = simde_mm_subs_epi16(As, Sh);
 
@@ -2570,7 +2581,7 @@ static inline void radix3_combine8_q15_256_fast(simde__m256i A,
   const simde__m256i As = simde_mm256_mulhrs_epi16(A, simde_mm256_set1_epi16(Q15_INV_SQRT3));
   const simde__m256i S = simde_mm256_adds_epi16(Bs, Cs);
   const simde__m256i D = simde_mm256_subs_epi16(Bs, Cs);
-  const simde__m256i base = simde_mm256_subs_epi16(As, simde_mm256_srai_epi16(S, 1));
+  const simde__m256i base = simde_mm256_subs_epi16(As, half_q15_256(S));
   const simde__m256i Z_mj = mul_minus_j_scaled_dir_i16_256(D, Q15_HALF_SQRT3, dir);
 
   *Y0 = simde_mm256_adds_epi16(As, S);
@@ -2695,7 +2706,7 @@ static inline void radix3_butterfly4_unitary_q15_128(simde__m128i x0,
   const simde__m128i x0s = simde_mm_mulhrs_epi16(x0, simde_mm_set1_epi16(Q15_INV_SQRT3));
   const simde__m128i base = simde_mm_subs_epi16(x0s, simde_mm_mulhrs_epi16(sum, simde_mm_set1_epi16(Q15_INV_2SQRT3)));
   /* not folded into the multiply: by 1/2 every odd input is a rounding tie (-0.5..1 dB) */
-  const simde__m128i imag = simde_mm_mulhrs_epi16(diff, simde_mm_set1_epi16(Q15_HALF));
+  const simde__m128i imag = half_q15_128(diff);
   *y0 = simde_mm_adds_epi16(x0s, simde_mm_mulhrs_epi16(sum, simde_mm_set1_epi16(Q15_INV_SQRT3)));
   add_pm_j_i16_128(base, imag, y1, y2, dir);
 }
