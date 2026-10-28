@@ -122,9 +122,22 @@ static inline void cq15x8_storeu(cq15x8_t *p, cq15x8_t x)
   cq15x8_store(p, x);
 }
 
+/* x / 2 with ties to the odd neighbour, (x >> 1) | (x & 1): no mean error and no gain error. */
+static inline int16x8_t neon_half_odd_s16(int16x8_t x)
+{
+  return vorrq_s16(vshrq_n_s16(x, 1), vandq_s16(x, vdupq_n_s16(1)));
+}
+
+/* x / 4 with ties to even, (x + 1 + ((x >> 2) & 1)) >> 2: no mean error. */
+static inline int16x8_t neon_quarter_even_s16(int16x8_t x)
+{
+  const int16x8_t one = vdupq_n_s16(1);
+  return vshrq_n_s16(vqaddq_s16(x, vaddq_s16(vandq_s16(vshrq_n_s16(x, 2), one), one)), 2);
+}
+
 static inline cq15x8_t cq15x8_rshr2_i16(cq15x8_t x)
 {
-  return cq15x8_make(vrshrq_n_s16(x.val[0], 2), vrshrq_n_s16(x.val[1], 2));
+  return cq15x8_make(neon_quarter_even_s16(x.val[0]), neon_quarter_even_s16(x.val[1]));
 }
 static inline cq15x8_t cq15x8_set1_i16(int x)
 {
@@ -211,10 +224,18 @@ static inline cq15x8_t cq15x8_mulhrs_i16(cq15x8_t a, cq15x8_t b)
 {
   return cq15x8_make(vqrdmulhq_s16(a.val[0], b.val[0]), vqrdmulhq_s16(a.val[1], b.val[1]));
 }
-static inline cq15x8_t cq15x8_srai_i16(cq15x8_t a, int n)
+/* x / 2^n (n >= 1) with ties to even, (x + 2^(n-1) - 1 + ((x >> n) & 1)) >> n: no mean error. A plain
+ * arithmetic shift truncates (-(2^n - 1) / 2^(n+1) LSB mean, -0.44 for n = 3). */
+static inline int16x8_t neon_sra_even_s16(int16x8_t x, int n)
 {
-  int16x8_t sh = vdupq_n_s16((int16_t)-n);
-  return cq15x8_make(vshlq_s16(a.val[0], sh), vshlq_s16(a.val[1], sh));
+  const int16x8_t sh = vdupq_n_s16((int16_t)-n);
+  const int16x8_t odd = vandq_s16(vshlq_s16(x, sh), vdupq_n_s16(1));
+  const int16x8_t bias = vaddq_s16(odd, vdupq_n_s16((int16_t)((1 << (n - 1)) - 1)));
+  return vshlq_s16(vqaddq_s16(x, bias), sh);
+}
+static inline cq15x8_t cq15x8_sra_even_i16(cq15x8_t a, int n)
+{
+  return cq15x8_make(neon_sra_even_s16(a.val[0], n), neon_sra_even_s16(a.val[1], n));
 }
 static inline cq15x8_t cq15x8_unpacklo_i32(cq15x8_t a, cq15x8_t b)
 {
@@ -252,6 +273,9 @@ static inline cq15x8_t cq15x8_select_halves(cq15x8_t a, cq15x8_t b, int imm)
 #define Q15_INV_SQRT8 ((int16_t)11585) /* round(32767 / sqrt(8)) */
 
 #define Q15_HALF 16384
+/* 1 / 2 as a twiddle factor. vqrdmulh rounds ties up, and x * 16384 is a tie for every odd x: +0.25 LSB
+ * on average per multiply, which adds up in the DC bin. With 16383 the ties round toward zero. */
+#define Q15_HALF_TW 16383
 
 typedef enum { DFT_DIR_FORWARD = -1, DFT_DIR_INVERSE = 1 } dft_dir_t;
 
@@ -272,9 +296,24 @@ static inline int16_t sat_q15(long x)
   return (int16_t)x;
 }
 
+/* Q15 constant for vqrdmulh without a tie bias (see Q15_HALF_TW): multiples of 4096 move one step toward zero. */
+static inline int16_t q15_untie(int16_t v)
+{
+  return (v & 0xfff) || !v ? v : v > 0 ? v - 1 : v + 1;
+}
+
 static inline int16_t q15_from_float(float x)
 {
-  return sat_q15((long)lrintf(32767.0f * x));
+  return q15_untie(sat_q15((long)lrintf(32767.0f * x)));
+}
+
+/* Q15 constant c for a data scaling. A multiple of 4096 (1/2, 1/4, ...) makes every tie round up with
+ * vqrdmulh; c - 1 and c + 1 in alternate complex lanes round them toward and away from zero: no mean
+ * error, and the gain errors of the two sets of lanes cancel. */
+static inline int16x8_t neon_q15_dup_unbiased(int16_t c)
+{
+  const int16x8_t alt = {-1, -1, 1, 1, -1, -1, 1, 1};
+  return (c & 0xfff) || !c ? vdupq_n_s16(c) : vaddq_s16(vdupq_n_s16(c), alt);
 }
 
 static inline neon_m128i swap_complex_pairs_i16_128(neon_m128i a)
@@ -308,7 +347,7 @@ static inline neon_m128i mul_minus_j_q15_128(neon_m128i z)
 
 static inline neon_m128i q15_mul_i16_128(neon_m128i x, int16_t q15)
 {
-  return neon128_mulhrs_i16(x, neon128_set1_i16(q15));
+  return neon128_from_i16(vqrdmulhq_s16(neon128_as_i16(x), neon_q15_dup_unbiased(q15)));
 }
 
 #define Q15_INV_SQRT3 18919 /* 1 / sqrt(3) */
@@ -426,7 +465,7 @@ static int16_t q15_unitary_scale_coeff(int16_t x, int radix)
     case 3:
       return sat_q15((long)((float)x / sqrtf(3.0f)));
     case 4:
-      return (int16_t)(x / 2);
+      return q15_untie((int16_t)(x / 2));
     case 5:
       return sat_q15((long)((float)x / sqrtf(5.0f)));
     default:
@@ -591,9 +630,23 @@ SVE2_TARGET static inline svint16_t sve2_cmul_q15(svint16_t a, svint16_t b)
   return y;
 }
 
+/* SVE2 version of neon_q15_dup_unbiased(). */
+SVE2_TARGET static inline svint16_t sve2_q15_dup_unbiased(int16_t c)
+{
+  if ((c & 0xfff) || !c)
+    return svdup_n_s16(c);
+  return svadd_s16_x(svptrue_b16(), svdup_n_s16(c), svdupq_n_s16(-1, -1, 1, 1, -1, -1, 1, 1));
+}
+
 SVE2_TARGET static inline svint16_t sve2_q15_real_mul(svint16_t x, int16_t c)
 {
-  return svqrdmulh_s16(x, svdup_n_s16(c));
+  return svqrdmulh_s16(x, sve2_q15_dup_unbiased(c));
+}
+
+/* x / 2 with ties to the odd neighbour (see neon_half_odd_s16()). */
+SVE2_TARGET static inline svint16_t sve2_half_odd_s16(svbool_t pg, svint16_t x)
+{
+  return svorr_s16_x(pg, svasr_n_s16_x(pg, x, 1), svand_n_s16_x(pg, x, 1));
 }
 
 SVE2_TARGET static inline void sve2_dft3_q15(svint16_t x0, svint16_t x1, svint16_t x2, svint16_t *y0, svint16_t *y1, svint16_t *y2)
@@ -615,6 +668,31 @@ sve2_dft4_q15(svint16_t x0, svint16_t x1, svint16_t x2, svint16_t x3, svint16_t 
   const svint16_t d02 = svqsub_s16_x(pg, x0, x2);
   const svint16_t s13 = svqadd_s16_x(pg, x1, x3);
   const svint16_t d13 = svqsub_s16_x(pg, x1, x3);
+  *y0 = svqadd_s16_x(pg, s02, s13);
+  *y2 = svqsub_s16_x(pg, s02, s13);
+  *y1 = svqcadd_s16(d02, d13, 270);
+  *y3 = svqcadd_s16(d02, d13, 90);
+}
+
+/* sve2_dft4_q15() of x / 2. (a + b) / 2 and (a - b) / 2 are computed without overflow by halving add/sub,
+ * which drop the same bit, (a ^ b) & 1; setting it rounds ties to odd: no mean error, one rounding per
+ * pair instead of one per input. */
+SVE2_TARGET static inline void sve2_dft4_half_q15(svint16_t x0,
+                                                  svint16_t x1,
+                                                  svint16_t x2,
+                                                  svint16_t x3,
+                                                  svint16_t *y0,
+                                                  svint16_t *y1,
+                                                  svint16_t *y2,
+                                                  svint16_t *y3)
+{
+  const svbool_t pg = svptrue_b16();
+  const svint16_t p02 = svand_n_s16_x(pg, sveor_s16_x(pg, x0, x2), 1);
+  const svint16_t p13 = svand_n_s16_x(pg, sveor_s16_x(pg, x1, x3), 1);
+  const svint16_t s02 = svorr_s16_x(pg, svhadd_s16_x(pg, x0, x2), p02);
+  const svint16_t d02 = svorr_s16_x(pg, svhsub_s16_x(pg, x0, x2), p02);
+  const svint16_t s13 = svorr_s16_x(pg, svhadd_s16_x(pg, x1, x3), p13);
+  const svint16_t d13 = svorr_s16_x(pg, svhsub_s16_x(pg, x1, x3), p13);
   *y0 = svqadd_s16_x(pg, s02, s13);
   *y2 = svqsub_s16_x(pg, s02, s13);
   *y1 = svqcadd_s16(d02, d13, 270);
@@ -700,7 +778,7 @@ SVE2_TARGET static void sve2_dft_q15(const sve2_plan_t *p, const c16_t *src, c16
     const int m = st->m;
     const int q = st->q;
     const int cplx_per_vec = (int)svcnth() / 2;
-    const svint16_t scale0 = svdup_n_s16(st->scale_q15);
+    const svint16_t scale0 = sve2_q15_dup_unbiased(st->scale_q15);
 
     for (int base = 0; base < p->N; base += m) {
       for (int j = 0; j < q; j += cplx_per_vec) {
@@ -772,7 +850,7 @@ static sve2_dft64_twiddle_t g_sve2_dft64_tw;
 
 static inline int16_t sve2_dft64_q15_half_twiddle(float x)
 {
-  return (int16_t)(q15_from_float(x) / 2);
+  return q15_untie((int16_t)(q15_from_float(x) / 2));
 }
 
 static void sve2_dft64_prepare(void)
@@ -805,8 +883,8 @@ static void sve2_dft64_prepare(void)
 
 SVE2_TARGET static inline svint16_t sve2_q15_half_shift(svbool_t pg, svint16_t x)
 {
-  /* Power-of-two 1/2 normalization without a Q15 multiply. */
-  return svasr_n_s16_x(pg, x, 1);
+  /* Power-of-two 1/2 normalization without a Q15 multiply, ties to odd (no bias). */
+  return sve2_half_odd_s16(pg, x);
 }
 
 SVE2_TARGET static inline svint16_t sve2_dft64_apply_scaled_twiddle_q15(svbool_t pg, svint16_t x, int k, int r)
@@ -884,12 +962,12 @@ SVE2_TARGET static void sve2_dft64_q15_leaf(const c16_t *src, c16_t *dst)
   c16_t gbuf[64] __attribute__((aligned(64)));
 
   for (int i = 0; i < 4; i++) {
-    const svint16_t x0 = sve2_q15_half_shift(pg, svld1_s16(pg, (const int16_t *)(src + 4 * (i))));
-    const svint16_t x1 = sve2_q15_half_shift(pg, svld1_s16(pg, (const int16_t *)(src + 4 * (i + 4))));
-    const svint16_t x2 = sve2_q15_half_shift(pg, svld1_s16(pg, (const int16_t *)(src + 4 * (i + 8))));
-    const svint16_t x3 = sve2_q15_half_shift(pg, svld1_s16(pg, (const int16_t *)(src + 4 * (i + 12))));
+    const svint16_t x0 = svld1_s16(pg, (const int16_t *)(src + 4 * (i)));
+    const svint16_t x1 = svld1_s16(pg, (const int16_t *)(src + 4 * (i + 4)));
+    const svint16_t x2 = svld1_s16(pg, (const int16_t *)(src + 4 * (i + 8)));
+    const svint16_t x3 = svld1_s16(pg, (const int16_t *)(src + 4 * (i + 12)));
     svint16_t y0, y1, y2, y3;
-    sve2_dft4_q15(x0, x1, x2, x3, &y0, &y1, &y2, &y3);
+    sve2_dft4_half_q15(x0, x1, x2, x3, &y0, &y1, &y2, &y3);
     svst1_s16(pg, (int16_t *)(hbuf + 4 * (4 * i)), y0);
     svst1_s16(pg, (int16_t *)(hbuf + 4 * (4 * i + 1)), y1);
     svst1_s16(pg, (int16_t *)(hbuf + 4 * (4 * i + 2)), y2);
@@ -1043,19 +1121,10 @@ SVE2_TARGET static void sve2_dft128_q15_fused_st2(const c16_t *src, c16_t *dst)
     const svint16_t o2 = sve2_cmul_q15(svqsub_s16_x(pg, x20, x21), svld1_s16(pg, g_sve2_dft128_tw.w128_q15[b2]));
     const svint16_t o3 = sve2_cmul_q15(svqsub_s16_x(pg, x30, x31), svld1_s16(pg, g_sve2_dft128_tw.w128_q15[b3]));
 
-    const svint16_t ce0 = sve2_q15_real_mul(e0, Q15_HALF);
-    const svint16_t ce1 = sve2_q15_real_mul(e1, Q15_HALF);
-    const svint16_t ce2 = sve2_q15_real_mul(e2, Q15_HALF);
-    const svint16_t ce3 = sve2_q15_real_mul(e3, Q15_HALF);
-    const svint16_t co0 = sve2_q15_real_mul(o0, Q15_HALF);
-    const svint16_t co1 = sve2_q15_real_mul(o1, Q15_HALF);
-    const svint16_t co2 = sve2_q15_real_mul(o2, Q15_HALF);
-    const svint16_t co3 = sve2_q15_real_mul(o3, Q15_HALF);
-
     svint16_t ey0, ey1, ey2, ey3;
     svint16_t oy0, oy1, oy2, oy3;
-    sve2_dft4_q15(ce0, ce1, ce2, ce3, &ey0, &ey1, &ey2, &ey3);
-    sve2_dft4_q15(co0, co1, co2, co3, &oy0, &oy1, &oy2, &oy3);
+    sve2_dft4_half_q15(e0, e1, e2, e3, &ey0, &ey1, &ey2, &ey3);
+    sve2_dft4_half_q15(o0, o1, o2, o3, &oy0, &oy1, &oy2, &oy3);
 
     svst1_s16(pg, (int16_t *)(h_even + 4 * (4 * i)), ey0);
     svst1_s16(pg, (int16_t *)(h_even + 4 * (4 * i + 1)), ey1);
@@ -1086,7 +1155,7 @@ static sve2_dft256_twiddle_t g_sve2_dft256_tw;
 static inline int16_t sve2_dft256_q15_twiddle_scaled(float x)
 {
   const int16_t q = q15_from_float(x);
-  return (int16_t)(q / 2);
+  return q15_untie((int16_t)(q / 2));
 }
 
 static void sve2_dft256_prepare(void)
@@ -1335,7 +1404,7 @@ static const uint16_t g_sve2_tiny_q15_swap[8] __attribute__((aligned(16))) = {2,
 static const uint16_t g_sve2_tiny_q15_take_ac[8] __attribute__((aligned(16))) = {0, 1, 8, 9, 0, 1, 8, 9};
 static const uint16_t g_sve2_tiny_q15_final[8] __attribute__((aligned(16))) = {0, 1, 2, 3, 8, 9, 10, 11};
 
-/* Packed unitary DFT4 using a rounded right shift for the 1/2 scaling.
+/* Packed unitary DFT4, the 1/2 scaling done by halving add/sub.
  * With VL=128, one SVE register holds four complex Q15 samples. */
 SVE2_TARGET static inline svint16_t sve2_dft4_q15_vec_rshift(svint16_t vin)
 {
@@ -1344,10 +1413,11 @@ SVE2_TARGET static inline svint16_t sve2_dft4_q15_vec_rshift(svint16_t vin)
   const svuint16_t iswp = svld1_u16(pg, g_sve2_tiny_q15_swap);
   const svuint16_t itake = svld1_u16(pg, g_sve2_tiny_q15_take_ac);
   const svuint16_t ifin = svld1_u16(pg, g_sve2_tiny_q15_final);
-  const svint16_t v = svrshr_n_s16_x(pg, vin, 1);
-  const svint16_t vr = svtbl_s16(v, irot);
-  const svint16_t sum = svqadd_s16_x(pg, v, vr);
-  const svint16_t dif = svqsub_s16_x(pg, v, vr);
+  /* (v + vr) / 2 and (v - vr) / 2, ties to odd (see sve2_dft4_half_q15()) */
+  const svint16_t vr = svtbl_s16(vin, irot);
+  const svint16_t par = svand_n_s16_x(pg, sveor_s16_x(pg, vin, vr), 1);
+  const svint16_t sum = svorr_s16_x(pg, svhadd_s16_x(pg, vin, vr), par);
+  const svint16_t dif = svorr_s16_x(pg, svhsub_s16_x(pg, vin, vr), par);
   const svint16_t ss = svtbl_s16(sum, iswp);
   const svint16_t ds = svtbl_s16(dif, iswp);
   const svint16_t a = svqadd_s16_x(pg, sum, ss);
@@ -1375,12 +1445,7 @@ SVE2_TARGET static inline void sve2_dft4_unitary_q15(svint16_t x0,
                                                      svint16_t *y2,
                                                      svint16_t *y3)
 {
-  const svbool_t pg = svptrue_b16();
-  x0 = sve2_q15_half_shift(pg, x0);
-  x1 = sve2_q15_half_shift(pg, x1);
-  x2 = sve2_q15_half_shift(pg, x2);
-  x3 = sve2_q15_half_shift(pg, x3);
-  sve2_dft4_q15(x0, x1, x2, x3, y0, y1, y2, y3);
+  sve2_dft4_half_q15(x0, x1, x2, x3, y0, y1, y2, y3);
 }
 
 SVE2_TARGET static inline void sve2_dft8_unitary_q15(svint16_t x0,
@@ -1401,10 +1466,10 @@ SVE2_TARGET static inline void sve2_dft8_unitary_q15(svint16_t x0,
                                                      svint16_t *y7)
 {
   const svbool_t pg = svptrue_b16();
-  static const int16_t w1_over_sqrt2_q15[8]
-      __attribute__((aligned(16))) = {Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF};
-  static const int16_t w3_over_sqrt2_q15[8]
-      __attribute__((aligned(16))) = {-Q15_HALF, -Q15_HALF, -Q15_HALF, -Q15_HALF, -Q15_HALF, -Q15_HALF, -Q15_HALF, -Q15_HALF};
+  static const int16_t w1_over_sqrt2_q15[8] __attribute__((
+      aligned(16))) = {Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW};
+  static const int16_t w3_over_sqrt2_q15[8] __attribute__((aligned(
+      16))) = {-Q15_HALF_TW, -Q15_HALF_TW, -Q15_HALF_TW, -Q15_HALF_TW, -Q15_HALF_TW, -Q15_HALF_TW, -Q15_HALF_TW, -Q15_HALF_TW};
   svint16_t e0, e1, e2, e3, o0, o1, o2, o3;
   sve2_dft4_unitary_q15(x0, x2, x4, x6, &e0, &e1, &e2, &e3);
   sve2_dft4_unitary_q15(x1, x3, x5, x7, &o0, &o1, &o2, &o3);
@@ -1470,12 +1535,12 @@ SVE2_TARGET static inline void sve2_idft12_q15_vectors(const c16_t *src, svint16
 SVE2_TARGET static inline void sve2_dft16_q15_vectors(const c16_t *src, svint16_t *y0, svint16_t *y1, svint16_t *y2, svint16_t *y3)
 {
   const svbool_t pg16 = svptrue_b16();
-  const svint16_t x0 = sve2_q15_half_shift(pg16, svld1_s16(pg16, (const int16_t *)(src)));
-  const svint16_t x1 = sve2_q15_half_shift(pg16, svld1_s16(pg16, (const int16_t *)(src + 4)));
-  const svint16_t x2 = sve2_q15_half_shift(pg16, svld1_s16(pg16, (const int16_t *)(src + 8)));
-  const svint16_t x3 = sve2_q15_half_shift(pg16, svld1_s16(pg16, (const int16_t *)(src + 12)));
+  const svint16_t x0 = svld1_s16(pg16, (const int16_t *)(src));
+  const svint16_t x1 = svld1_s16(pg16, (const int16_t *)(src + 4));
+  const svint16_t x2 = svld1_s16(pg16, (const int16_t *)(src + 8));
+  const svint16_t x3 = svld1_s16(pg16, (const int16_t *)(src + 12));
   svint16_t z0, z1, z2, z3;
-  sve2_dft4_q15(x0, x1, x2, x3, &z0, &z1, &z2, &z3);
+  sve2_dft4_half_q15(x0, x1, x2, x3, &z0, &z1, &z2, &z3);
   z1 = sve2_cmul_q15(z1, svld1_s16(pg16, g_sve2_tiny_tw.w16_q15[0]));
   z2 = sve2_cmul_q15(z2, svld1_s16(pg16, g_sve2_tiny_tw.w16_q15[1]));
   z3 = sve2_cmul_q15(z3, svld1_s16(pg16, g_sve2_tiny_tw.w16_q15[2]));
@@ -1700,7 +1765,7 @@ SVE2_TARGET static void sve2_dft512_q15(const c16_t *src, c16_t *dst)
 
 static inline int16x8_t neon_real_mul_q15(int16x8_t x, int16_t c)
 {
-  return vqrdmulhq_s16(x, vdupq_n_s16(c));
+  return vqrdmulhq_s16(x, neon_q15_dup_unbiased(c));
 }
 
 static inline int16x8_t neon_rot90_q15(int16x8_t x)
@@ -1907,7 +1972,7 @@ static inline int16_t sve2_large_q15_scale_coeff(float x, int radix)
   const int16_t q = q15_from_float(x);
   switch (radix) {
     case 4:
-      return (int16_t)(q / 2);
+      return q15_untie((int16_t)(q / 2));
     case 8:
       return sat_q15((long)((float)q / sqrtf(8.0f)));
     default:
@@ -3425,7 +3490,7 @@ static inline int16_t q15_twiddle_32768(float x)
     v = 32767;
   if (v < -32767)
     v = -32767;
-  return (int16_t)v;
+  return q15_untie((int16_t)v);
 }
 
 static void init_native_q15_leaf_twiddles(void)
@@ -3764,7 +3829,7 @@ static inline void dft64x8_batch_q15_store(const cq15x8_t x[64],
                    &H[7],
                    dir);
 
-    T[0][q] = cq15x8_srai_i16(H[0], 3);
+    T[0][q] = cq15x8_sra_even_i16(H[0], 3);
     for (int r = 1; r < 8; r++)
       T[r][q] =
           complex_mul8_prepack_q15(H[r], g_dft64_batch_re_re_q15[dir_slot][r][q], g_dft64_batch_im_signed_q15[dir_slot][r][q]);
@@ -3815,7 +3880,7 @@ static inline void dft64_q15_dir(const c16_t *src, c16_t *dst, dft_dir_t dir)
   const cq15x8_t *C64_RE = (dir == DFT_DIR_FORWARD) ? g_dft64_q15_tw.C64_RE_RE_q15 : g_dft64_q15_tw.C64_RE_RE_q15_inverse;
 
   const cq15x8_t *C64_IM = (dir == DFT_DIR_FORWARD) ? g_dft64_q15_tw.C64_IM_SIGNED_q15 : g_dft64_q15_tw.C64_IM_SIGNED_q15_inverse;
-  H0 = cq15x8_srai_i16(H0, 3);
+  H0 = cq15x8_sra_even_i16(H0, 3);
 
   H1 = complex_mul8_prepack_q15(H1, C64_RE[1], C64_IM[1]);
   H2 = complex_mul8_prepack_q15(H2, C64_RE[2], C64_IM[2]);
@@ -3948,10 +4013,15 @@ static inline void dft4x4_q15(const neon_m128i x0,
   const int16x8_t a2 = neon128_as_i16(x2);
   const int16x8_t a3 = neon128_as_i16(x3);
 
-  const int16x8_t s02 = vhaddq_s16(a0, a2);
-  const int16x8_t d02 = vhsubq_s16(a0, a2);
-  const int16x8_t s13 = vhaddq_s16(a1, a3);
-  const int16x8_t d13 = vhsubq_s16(a1, a3);
+  /* (a + b) >> 1 and (a - b) >> 1 have the same dropped bit, (a ^ b) & 1: setting it rounds ties to odd
+   * (no bias); the plain halving add/sub truncates (-0.25 LSB mean). */
+  const int16x8_t one = vdupq_n_s16(1);
+  const int16x8_t p02 = vandq_s16(veorq_s16(a0, a2), one);
+  const int16x8_t p13 = vandq_s16(veorq_s16(a1, a3), one);
+  const int16x8_t s02 = vorrq_s16(vhaddq_s16(a0, a2), p02);
+  const int16x8_t d02 = vorrq_s16(vhsubq_s16(a0, a2), p02);
+  const int16x8_t s13 = vorrq_s16(vhaddq_s16(a1, a3), p13);
+  const int16x8_t d13 = vorrq_s16(vhsubq_s16(a1, a3), p13);
 
   const neon_m128i d13_raw = neon128_from_i16(d13);
   const int16x8_t d13_mj = neon128_as_i16(mul_minus_j_q15_128(d13_raw));
@@ -5119,7 +5189,7 @@ static inline void dft64_radix4_q15_neon(const c16_t *__restrict src, c16_t *__r
 
     /* Branch zero applies the 1/2 scale with one arithmetic shift. For
      * branches 1..3 the same scale is folded into the packed W64 coefficients. */
-    A0 = neon128_from_i16(vshrq_n_s16(neon128_as_i16(A0), 1));
+    A0 = neon128_from_i16(neon_half_odd_s16(neon128_as_i16(A0)));
     A1 = complex_mul4_prepack_q15_128(A1, g_dft64_r4_re_re_q15[0][block], g_dft64_r4_im_signed_q15[0][block]);
     A2 = complex_mul4_prepack_q15_128(A2, g_dft64_r4_re_re_q15[1][block], g_dft64_r4_im_signed_q15[1][block]);
     A3 = complex_mul4_prepack_q15_128(A3, g_dft64_r4_re_re_q15[2][block], g_dft64_r4_im_signed_q15[2][block]);
@@ -5167,9 +5237,9 @@ static inline void dft8x4_q15_unitary_native(const neon_m128i x0,
   E2 = q15_mul_i16_128(E2, Q15_INV_SQRT2);
   E3 = q15_mul_i16_128(E3, Q15_INV_SQRT2);
 
-  const neon_m128i half_re = neon128_set1_i16(Q15_HALF);
+  const neon_m128i half_re = neon128_set1_i16(Q15_HALF_TW);
   const neon_m128i half_minus_j =
-      neon128_setr_i16(Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF);
+      neon128_setr_i16(Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW);
 
   const neon_m128i T0 = q15_mul_i16_128(O0, Q15_INV_SQRT2);
   /* W8^1 / sqrt(2) = (1-j)/2. */
@@ -5177,7 +5247,7 @@ static inline void dft8x4_q15_unitary_native(const neon_m128i x0,
   /* W8^2 / sqrt(2) = -j/sqrt(2). */
   const neon_m128i T2 = mul_minus_j_q15_128(q15_mul_i16_128(O2, Q15_INV_SQRT2));
   /* W8^3 / sqrt(2) = (-1-j)/2. */
-  const neon_m128i T3 = complex_mul4_prepack_q15_128(O3, neon128_set1_i16((int16_t)-Q15_HALF), half_minus_j);
+  const neon_m128i T3 = complex_mul4_prepack_q15_128(O3, neon128_set1_i16((int16_t)-Q15_HALF_TW), half_minus_j);
 
   *Y0 = neon128_adds_i16(E0, T0);
   *Y4 = neon128_subs_i16(E0, T0);
@@ -5213,13 +5283,13 @@ static inline void idft8x4_q15_unitary_native(const neon_m128i x0,
   E1 = q15_mul_i16_128(E1, Q15_INV_SQRT2);
   E2 = q15_mul_i16_128(E2, Q15_INV_SQRT2);
   E3 = q15_mul_i16_128(E3, Q15_INV_SQRT2);
-  const neon_m128i half_re = neon128_set1_i16(Q15_HALF);
+  const neon_m128i half_re = neon128_set1_i16(Q15_HALF_TW);
   const neon_m128i half_plus_j =
-      neon128_setr_i16(-Q15_HALF, Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF, Q15_HALF, -Q15_HALF, Q15_HALF);
+      neon128_setr_i16(-Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW, -Q15_HALF_TW, Q15_HALF_TW);
   const neon_m128i T0 = q15_mul_i16_128(O0, Q15_INV_SQRT2);
   const neon_m128i T1 = complex_mul4_prepack_q15_128(O1, half_re, half_plus_j);
   const neon_m128i T2 = mul_j_q15_128(q15_mul_i16_128(O2, Q15_INV_SQRT2));
-  const neon_m128i T3 = complex_mul4_prepack_q15_128(O3, neon128_set1_i16((int16_t)-Q15_HALF), half_plus_j);
+  const neon_m128i T3 = complex_mul4_prepack_q15_128(O3, neon128_set1_i16((int16_t)-Q15_HALF_TW), half_plus_j);
   *Y0 = neon128_adds_i16(E0, T0);
   *Y4 = neon128_subs_i16(E0, T0);
   *Y1 = neon128_adds_i16(E1, T1);
@@ -5380,11 +5450,11 @@ static inline void neon_mono_idft8_q15(const c16_t *src, c16_t *dst)
  * Input/output layout is four contiguous c16 values in one int16x8_t. */
 static inline __attribute__((always_inline)) int16x8_t neon_dft4_packed_q15(int16x8_t vin)
 {
-  /* 1/sqrt(4) = 1/2: one rounded shift, no multiplier. */
-  const int16x8_t v = vrshrq_n_s16(vin, 1);
-  const int16x8_t vr = vextq_s16(v, v, 4);
-  const int16x8_t sum = vqaddq_s16(v, vr);
-  const int16x8_t dif = vqsubq_s16(v, vr);
+  /* 1/sqrt(4) = 1/2 by halving add/sub, ties to odd (no bias), no multiplier. */
+  const int16x8_t vr = vextq_s16(vin, vin, 4);
+  const int16x8_t par = vandq_s16(veorq_s16(vin, vr), vdupq_n_s16(1));
+  const int16x8_t sum = vorrq_s16(vhaddq_s16(vin, vr), par);
+  const int16x8_t dif = vorrq_s16(vhsubq_s16(vin, vr), par);
   const int16x8_t ss = vreinterpretq_s16_u32(vrev64q_u32(vreinterpretq_u32_s16(sum)));
   const int16x8_t ds = vreinterpretq_s16_u32(vrev64q_u32(vreinterpretq_u32_s16(dif)));
   const int16x8_t a = vqaddq_s16(sum, ss); /* Y0 replicated across complex lanes. */
