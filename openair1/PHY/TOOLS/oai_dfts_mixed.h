@@ -289,11 +289,8 @@ static inline void raw_radix12_pfa8_q15_256(const c16_t *src, int M, int off, si
                  x3 = simde_mm256_loadu_si256((const simde__m256i *)(src + ids[n][3] * M + off));
     /* Unitary DFT4: halve between the two add layers, so neither layer grows more than 2x the input
      * (the first layer is exact up to half full scale, the second sees halved values). */
-    const simde__m256i h = simde_mm256_set1_epi16(Q15_HALF);
-    const simde__m256i s02 = simde_mm256_mulhrs_epi16(simde_mm256_adds_epi16(x0, x2), h),
-                       d02 = simde_mm256_mulhrs_epi16(simde_mm256_subs_epi16(x0, x2), h),
-                       s13 = simde_mm256_mulhrs_epi16(simde_mm256_adds_epi16(x1, x3), h),
-                       d13 = simde_mm256_mulhrs_epi16(simde_mm256_subs_epi16(x1, x3), h);
+    const simde__m256i s02 = half_q15_256(simde_mm256_adds_epi16(x0, x2)), d02 = half_q15_256(simde_mm256_subs_epi16(x0, x2)),
+                       s13 = half_q15_256(simde_mm256_adds_epi16(x1, x3)), d13 = half_q15_256(simde_mm256_subs_epi16(x1, x3));
     s[n][0] = simde_mm256_adds_epi16(s02, s13);
     s[n][2] = simde_mm256_subs_epi16(s02, s13);
     add_pm_j_i16_256(d02, d13, &s[n][1], &s[n][3], dir);
