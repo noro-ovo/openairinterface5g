@@ -24,6 +24,10 @@ static pthread_mutex_t sr_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define Q15_INV_2SQRT3 ((int16_t)9459) /* 1 / (2 * sqrt(3)) */
 
 #define Q15_HALF ((int16_t)16384) /* 1 / 2 */
+/* 1 / 2 as a twiddle factor. mulhrs rounds ties up, and x * 16384 is a tie for every odd x: +0.25 LSB
+ * on average per multiply, which adds up in the DC bin. With 16383 the ties round toward zero. Data
+ * halvings use half_q15_256() (see there). */
+#define Q15_HALF_TW ((int16_t)16383)
 
 #define Q15_ONE ((int16_t)32767)
 
@@ -184,9 +188,15 @@ static inline simde__m256i c16_mul_q15_simd256(simde__m256i x, simde__m256i w_re
   return simde_mm256_shuffle_epi8(packed, mask);
 }
 
+/* Q15 constant for mulhrs without a tie bias (see Q15_HALF_TW): multiples of 4096 move one step toward zero. */
+static inline int16_t q15_untie(int16_t v)
+{
+  return (v & 0xfff) || !v ? v : v > 0 ? v - 1 : v + 1;
+}
+
 static inline int16_t q15_from_float(float x)
 {
-  return sat_i16((int32_t)lrintf(32767.0f * x));
+  return q15_untie(sat_i16((int32_t)lrintf(32767.0f * x)));
 }
 
 static inline simde__m128i swap_complex_pairs_i16_128(simde__m128i a)
@@ -249,8 +259,11 @@ DEFINE_COMPLEX_J_ROTATION(mul_minus_q15_128,
                           simde_mm_setr_epi16(1, -1, 1, -1, 1, -1, 1, -1),
                           simde_mm_sign_epi16)
 
+static inline simde__m128i half_q15_128(simde__m128i x);
 static inline simde__m128i q15_mul_i16_128(simde__m128i x, int16_t q15)
 {
+  if (q15 == Q15_HALF)
+    return half_q15_128(x);
   return simde_mm_mulhrs_epi16(x, simde_mm_set1_epi16(q15));
 }
 
@@ -900,11 +913,11 @@ static int init_sr_twiddle_simd(sr_twiddle_simd_t *tw, int N, dft_dir_t dir)
       float theta1 = (float)dir * 2.0f * (float)M_PI * k / (float)N;
       float theta3 = (float)dir * 6.0f * (float)M_PI * k / (float)N;
 
-      int16_t w1r = sat_i16(lrintf(32767.0f * cosf(theta1))) / 2;
-      int16_t w1i = sat_i16(lrintf(32767.0f * sinf(theta1))) / 2;
+      int16_t w1r = q15_untie(sat_i16(lrintf(32767.0f * cosf(theta1))) / 2);
+      int16_t w1i = q15_untie(sat_i16(lrintf(32767.0f * sinf(theta1))) / 2);
 
-      int16_t w3r = sat_i16(lrintf(32767.0f * cosf(theta3))) / 2;
-      int16_t w3i = sat_i16(lrintf(32767.0f * sinf(theta3))) / 2;
+      int16_t w3r = q15_untie(sat_i16(lrintf(32767.0f * cosf(theta3))) / 2);
+      int16_t w3i = q15_untie(sat_i16(lrintf(32767.0f * sinf(theta3))) / 2);
 
       w1_re_negim[2 * j] = w1r;
       w1_re_negim[2 * j + 1] = sat_i16(-(long)w1i);
@@ -964,10 +977,27 @@ static const sr_twiddle_simd_t *sr_twiddle_table_get(int N, dft_dir_t dir)
 #define DFT_MIXED_POWER2_MAX_N 65536
 
 /* Rounded halving. Leaf kernels halve their inputs before the first add so a
- * sum of two full-scale samples cannot saturate; their twiddles carry x2. */
+ * sum of two full-scale samples cannot saturate; their twiddles carry x2.
+ * mulhrs by 16384 rounds every tie (odd x) up: +0.25 LSB mean error per halving, which adds up in
+ * the DC bin. Here the ties round toward zero in the even complex lanes (16383) and away from zero
+ * in the odd ones (16385): no mean error, and the gain errors of the two sets of lanes cancel. */
+#define Q15_HALF_UNBIASED_8(c) c - 1, c - 1, c + 1, c + 1, c - 1, c - 1, c + 1, c + 1
 static inline simde__m256i half_q15_256(simde__m256i x)
 {
-  return simde_mm256_mulhrs_epi16(x, simde_mm256_set1_epi16(Q15_HALF));
+  return simde_mm256_mulhrs_epi16(x, simde_mm256_setr_epi16(Q15_HALF_UNBIASED_8(16384), Q15_HALF_UNBIASED_8(16384)));
+}
+
+/* x / 2 with ties to the odd neighbour, (x >> 1) | (x & 1): no mean error and no gain error, one or
+ * two operations more than half_q15_256(). Used by the DFT8 core, where the rounding matters most. */
+static inline simde__m256i half_odd_q15_256(simde__m256i x)
+{
+  return simde_mm256_or_si256(simde_mm256_srai_epi16(x, 1), simde_mm256_and_si256(x, simde_mm256_set1_epi16(1)));
+}
+
+/* x / 4, same tie handling as half_q15_256(). */
+static inline simde__m256i quarter_q15_256(simde__m256i x)
+{
+  return simde_mm256_mulhrs_epi16(x, simde_mm256_setr_epi16(Q15_HALF_UNBIASED_8(8192), Q15_HALF_UNBIASED_8(8192)));
 }
 
 static inline simde__m256i scale_q15_256(simde__m256i x, int16_t q15)
@@ -977,7 +1007,7 @@ static inline simde__m256i scale_q15_256(simde__m256i x, int16_t q15)
 
 static inline simde__m128i half_q15_128(simde__m128i x)
 {
-  return simde_mm_mulhrs_epi16(x, simde_mm_set1_epi16(Q15_HALF));
+  return simde_mm_mulhrs_epi16(x, simde_mm_setr_epi16(Q15_HALF_UNBIASED_8(16384)));
 }
 
 /* Radix-9 first stages scale their inputs by 1/sqrt(3) so the raw radix-3

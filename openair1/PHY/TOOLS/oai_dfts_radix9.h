@@ -67,7 +67,7 @@ static inline void radix3_butterfly8_unitary_q15_256(simde__m256i x0,
   const simde__m256i x0s = simde_mm256_mulhrs_epi16(x0, simde_mm256_set1_epi16(Q15_INV_SQRT3));
   const simde__m256i base = simde_mm256_subs_epi16(x0s, simde_mm256_mulhrs_epi16(sum, simde_mm256_set1_epi16(Q15_INV_2SQRT3)));
   /* not folded into the multiply: by 1/2 every odd input is a rounding tie (-0.5..1 dB) */
-  const simde__m256i imag = simde_mm256_mulhrs_epi16(diff, simde_mm256_set1_epi16(Q15_HALF));
+  const simde__m256i imag = half_q15_256(diff);
   *y0 = simde_mm256_adds_epi16(x0s, simde_mm256_mulhrs_epi16(sum, simde_mm256_set1_epi16(Q15_INV_SQRT3)));
   add_pm_j_i16_256(base, imag, y1, y2, dir);
 }
@@ -151,7 +151,7 @@ DEFINE_RAW_RADIX3_BUTTERFLY(radix3_butterfly8_q15_256,
                             simde__m256i,
                             simde_mm256_adds_epi16,
                             simde_mm256_subs_epi16,
-                            simde_mm256_mulhrs_epi16(sum, simde_mm256_set1_epi16(Q15_HALF)),
+                            half_q15_256(sum),
                             mul_minus_j_scaled_dir_i16_256(diff, Q15_HALF_SQRT3, dir),
                             unused)
 
@@ -407,19 +407,20 @@ static inline simde__m256i complex_mul8_bcast_small_q15_256(simde__m256i a, int1
  * one YMM register. Partial final groups use AVX2 mask stores, not XMM tails.
  * ------------------------------------------------------------------------- */
 
-static const int16_t dft8_leaf_twiddle_re[8] = {16384, 11585, 0, -11585, -16384, -11585, 0, 11585};
-static const int16_t dft8_leaf_twiddle_im_fwd[8] = {0, -11585, -16384, -11585, 0, 11585, 16384, 11585};
-/* Leaf twiddles: round(S cos(2 pi k / N)), S = 16384 (DFT8/12/16), 32768 / sqrt(8) (DFT32), 32768 / sqrt(5) (DFT20). */
+static const int16_t dft8_leaf_twiddle_re[8] = {16383, 11585, 0, -11585, -16383, -11585, 0, 11585};
+static const int16_t dft8_leaf_twiddle_im_fwd[8] = {0, -11585, -16383, -11585, 0, 11585, 16383, 11585};
+/* Leaf twiddles: round(S cos(2 pi k / N)), S = 16383 (DFT8/12/16, see Q15_HALF_TW), 32768 / sqrt(8) (DFT32), 32768 / sqrt(5)
+ * (DFT20). */
 static const int16_t dft16_leaf_twiddle_re[16] =
-    {16384, 15137, 11585, 6270, 0, -6270, -11585, -15137, -16384, -15137, -11585, -6270, 0, 6270, 11585, 15137};
+    {16383, 15137, 11585, 6270, 0, -6270, -11585, -15137, -16383, -15137, -11585, -6270, 0, 6270, 11585, 15137};
 static const int16_t dft16_leaf_twiddle_im_fwd[16] =
-    {0, -6270, -11585, -15137, -16384, -15137, -11585, -6270, 0, 6270, 11585, 15137, 16384, 15137, 11585, 6270};
-static const int16_t dft32_leaf_twiddle_re[32] = {11585, 11363, 10703, 9633,   8192,   6436,   4433,   2260,   0,     -2260, -4433,
-                                                  -6436, -8192, -9633, -10703, -11363, -11585, -11363, -10703, -9633, -8192, -6436,
-                                                  -4433, -2260, 0,     2260,   4433,   6436,   8192,   9633,   10703, 11363};
+    {0, -6270, -11585, -15137, -16383, -15137, -11585, -6270, 0, 6270, 11585, 15137, 16383, 15137, 11585, 6270};
+static const int16_t dft32_leaf_twiddle_re[32] = {11585, 11363, 10703, 9633,   8191,   6436,   4433,   2260,   0,     -2260, -4433,
+                                                  -6436, -8191, -9633, -10703, -11363, -11585, -11363, -10703, -9633, -8191, -6436,
+                                                  -4433, -2260, 0,     2260,   4433,   6436,   8191,   9633,   10703, 11363};
 static const int16_t dft32_leaf_twiddle_im_fwd[32] = {
-    0, -2260, -4433, -6436, -8192, -9633, -10703, -11363, -11585, -11363, -10703, -9633, -8192, -6436, -4433, -2260,
-    0, 2260,  4433,  6436,  8192,  9633,  10703,  11363,  11585,  11363,  10703,  9633,  8192,  6436,  4433,  2260};
+    0, -2260, -4433, -6436, -8191, -9633, -10703, -11363, -11585, -11363, -10703, -9633, -8191, -6436, -4433, -2260,
+    0, 2260,  4433,  6436,  8191,  9633,  10703,  11363,  11585,  11363,  10703,  9633,  8191,  6436,  4433,  2260};
 
 static __attribute__((always_inline)) inline simde__m256i complex_lane_mask_epi32(int valid)
 {
@@ -731,8 +732,8 @@ dft32x8_twiddle_scaled_store(const c16_t *b, int M, c16_t *dst, int R, int first
     dft32x8_twiddle_scaled_store_body(b, M, dst, R, first, valid, NULL, DFT_DIR_INVERSE);
 }
 
-static const int16_t dft12_leaf_twiddle_re[12] = {16384, 14189, 8192, 0, -8192, -14189, -16384, -14189, -8192, 0, 8192, 14189};
-static const int16_t dft12_leaf_twiddle_im_fwd[12] = {0, -8192, -14189, -16384, -14189, -8192, 0, 8192, 14189, 16384, 14189, 8192};
+static const int16_t dft12_leaf_twiddle_re[12] = {16383, 14189, 8191, 0, -8191, -14189, -16383, -14189, -8191, 0, 8191, 14189};
+static const int16_t dft12_leaf_twiddle_im_fwd[12] = {0, -8191, -14189, -16383, -14189, -8191, 0, 8191, 14189, 16383, 14189, 8191};
 
 static __attribute__((always_inline)) inline void load_four_leaf_inputs_gathered(const c16_t *b,
                                                                                  int M,
@@ -890,7 +891,7 @@ static __attribute__((always_inline)) inline void dft12x8_pointer_batch_store(co
 DEFINE_UNITARY_DFT4(dft4x8_q15_256_exact,
                     __attribute__((always_inline)),
                     simde__m256i,
-                    simde_mm256_srai_epi16,
+                    half_q15_256,
                     simde_mm256_adds_epi16,
                     simde_mm256_subs_epi16,
                     simde_mm256_add_epi16,
@@ -919,15 +920,14 @@ static inline void dft8x8_q15_256_parent(const simde__m256i x0,
   /* The DFT32 decomposition requires a unitary DFT8. Its inputs come from the radix-9 stage, whose peaks
    * can exceed half full scale, so they are halved (rounded) before the first layer and the core applies
    * the remaining 1/sqrt(2) after it: no intermediate value exceeds the input peak times sqrt(2). */
-  const simde__m256i h = simde_mm256_set1_epi16(Q15_HALF);
-  dft8x8_q15_256_core(simde_mm256_mulhrs_epi16(x0, h),
-                      simde_mm256_mulhrs_epi16(x1, h),
-                      simde_mm256_mulhrs_epi16(x2, h),
-                      simde_mm256_mulhrs_epi16(x3, h),
-                      simde_mm256_mulhrs_epi16(x4, h),
-                      simde_mm256_mulhrs_epi16(x5, h),
-                      simde_mm256_mulhrs_epi16(x6, h),
-                      simde_mm256_mulhrs_epi16(x7, h),
+  dft8x8_q15_256_core(half_q15_256(x0),
+                      half_q15_256(x1),
+                      half_q15_256(x2),
+                      half_q15_256(x3),
+                      half_q15_256(x4),
+                      half_q15_256(x5),
+                      half_q15_256(x6),
+                      half_q15_256(x7),
                       &Y[0],
                       &Y[1],
                       &Y[2],
