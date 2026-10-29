@@ -703,17 +703,18 @@ void nr_pusch_llr_true_scale(int16_t *llr, int n, int qm, int shift, uint32_t nv
     e++;
   int q = (int)lrintf(g / (float)(1 << e) * 32768.0f);
   q = q > 32767 ? 32767 : q;
-  const simde__m256i vq = simde_mm256_set1_epi16(q);
+  // symmetric saturation at +-32767: the descrambling negates LLRs (x * -1), which leaves -32768 negative
+  const simde__m256i vq = simde_mm256_set1_epi16(q), vmin = simde_mm256_set1_epi16(-32767);
   int k = 0;
   for (; k + 16 <= n; k += 16) {
     simde__m256i v = simde_mm256_mulhrs_epi16(simde_mm256_loadu_si256((simde__m256i *)&llr[k]), vq);
     for (int i = 0; i < e; i++)
       v = simde_mm256_adds_epi16(v, v);
-    simde_mm256_storeu_si256((simde__m256i *)&llr[k], v);
+    simde_mm256_storeu_si256((simde__m256i *)&llr[k], simde_mm256_max_epi16(v, vmin));
   }
   for (; k < n; k++) {
     int v = ((llr[k] * q + 16384) >> 15) << e;
-    llr[k] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+    llr[k] = v > 32767 ? 32767 : v < -32767 ? -32767 : v;
   }
 }
 
