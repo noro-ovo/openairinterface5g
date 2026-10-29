@@ -209,32 +209,33 @@ int nrLDPC_llr_agc_parse(const char *str, nr_ldpc_llr_agc_rule_t *rule)
   return 0;
 }
 
-void nrLDPC_llr_stats(const int16_t *z, int b, int e, int step, nr_ldpc_llr_stats_t *st)
+void nrLDPC_llr_copy_stats(int16_t *dst, const int16_t *src, int n, nr_ldpc_llr_stats_t *st)
 {
+  // the copy is memory bound: the |x| sum and the zero count ride along at almost no cost
   const simde__m256i ones = simde_mm256_set1_epi16(1);
   simde__m256i acc = simde_mm256_setzero_si256(), zc = simde_mm256_setzero_si256();
-  int i = b, nv = 0;
-  for (; i + 16 <= e; i += 16 * step, nv++) {
-    const simde__m256i v = simde_mm256_loadu_si256((const simde__m256i *)(z + i));
+  int i = 0;
+  for (; i + 16 <= n; i += 16) {
+    const simde__m256i v = simde_mm256_loadu_si256((const simde__m256i *)(src + i));
+    simde_mm256_storeu_si256((simde__m256i *)(dst + i), v);
     acc = simde_mm256_add_epi32(acc, simde_mm256_madd_epi16(simde_mm256_abs_epi16(v), ones));
-    zc = simde_mm256_sub_epi16(zc, simde_mm256_cmpeq_epi16(v, simde_mm256_setzero_si256())); // < 2^15 per lane
+    zc = simde_mm256_sub_epi16(zc, simde_mm256_cmpeq_epi16(v, simde_mm256_setzero_si256())); // < 2^16 per lane (n < 2^20)
   }
   int32_t a[8];
-  int16_t c[16];
+  uint16_t c[16];
   simde_mm256_storeu_si256((simde__m256i *)a, acc);
   simde_mm256_storeu_si256((simde__m256i *)c, zc);
   int32_t sabs = 0, nzero = 0;
   for (int k = 0; k < 8; k++)
     sabs += a[k];
   for (int k = 0; k < 16; k++)
-    nzero += (uint16_t)c[k];
-  int n = 16 * nv;
-  if (step == 1) // tail
-    for (; i < e; i++, n++) {
-      const int v = z[i];
-      sabs += v < 0 ? -v : v;
-      nzero += v == 0;
-    }
+    nzero += c[k];
+  for (; i < n; i++) {
+    const int v = src[i];
+    dst[i] = src[i];
+    sabs += v < 0 ? -v : v;
+    nzero += v == 0;
+  }
   st->sabs += sabs;
   st->nnz += n - nzero;
   st->n += n;
