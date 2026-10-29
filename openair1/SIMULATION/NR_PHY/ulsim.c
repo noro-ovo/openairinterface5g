@@ -1112,6 +1112,7 @@ int main(int argc, char *argv[])
       uint8_t round = 0;
       crc_status = 1;
       errors_decoding = 0;
+      error_flag = 0; // per trial: a later trial whose CRC passes with a wrong payload is a false positive
       NR_gNB_PUSCH *pusch_vars = &gNB->pusch_vars[UE_id];
 
       while (round < max_rounds && crc_status && !stop) {
