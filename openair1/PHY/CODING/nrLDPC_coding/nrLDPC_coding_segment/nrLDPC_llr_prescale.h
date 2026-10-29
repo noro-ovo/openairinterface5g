@@ -118,9 +118,10 @@ typedef struct {
 } nr_ldpc_llr_stats_t;
 
 /**
- * \brief accumulate the statistics of z[b..e) into st, sampling one 16-value vector out of `step` (step 1 = all values)
+ * \brief copy n int16 LLRs src -> dst and accumulate their statistics (sum |x|, non-zero count) into st (n < 2^20; the
+ *        int32 sum is exact for a code block of int16 LLRs)
  */
-void nrLDPC_llr_stats(const int16_t *z, int b, int e, int step, nr_ldpc_llr_stats_t *st);
+void nrLDPC_llr_copy_stats(int16_t *dst, const int16_t *src, int n, nr_ldpc_llr_stats_t *st);
 
 /**
  * \brief gain (mode GAIN, or NONE if exactly 1) that maps the measured mean |LLR| to target; gain in [2^-15, 256]
