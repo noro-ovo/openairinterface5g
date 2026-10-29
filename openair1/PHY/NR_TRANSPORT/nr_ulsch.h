@@ -28,6 +28,10 @@ NR_gNB_ULSCH_t new_gNB_ulsch(uint8_t max_ldpc_iterations, uint16_t N_RB_UL);
   @param nb_pusch, number of uplink shared channels
 */
 
+/// PUSCH true-LLR scaling (see nr_ulsch_demodulation.c): step in nats per LSB for Qm (0 = off) and the in-place rescale
+float nr_pusch_llr_true_step(int qm);
+void nr_pusch_llr_true_scale(int16_t *llr, int n, int qm, int shift, uint32_t nvar);
+
 int nr_ulsch_decoding(PHY_VARS_gNB *phy_vars_gNB,
                       NR_DL_FRAME_PARMS *frame_parms,
                       uint32_t frame,
