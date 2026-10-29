@@ -42,7 +42,12 @@
 /// maximum modulation order handled by the table (index = Qm, 0..8)
 #define NR_LDPC_LLR_PRESCALE_MAX_QM 8
 
-typedef enum { NR_LDPC_LLR_PRESCALE_NONE = 0, NR_LDPC_LLR_PRESCALE_FRAC, NR_LDPC_LLR_PRESCALE_LSHIFT } nr_ldpc_llr_prescale_mode_t;
+typedef enum {
+  NR_LDPC_LLR_PRESCALE_NONE = 0,
+  NR_LDPC_LLR_PRESCALE_FRAC,
+  NR_LDPC_LLR_PRESCALE_LSHIFT,
+  NR_LDPC_LLR_PRESCALE_GAIN ///< general gain 2^lshift * q15/2^15 (AGC), symmetric rounding, saturating
+} nr_ldpc_llr_prescale_mode_t;
 
 typedef struct {
   uint8_t mode; ///< nr_ldpc_llr_prescale_mode_t
@@ -83,5 +88,43 @@ static inline const nr_ldpc_llr_prescale_t *nrLDPC_llr_prescale_get(const nr_ldp
  * With ps == NULL or mode NONE this is exactly the legacy loop (simde_mm_packs_epi16 per 16 values).
  */
 void nrLDPC_llr_pack_int8(const int16_t *z, int8_t *l, int nvec, const nr_ldpc_llr_prescale_t *ps);
+
+/* ---------------------------------------------------------------------------------------------------------------
+ * Per-code-block AGC (default): the int16 LLR scale of OAI's receivers follows the received amplitude (the channel
+ * compensations normalise by |h|, not |h|^2), so a fixed per-Qm gain is only right at one amplitude. The AGC measures
+ * the mean |LLR| of the non-zero coded LLRs of each code block (fillers excluded; 1 of 4 vectors for blocks of more
+ * than 4096 LLRs) and scales the block to a per-(layers, Qm) target before the saturating int8 pack, in the same pass
+ * as the pack. The default targets are the mean |LLR| that OAI's receivers produce at the simulators' nominal level
+ * after the default pre-scale (1 layer: QPSK 12, 16QAM 124/4, 64QAM 92, 256QAM 73; 2+ layers: QPSK 33, 16QAM 40,
+ * 64QAM 80, 256QAM 73), i.e. the AGC keeps the measured nominal operating point at every amplitude.
+ * ------------------------------------------------------------------------------------------------------------- */
+#define NR_LDPC_LLR_AGC_DEFAULT "12,31,92,73/33,40,80,73"
+
+/// per-(layers, Qm) target mean |LLR| (int8 domain); 0 = no AGC for that Qm (the pre-scale rule applies)
+typedef struct {
+  float target[2][NR_LDPC_LLR_PRESCALE_MAX_QM + 1];
+} nr_ldpc_llr_agc_rule_t;
+
+/**
+ * \brief parse "default", "off" (all 0 = AGC disabled, the pre-scale rule applies), "t2,t4,t6,t8" or
+ * "t2,t4,t6,t8/u2,u4,u6,u8" (targets for QPSK..256QAM, 1 layer / 2+ layers; 0 disables that entry)
+ * \return 0 on success, -1 on error (rule then all 0)
+ */
+int nrLDPC_llr_agc_parse(const char *str, nr_ldpc_llr_agc_rule_t *rule);
+
+/// statistics of int16 LLRs: sum of |x| and number of non-zero values over the sampled positions, number sampled
+typedef struct {
+  int32_t sabs, nnz, n;
+} nr_ldpc_llr_stats_t;
+
+/**
+ * \brief accumulate the statistics of z[b..e) into st, sampling one 16-value vector out of `step` (step 1 = all values)
+ */
+void nrLDPC_llr_stats(const int16_t *z, int b, int e, int step, nr_ldpc_llr_stats_t *st);
+
+/**
+ * \brief gain (mode GAIN, or NONE if exactly 1) that maps the measured mean |LLR| to target; gain in [2^-15, 256]
+ */
+nr_ldpc_llr_prescale_t nrLDPC_llr_agc_gain(float target, const nr_ldpc_llr_stats_t *st);
 
 #endif
