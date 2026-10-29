@@ -69,6 +69,8 @@
  */
 typedef struct nrLDPC_decoding_parameters_s {
   t_nrLDPC_dec_params decoderParms;
+  /// LLRs already in true-LLR units (nrLDPC_TB_decoding_parameters_t.llr_true_scale): no pre-scale, no AGC
+  bool llr_true_scale;
 
   int r;
   uint8_t Qm;
@@ -99,6 +101,10 @@ typedef struct nrLDPC_decoding_parameters_s {
 
 /// Qm-dependent gain applied to the int16 LLRs before the int8 pack (see nrLDPC_llr_prescale.h), set once at init
 static nr_ldpc_llr_prescale_rule_t llr_prescale_rule;
+/// per-code-block AGC targets (replace the pre-scale for every (layers, Qm) with a non-zero target)
+static nr_ldpc_llr_agc_rule_t llr_agc_rule;
+/// guard against code blocks without channel information (see nr_process_decode_segment())
+static int llr_guard = 1;
 static pthread_once_t llr_prescale_once = PTHREAD_ONCE_INIT;
 
 /* Rule source, highest priority first:
@@ -110,10 +116,30 @@ static pthread_once_t llr_prescale_once = PTHREAD_ONCE_INIT;
  * "off" restores the legacy conversion bit-exactly. */
 static void llr_prescale_init(void)
 {
-  char *cfg = NULL;
+  char *cfg = NULL, *cfg_agc = NULL;
+  int cfg_guard = 1;
   const char *src = "default";
   if (config_get_if() != NULL) {
     paramdef_t params[] = {
+        {"llr_agc",
+         "per-code-block AGC of the int16 LLRs before the int8 LDPC decoder input (decoder oai only; the fast decoder has its own), "
+         "target mean |LLR| per Qm: \"t2,t4,t6,t8\" or \"t2,t4,t6,t8/u2,u4,u6,u8\" (1 layer / 2+ layers; 0 = use llr_prescale for "
+         "that Qm), \"default\" (" NR_LDPC_LLR_AGC_DEFAULT ") or \"off\" (llr_prescale only)\n",
+         0,
+         .strptr = &cfg_agc,
+         .defstrval = "default",
+         TYPE_STRING,
+         0,
+         NULL},
+        {"llr_guard",
+         "1: declare a code block failed without decoding when fewer than (K'-2Z)/2 of its coded LLRs are non-zero (an all-zero "
+         "input decodes to the all-zero codeword, whose CRC passes); 0: off\n",
+         0,
+         .iptr = &cfg_guard,
+         .defintval = 1,
+         TYPE_INT,
+         0,
+         NULL},
         {"llr_prescale",
          "Qm-dependent gain of the int16 LLRs before the int8 LDPC decoder input: \"g2,g4,g6,g8\" (QPSK..256QAM, any number of layers), "
          "\"g2,g4,g6,g8/h2,h4,h6,h8\" (1 layer / 2+ layers), \"default\" (decoder oai: " NR_LDPC_LLR_PRESCALE_DEFAULT
@@ -142,6 +168,29 @@ static void llr_prescale_init(void)
   char buf[160];
   nrLDPC_llr_prescale_str(&llr_prescale_rule, buf, sizeof(buf));
   LOG_I(PHY, "LDPC decoder input LLR pre-scale (decoder %s, %s \"%s\"): %s\n", nrLDPC_decoder_name(dec), src, str, buf);
+  const char *env_agc = getenv("OAI_LDPC_LLR_AGC");
+  const char *agc = env_agc ? env_agc : cfg_agc ? cfg_agc : "default";
+  // the fast decoder normalises its input itself (AGC on the non-zero LLRs): its default is the pre-scale rule only
+  if (dec == NR_LDPC_DECODER_FAST && !env_agc && (!cfg_agc || !strcasecmp(cfg_agc, "default")))
+    agc = "off";
+  AssertFatal(nrLDPC_llr_agc_parse(agc, &llr_agc_rule) == 0,
+              "invalid LDPC LLR AGC \"%s\": expected \"t2,t4,t6,t8\" or \"t2,t4,t6,t8/u2,u4,u6,u8\" with targets in [0,127], \"default\" or \"off\"\n",
+              agc);
+  const char *env_guard = getenv("OAI_LDPC_LLR_GUARD");
+  llr_guard = env_guard ? atoi(env_guard) != 0 : cfg_guard != 0;
+  LOG_I(PHY,
+        "LDPC decoder input LLR AGC (%s \"%s\"): 1 layer %g %g %g %g, 2+ layers %g %g %g %g (0 = pre-scale); all-zero guard %s\n",
+        env_agc ? "env OAI_LDPC_LLR_AGC" : cfg_agc ? "config" : "default",
+        agc,
+        llr_agc_rule.target[0][2],
+        llr_agc_rule.target[0][4],
+        llr_agc_rule.target[0][6],
+        llr_agc_rule.target[0][8],
+        llr_agc_rule.target[1][2],
+        llr_agc_rule.target[1][4],
+        llr_agc_rule.target[1][6],
+        llr_agc_rule.target[1][8],
+        llr_guard ? "on" : "off");
 }
 
 static void nr_process_decode_segment(void *arg)
@@ -223,11 +272,38 @@ static void nr_process_decode_segment(void *arg)
   memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
   // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
   int8_t l[68 * 384 + 16] __attribute__((aligned(16)));
-  nrLDPC_llr_pack_int8(z,
-                       l,
-                       ((Kc * rdata->Z) >> 4) + 1,
-                       p_decoderParms->llr_prescale_q8 == 256 ? NULL
-                                                              : nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, p_decoderParms->nb_layers));
+  // TBs already in true-LLR units (llr_true_scale, see nrLDPC_prepare_TB_decoding()) are packed without gain or AGC
+  const int true_scale = rdata->llr_true_scale;
+  const int nl_idx = p_decoderParms->nb_layers > 1;
+  const float agc_target = !true_scale && Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? llr_agc_rule.target[nl_idx][Qm] : 0;
+  const nr_ldpc_llr_prescale_t *ps = true_scale ? NULL : nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, p_decoderParms->nb_layers);
+  nr_ldpc_llr_prescale_t agc_ps;
+  if (agc_target > 0 || llr_guard) {
+    // statistics of the coded LLRs [2Z, Kc*Z) without the fillers [Kprime, K); 1 vector out of 4 for large blocks
+    const int n_all = Kc * rdata->Z;
+    const int step = n_all > 4096 ? 4 : 1;
+    nr_ldpc_llr_stats_t st = {0};
+    nrLDPC_llr_stats(z, 2 * rdata->Z, Kprime, step, &st);
+    nrLDPC_llr_stats(z, K, n_all, step, &st);
+    // Guard: fewer channel LLRs than half the number of information bits cannot be decoded. Without it, a block whose
+    // LLRs all underflowed to 0 (very weak or absent signal) decodes to the all-zero codeword and passes its CRC (and,
+    // with zero payload, the TB CRC): a wrong TB would be delivered as correct.
+    if (llr_guard && (st.n == 0 || (int64_t)st.nnz * (n_all - 2 * rdata->Z - (K - Kprime)) < (int64_t)st.n * ((Kprime - 2 * rdata->Z) / 2))) {
+      LOG_D(PHY, "LDPC segment %d: %d/%d non-zero LLRs sampled, declared failed (guard)\n", rdata->r, st.nnz, st.n);
+      memset(rdata->c, 0, K >> 3);
+      *rdata->decodeSuccess = false;
+      completed_task_ans(rdata->ans);
+      return;
+    }
+    if (agc_target > 0) {
+      agc_ps = nrLDPC_llr_agc_gain(agc_target, &st);
+      ps = &agc_ps;
+      p_decoderParms->llr_prescale_q8 = agc_ps.q8;
+    }
+  }
+  nrLDPC_llr_pack_int8(z, l, ((Kc * rdata->Z) >> 4) + 1, ps);
+  if (ps && ps->mode != NR_LDPC_LLR_PRESCALE_NONE && rdata->F > 0)
+    memset(l + Kprime, 127, rdata->F); // fillers stay "known 0" whatever the gain
   //////////////////////////////////////////////////////////////////////////////////////////
 
   //////////////////////////////////////////////////////////////////////////////////////////
@@ -295,6 +371,7 @@ int nrLDPC_prepare_TB_decoding(nrLDPC_slot_decoding_parameters_t *nrLDPC_slot_de
     rdata->C = nrLDPC_TB_decoding_parameters->C;
     rdata->A = nrLDPC_TB_decoding_parameters->A;
     rdata->Qm = Qm;
+    rdata->llr_true_scale = nrLDPC_TB_decoding_parameters->llr_true_scale;
     rdata->K = nrLDPC_TB_decoding_parameters->K;
     rdata->Z = nrLDPC_TB_decoding_parameters->Z;
     rdata->F = nrLDPC_TB_decoding_parameters->F;
