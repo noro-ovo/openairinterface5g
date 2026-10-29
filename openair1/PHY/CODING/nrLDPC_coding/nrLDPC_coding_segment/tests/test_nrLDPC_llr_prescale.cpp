@@ -287,21 +287,27 @@ TEST(nrLDPC_llr_agc, exhaustive_gain_pack_vs_reference)
   }
 }
 
-TEST(nrLDPC_llr_agc, statistics_vs_scalar)
+TEST(nrLDPC_llr_agc, copy_statistics_vs_scalar)
 {
   std::mt19937 rng(11);
-  std::vector<int16_t> z(68 * 384 + 32);
+  std::vector<int16_t> z(68 * 384 + 32), d(68 * 384 + 32);
   for (auto &v : z)
     v = (rng() % 5 == 0) ? 0 : (int16_t)((int)(rng() % 65536) - 32768);
   for (int b : {0, 1, 7, 16, 33})
     for (int e : {b, b + 1, b + 15, b + 16, b + 17, 1000, 68 * 384}) {
+      std::fill(d.begin(), d.end(), (int16_t)0x5555);
       nr_ldpc_llr_stats_t st = {0};
-      nrLDPC_llr_stats(z.data(), b, e, 1, &st);
+      nrLDPC_llr_copy_stats(d.data() + b, z.data() + b, e - b, &st);
       long sa = 0, nz = 0;
       for (int i = b; i < e; i++) {
         sa += std::labs((long)z[i]);
         nz += z[i] != 0;
+        ASSERT_EQ(d[i], z[i]) << b << " " << e << " " << i;
       }
+      for (int i = 0; i < b; i++)
+        ASSERT_EQ(d[i], (int16_t)0x5555);
+      for (int i = e; i < (int)d.size(); i++)
+        ASSERT_EQ(d[i], (int16_t)0x5555);
       // the int32 sum is exact as long as it fits (true for a code block of int16 LLRs below |x| ~ 2^15 / 1.0)
       if (sa < (1L << 31)) {
         EXPECT_EQ(st.sabs, sa) << b << " " << e;
@@ -309,8 +315,4 @@ TEST(nrLDPC_llr_agc, statistics_vs_scalar)
       EXPECT_EQ(st.nnz, nz) << b << " " << e;
       EXPECT_EQ(st.n, e - b) << b << " " << e;
     }
-  // sub-sampling: one 16-value vector out of step
-  nr_ldpc_llr_stats_t st = {0};
-  nrLDPC_llr_stats(z.data(), 0, 64 * 16, 4, &st);
-  EXPECT_EQ(st.n, 16 * 16);
 }
