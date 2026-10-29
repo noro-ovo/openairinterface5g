@@ -1222,9 +1222,11 @@ void nr_decode_pucch2(PHY_VARS_gNB *gNB,
     for (int group = 0; group < nb_re_dmrs; group += 4)
       *(simde__m128i *)(pil_dmrs + group) = oai_mm_conj(byte2m128i[*sGold8++]);
 
-    // Compute delay
-    c16_t ch_ls[128] __attribute__((aligned(32))) = {0};
+    // Compute delay on each antenna and keep the strongest valid peak, the delay is common to all antennas
+    delay_t delay = {0};
     {
+      c16_t ch_ls[128] __attribute__((aligned(32))) = {0};
+      c16_t ch_temp[128] __attribute__((aligned(32)));
       c16_t rdmrs_gold[nb_re_dmrs] __attribute__((aligned(32)));
       for (int aa = 0; aa < Prx; aa++) {
         mult_complex_vectors(rdmrs_ext[aa], pil_dmrs, rdmrs_gold, nb_re_dmrs, 0);
@@ -1233,11 +1235,12 @@ void nr_decode_pucch2(PHY_VARS_gNB *gNB,
         for (int i = 0; i < nb_re_dmrs; i++)
           for (int k = 0; k < 3 && ch_ls_ptr < end; k++)
             *ch_ls_ptr++ = rdmrs_gold[i];
+        delay_t delay_aa = {0};
+        nr_est_delay(128, ch_ls, ch_temp, &delay_aa);
+        if (delay_aa.valid && delay_aa.delay_max_val > delay.delay_max_val)
+          delay = delay_aa;
       }
     }
-    c16_t ch_temp[128] __attribute__((aligned(32)));
-    delay_t delay = {0};
-    nr_est_delay(128, ch_ls, ch_temp, &delay);
 
     // Apply delay compensation on the input
     if (delay.est_delay != 0) {
