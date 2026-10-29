@@ -27,6 +27,7 @@
 #include "PHY/phy_vars.h"
 #include "SCHED_NR/sched_nr.h"
 #include "openair1/SIMULATION/TOOLS/sim.h"
+#include "openair1/SIMULATION/TOOLS/sim_rx_gain.h"
 #include "openair1/SIMULATION/RF/rf.h"
 #include "openair1/SIMULATION/NR_PHY/nr_unitary_defs.h"
 #include <executables/softmodem-common.h>
@@ -600,6 +601,14 @@ int main(int argc, char **argv)
         rxdata[aa] = malloc(frame_length_complex_samples * sizeof(**rxdata));
       for (i=0; i<frame_length_complex_samples; i++) {
         for (aa=0; aa<frame_parms->nb_antennas_rx; aa++) {
+          const sim_rx_gain_t *G = sim_rx_gain_get();
+          if (G->active) { // experiment: receive gain + int16 ADC (sim_rx_gain.h); same noise draws as below
+            const double nr = r_re[aa][i] + sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0);
+            const double ni = r_im[aa][i] + sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0);
+            rxdata[aa][i].r = sim_rx_adc(G->g * nr);
+            rxdata[aa][i].i = sim_rx_adc(G->g * ni);
+            continue;
+          }
           rxdata[aa][i].r = (short)(r_re[aa][i] + sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0));
           rxdata[aa][i].i = (short)(r_im[aa][i] + sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0));
         }
