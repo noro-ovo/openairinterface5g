@@ -6,7 +6,8 @@
 #include "nr_polar_psbch_defs.h"
 #include "common/utils/LOG/log.h"
 
-#define PolarKey ((messageType << 24) | (messageLength << 8) | aggregation_level)
+// messageType (< 8), messageLength (< 2048) and aggregation level / E (< 65536: UCI on PUSCH passes E here) in 32 bits
+#define PolarKey (((uint32_t)messageType << 27) | ((uint32_t)messageLength << 16) | (uint32_t)aggregation_level)
 static t_nrPolar_params *PolarList = NULL;
 pthread_mutex_t PolarListMutex = PTHREAD_MUTEX_INITIALIZER;
 

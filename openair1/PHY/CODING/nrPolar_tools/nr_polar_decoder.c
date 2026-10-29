@@ -35,7 +35,7 @@ int8_t polar_decoder(double *input,
                      uint8_t listSize,
                      int8_t messageType,
                      uint16_t messageLength,
-                     uint8_t aggregation_level)
+                     uint16_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
   // Assumes no a priori knowledge.
@@ -304,7 +304,7 @@ int8_t polar_decoder_dci(double *input,
                          uint16_t n_RNTI,
                          int8_t messageType,
                          uint16_t messageLength,
-                         uint8_t aggregation_level)
+                         uint16_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
 
@@ -587,7 +587,7 @@ uint32_t polar_decoder_int16(const int16_t *input,
                              uint8_t ones_flag,
                              int8_t messageType,
                              uint16_t messageLength,
-                             uint8_t aggregation_level)
+                             uint16_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
 #ifdef POLAR_CODING_DEBUG

@@ -562,7 +562,11 @@ void nr_uci_encoding(uint64_t payload, uint8_t nr_bit, uint8_t nrofPRB, uint16_t
   } else { // A >= 12
     // Polar encoder handles encoding and rate matching internally
     payload = reverse_bits(payload, A);
-    polar_encoder_fast(&payload, b, 0, 0, NR_POLAR_UCI_PUCCH_MESSAGE_TYPE, A, nrofPRB);
+    // nrofPRB == 0: UCI on PUSCH, rate matched to E (38.212 6.3.2.4); otherwise PUCCH format 2 (E = 16 nrofPRB)
+    if (nrofPRB == 0)
+      polar_encoder_fast(&payload, b, 0, 0, NR_POLAR_UCI_PUSCH_MESSAGE_TYPE, A, E);
+    else
+      polar_encoder_fast(&payload, b, 0, 0, NR_POLAR_UCI_PUCCH_MESSAGE_TYPE, A, nrofPRB);
   }
 }
 
