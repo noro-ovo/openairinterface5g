@@ -171,7 +171,8 @@ static void llr_prescale_init(void)
   const char *env_agc = getenv("OAI_LDPC_LLR_AGC");
   const char *agc = env_agc ? env_agc : cfg_agc ? cfg_agc : "default";
   // the fast decoder normalises its input itself (AGC on the non-zero LLRs): its default is the pre-scale rule only
-  if (dec == NR_LDPC_DECODER_FAST && !env_agc && (!cfg_agc || !strcasecmp(cfg_agc, "default")))
+  const int fast_default = dec == NR_LDPC_DECODER_FAST && !env_agc && (!cfg_agc || !strcasecmp(cfg_agc, "default"));
+  if (fast_default)
     agc = "off";
   AssertFatal(nrLDPC_llr_agc_parse(agc, &llr_agc_rule) == 0,
               "invalid LDPC LLR AGC \"%s\": expected \"t2,t4,t6,t8\" or \"t2,t4,t6,t8/u2,u4,u6,u8\" with targets in [0,127], \"default\" or \"off\"\n",
@@ -180,7 +181,7 @@ static void llr_prescale_init(void)
   llr_guard = env_guard ? atoi(env_guard) != 0 : cfg_guard != 0;
   LOG_I(PHY,
         "LDPC decoder input LLR AGC (%s \"%s\"): 1 layer %g %g %g %g, 2+ layers %g %g %g %g (0 = pre-scale); all-zero guard %s\n",
-        env_agc ? "env OAI_LDPC_LLR_AGC" : cfg_agc ? "config" : "default",
+        env_agc ? "env OAI_LDPC_LLR_AGC" : fast_default ? "default of the fast decoder" : cfg_agc ? "config" : "default",
         agc,
         llr_agc_rule.target[0][2],
         llr_agc_rule.target[0][4],
