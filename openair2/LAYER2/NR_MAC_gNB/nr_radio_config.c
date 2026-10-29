@@ -1564,6 +1564,10 @@ long ue_supported_ul_layers(const NR_UE_NR_Capability_t *uecap, int ul_id)
 
 static long set_ul_max_layers(const nr_mac_config_t *configuration, const NR_UE_NR_Capability_t *uecap, int ul_id)
 {
+  // phy-test without UE capability: the phy-test scheduler uses the configured number of UL layers (-L), so maxRank
+  // has to allow it (with 1 the UE reads the DCI precoding field as 1 layer while the gNB decodes 2)
+  if (!uecap && get_softmodem_params()->phy_test)
+    return configuration->pusch_AntennaPorts;
   return min(ue_supported_ul_layers(uecap, ul_id), configuration->pusch_AntennaPorts);
 }
 
