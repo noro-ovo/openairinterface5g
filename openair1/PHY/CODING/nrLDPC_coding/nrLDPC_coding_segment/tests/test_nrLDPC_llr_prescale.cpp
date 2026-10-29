@@ -214,3 +214,103 @@ int main(int argc, char **argv)
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
+
+// ---------------------------------------------------------------------------------------------- per-code-block AGC
+
+namespace {
+int8_t ref_gain(int16_t x, const nr_ldpc_llr_prescale_t &p)
+{
+  // y = sign(x) * round(min(|x|, 32767 >> k) * 2^k * q15 / 2^15) (round half away from zero), saturated to int8
+  long a = x == -32768 ? 32767 : std::labs((long)x);
+  const long c = 32767 >> p.lshift;
+  if (a > c)
+    a = c;
+  const long y = ((a << p.lshift) * p.q15 + (1 << 14)) >> 15;
+  return sat8(x < 0 ? -y : y);
+}
+} // namespace
+
+TEST(nrLDPC_llr_agc, parse)
+{
+  nr_ldpc_llr_agc_rule_t r, d;
+  ASSERT_EQ(nrLDPC_llr_agc_parse("default", &r), 0);
+  ASSERT_EQ(nrLDPC_llr_agc_parse(NR_LDPC_LLR_AGC_DEFAULT, &d), 0);
+  EXPECT_EQ(memcmp(&r, &d, sizeof(r)), 0);
+  EXPECT_EQ(r.target[0][4], 31.0f);
+  EXPECT_EQ(r.target[1][4], 40.0f);
+  ASSERT_EQ(nrLDPC_llr_agc_parse("off", &r), 0);
+  for (int l = 0; l < 2; l++)
+    for (int q = 0; q <= NR_LDPC_LLR_PRESCALE_MAX_QM; q++)
+      EXPECT_EQ(r.target[l][q], 0.0f);
+  ASSERT_EQ(nrLDPC_llr_agc_parse("10,20,0,40", &r), 0);
+  EXPECT_EQ(r.target[1][2], 10.0f);
+  EXPECT_EQ(r.target[0][6], 0.0f);
+  for (const char *bad : {"", "1,2,3", "1,2,3,4/", "1,2,3,4/5,6,7", "1,2,3,200", "-1,2,3,4", "x"})
+    EXPECT_EQ(nrLDPC_llr_agc_parse(bad, &r), -1) << bad;
+}
+
+TEST(nrLDPC_llr_agc, gain_selection)
+{
+  nr_ldpc_llr_stats_t st = {.sabs = 1000, .nnz = 10, .n = 20}; // mean |LLR| of the non-zero values: 100
+  nr_ldpc_llr_prescale_t p = nrLDPC_llr_agc_gain(25.0f, &st);
+  EXPECT_EQ(p.mode, NR_LDPC_LLR_PRESCALE_FRAC);
+  EXPECT_EQ(p.q15, 8192);
+  EXPECT_EQ(p.q8, 64);
+  st.sabs = 10; // mean 1 -> gain 25 = 2^5 * 0.78125
+  p = nrLDPC_llr_agc_gain(25.0f, &st);
+  EXPECT_EQ(p.mode, NR_LDPC_LLR_PRESCALE_GAIN);
+  EXPECT_EQ(p.lshift, 5);
+  EXPECT_EQ(p.q15, 25600);
+  st.sabs = 1; // gain capped at 256
+  p = nrLDPC_llr_agc_gain(100.0f, &st);
+  EXPECT_EQ(p.lshift, 8);
+  st.sabs = 0; // no non-zero LLR: x1
+  EXPECT_EQ(nrLDPC_llr_agc_gain(25.0f, &st).mode, NR_LDPC_LLR_PRESCALE_NONE);
+  st = {.sabs = 3100, .nnz = 100, .n = 100}; // mean = target: x1, legacy pack
+  EXPECT_EQ(nrLDPC_llr_agc_gain(31.0f, &st).mode, NR_LDPC_LLR_PRESCALE_NONE);
+}
+
+TEST(nrLDPC_llr_agc, exhaustive_gain_pack_vs_reference)
+{
+  const auto in = all_int16();
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> e(-15.0f, 8.0f);
+  for (int t = 0; t < 200; t++) {
+    nr_ldpc_llr_stats_t st = {.sabs = 1000, .nnz = 1000, .n = 1000};
+    const nr_ldpc_llr_prescale_t p = nrLDPC_llr_agc_gain(std::pow(2.0f, e(rng)), &st);
+    if (p.mode == NR_LDPC_LLR_PRESCALE_NONE)
+      continue;
+    std::vector<int8_t> out;
+    run(in, out, &p);
+    for (int i = 0; i < NVEC * 16; i++)
+      ASSERT_EQ(out[i], ref_gain(in[i], p)) << "k " << (int)p.lshift << " q15 " << p.q15 << " x " << in[i];
+  }
+}
+
+TEST(nrLDPC_llr_agc, statistics_vs_scalar)
+{
+  std::mt19937 rng(11);
+  std::vector<int16_t> z(68 * 384 + 32);
+  for (auto &v : z)
+    v = (rng() % 5 == 0) ? 0 : (int16_t)((int)(rng() % 65536) - 32768);
+  for (int b : {0, 1, 7, 16, 33})
+    for (int e : {b, b + 1, b + 15, b + 16, b + 17, 1000, 68 * 384}) {
+      nr_ldpc_llr_stats_t st = {0};
+      nrLDPC_llr_stats(z.data(), b, e, 1, &st);
+      long sa = 0, nz = 0;
+      for (int i = b; i < e; i++) {
+        sa += std::labs((long)z[i]);
+        nz += z[i] != 0;
+      }
+      // the int32 sum is exact as long as it fits (true for a code block of int16 LLRs below |x| ~ 2^15 / 1.0)
+      if (sa < (1L << 31)) {
+        EXPECT_EQ(st.sabs, sa) << b << " " << e;
+      }
+      EXPECT_EQ(st.nnz, nz) << b << " " << e;
+      EXPECT_EQ(st.n, e - b) << b << " " << e;
+    }
+  // sub-sampling: one 16-value vector out of step
+  nr_ldpc_llr_stats_t st = {0};
+  nrLDPC_llr_stats(z.data(), 0, 64 * 16, 4, &st);
+  EXPECT_EQ(st.n, 16 * 16);
+}
