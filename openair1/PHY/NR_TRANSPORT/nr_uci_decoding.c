@@ -2,6 +2,9 @@
  * SPDX-License-Identifier: LicenseRef-CSSL-1.0
  */
 
+#include "openair1/PHY/nr_phy_common/inc/nr_rx_norm.h"
+#include <math.h>
+#include <stdlib.h>
 #include "PHY/NR_TRANSPORT/nr_transport_proto.h"
 #include "PHY/CODING/nrSmallBlock/nr_small_block_defs.h"
 #include "PHY/NR_TRANSPORT/nr_ulsch.h"
@@ -40,18 +43,68 @@ void set_uci_payload(uint64_t *in, int n_bits, int n_bytes, uint8_t *out, int fr
   }
 }
 
+/* UCI on PUSCH uses the PUSCH int16 LLRs as they are, whose scale depends on the received amplitude and on the
+ * receiver: the polar decoder fails on clean input once |LLR| x E exceeds ~2^16 (16QAM LLRs reach 600 at the nominal
+ * level), and the small-block decoder input saturated at +-127 after combining. With the amplitude-invariant scaling
+ * (default) the LLRs are normalised first: mean |LLR| = min(64, 2^14/E) (>= 4) and clipped to 4x that for polar,
+ * mean |combined LLR| = 32 (clipped to +-127) for the small-block codes. */
+static int uci_llr_scale(const int16_t *in, int n, int16_t *out, double target, int clip)
+{
+  int64_t sabs = 0;
+  int nnz = 0;
+  for (int i = 0; i < n; i++) {
+    sabs += abs(in[i]);
+    nnz += in[i] != 0;
+  }
+  if (!sabs)
+    return 0;
+  const double k = target * nnz / (double)sabs;
+  for (int i = 0; i < n; i++) {
+    const long v = lrint(in[i] * k);
+    out[i] = v > clip ? clip : v < -clip ? -clip : (int16_t)v;
+  }
+  return 1;
+}
+
 static nr_uci_decoder_result_t uci_on_pusch_decoded_helper(const int16_t *llrs, int n_bits, int E, int Qm)
 {
   nr_uci_decoder_result_t res = {0};
+  const int rx_norm = nr_rx_norm_enabled(NR_RX_NORM_UCI);
   if (n_bits > 11) {
     // Polar decoding
     AssertFatal(n_bits <= 64, "Polar decoded seems to be capped to 64 bits\n");
+    AssertFatal(E > 0 && E < 65536, "UCI on PUSCH: E = %d out of range\n", E);
+    int16_t scaled[rx_norm ? E : 1];
+    if (rx_norm) {
+      double t = 16384.0 / E;
+      t = t > 64 ? 64 : t < 4 ? 4 : t;
+      if (uci_llr_scale(llrs, E, scaled, t, (int)(4 * t)))
+        llrs = scaled;
+    }
     int decoderState = polar_decoder_int16(llrs, &res.payload, 0, NR_POLAR_UCI_PUSCH_MESSAGE_TYPE, n_bits, E);
     res.payload = reverse_bits(res.payload, n_bits);
     res.crc_result = decoderState > 0;
   } else {
     int N = n_bits == 1 ? Qm : (n_bits == 2 ? 3 * Qm : 32); // 5.3.3 of 38.212
     int8_t decoder_input[N];
+    if (rx_norm) {
+      int32_t comb[32] = {0};
+      int16_t c16[32], c8[32];
+      for (int k = 0; k < E; k++)
+        comb[k % N] += llrs[k];
+      int32_t m = 0;
+      for (int i = 0; i < N; i++)
+        m = max(m, abs(comb[i]));
+      const int sh = m > 32767 ? log2_approx(m) - 14 : 0; // into int16 first (rare: very long repetition)
+      for (int i = 0; i < N; i++)
+        c16[i] = comb[i] >> sh;
+      if (uci_llr_scale(c16, N, c8, 32, 127)) {
+        for (int i = 0; i < N; i++)
+          decoder_input[i] = (int8_t)c8[i];
+      } else {
+        memset(decoder_input, 0, sizeof(decoder_input));
+      }
+    } else
     nr_rate_matching_smallcodeblock_rx(llrs, E, N, decoder_input);
     res.crc_result = 2;
     if (n_bits > 2)
