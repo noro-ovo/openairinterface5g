@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include "sim.h"
+#include "sim_rx_gain.h"
 
 /* linear phase noise model */
 void phase_noise(double ts, int16_t *InRe, int16_t *InIm)
@@ -34,8 +35,16 @@ void add_noise(c16_t **rxdata,
   for (int i = 0; i < length; i++) {
     for (int ap = 0; ap < nb_antennas_rx; ap++) {
       c16_t *rxd = &rxdata[ap][slot_offset + i + delay];
+      const sim_rx_gain_t *G = sim_rx_gain_get();
+      if (G->active) { // experiment: receive gain + int16 ADC (sim_rx_gain.h)
+        const double nr = r_re[ap][i] + sqrt(sigma / 2) * gaussZiggurat(0.0, 1.0);
+        const double ni = r_im[ap][i] + sqrt(sigma / 2) * gaussZiggurat(0.0, 1.0);
+        rxd->r = sim_rx_adc(G->g * nr);
+        rxd->i = sim_rx_adc(G->g * ni);
+      } else {
       rxd->r = r_re[ap][i] + sqrt(sigma / 2) * gaussZiggurat(0.0, 1.0); // convert to fixed point
       rxd->i = r_im[ap][i] + sqrt(sigma / 2) * gaussZiggurat(0.0, 1.0);
+      }
       /* Add phase noise if enabled */
       if (pdu_bit_map & ptrs_bit_map) {
         phase_noise(ts, &rxdata[ap][slot_offset + i + delay].r, &rxdata[ap][slot_offset + i + delay].i);
@@ -56,12 +65,20 @@ void add_noise_float(c16_t **rxdata,
                      const uint8_t nb_antennas_rx)
 {
   float sqrt_sigma_div2 = sqrtf(sigma / 2.0f);
+  const sim_rx_gain_t *G = sim_rx_gain_get();
 
   for (int i = 0; i < length; i++) {
     for (int ap = 0; ap < nb_antennas_rx; ap++) {
       c16_t *rxd = &rxdata[ap][slot_offset + i + delay];
-      rxd->r = (int16_t)(r_re[ap][i] + (gaussZiggurat(0.0, 1.0) * sqrt_sigma_div2));
-      rxd->i = (int16_t)(r_im[ap][i] + (gaussZiggurat(0.0, 1.0) * sqrt_sigma_div2));
+      if (G->active) { // experiment: receive gain + int16 ADC (sim_rx_gain.h); same noise draws as below
+        const double nr = r_re[ap][i] + (gaussZiggurat(0.0, 1.0) * sqrt_sigma_div2);
+        const double ni = r_im[ap][i] + (gaussZiggurat(0.0, 1.0) * sqrt_sigma_div2);
+        rxd->r = sim_rx_adc(G->g * nr);
+        rxd->i = sim_rx_adc(G->g * ni);
+      } else {
+        rxd->r = (int16_t)(r_re[ap][i] + (gaussZiggurat(0.0, 1.0) * sqrt_sigma_div2));
+        rxd->i = (int16_t)(r_im[ap][i] + (gaussZiggurat(0.0, 1.0) * sqrt_sigma_div2));
+      }
 
       if (apply_phase_noise) {
         phase_noise(ts, &rxd->r, &rxd->i);
