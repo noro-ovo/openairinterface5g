@@ -266,25 +266,27 @@ static void nr_process_decode_segment(void *arg)
   memset(z, 0, 2 * rdata->Z * sizeof(*z));
   // set Filler bits
   memset(z + Kprime, 127, rdata->F * sizeof(*z));
-  // Move coded bits before filler bits
-  memcpy(z + 2 * rdata->Z, rdata->d, (Kprime - 2 * rdata->Z) * sizeof(*z));
-  // skip filler bits
-  memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
-  // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
-  int8_t l[68 * 384 + 16] __attribute__((aligned(16)));
   // TBs already in true-LLR units (llr_true_scale, see nrLDPC_prepare_TB_decoding()) are packed without gain or AGC
   const int true_scale = rdata->llr_true_scale;
   const int nl_idx = p_decoderParms->nb_layers > 1;
   const float agc_target = !true_scale && Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? llr_agc_rule.target[nl_idx][Qm] : 0;
+  const int n_all = Kc * rdata->Z;
+  nr_ldpc_llr_stats_t st = {0};
+  if (agc_target > 0 || llr_guard) {
+    // statistics of the coded LLRs [2Z, Kc*Z) without the fillers [Kprime, K), taken while moving them into z
+    nrLDPC_llr_copy_stats(z + 2 * rdata->Z, rdata->d, Kprime - 2 * rdata->Z, &st);
+    nrLDPC_llr_copy_stats(z + K, rdata->d + (K - 2 * rdata->Z), n_all - K, &st);
+  } else {
+    // Move coded bits before filler bits
+    memcpy(z + 2 * rdata->Z, rdata->d, (Kprime - 2 * rdata->Z) * sizeof(*z));
+    // skip filler bits
+    memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
+  }
+  // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
+  int8_t l[68 * 384 + 16] __attribute__((aligned(16)));
   const nr_ldpc_llr_prescale_t *ps = true_scale ? NULL : nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, p_decoderParms->nb_layers);
   nr_ldpc_llr_prescale_t agc_ps;
   if (agc_target > 0 || llr_guard) {
-    // statistics of the coded LLRs [2Z, Kc*Z) without the fillers [Kprime, K); 1 vector out of 4 for large blocks
-    const int n_all = Kc * rdata->Z;
-    const int step = n_all > 4096 ? 4 : 1;
-    nr_ldpc_llr_stats_t st = {0};
-    nrLDPC_llr_stats(z, 2 * rdata->Z, Kprime, step, &st);
-    nrLDPC_llr_stats(z, K, n_all, step, &st);
     // Guard: fewer channel LLRs than half the number of information bits cannot be decoded. Without it, a block whose
     // LLRs all underflowed to 0 (very weak or absent signal) decodes to the all-zero codeword and passes its CRC (and,
     // with zero payload, the TB CRC): a wrong TB would be delivered as correct.
