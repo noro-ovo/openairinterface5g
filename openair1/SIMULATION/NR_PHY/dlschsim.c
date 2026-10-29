@@ -574,7 +574,8 @@ int main(int argc, char **argv)
 				}
 			}
 
-			if (errors_bit > 0) {
+			// false positive = decoding reported success but the payload is wrong
+			if (errors_bit > 0 && dlsch0_ue->last_iteration_cnt <= dlsch0_ue->max_ldpc_iterations) {
 				n_false_positive++;
 				if (n_trials == 1)
 					printf("errors_bit %u (trial %d)\n", errors_bit, trial);

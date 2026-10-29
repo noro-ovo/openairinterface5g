@@ -576,7 +576,9 @@ int main(int argc, char **argv)
       if (harq_process_gNB->processedSegments == harq_process_gNB->C) {
         bool crc_valid = check_crc(harq_process_gNB->b, lenWithCrc(1, TBS << 3), crcType(1, TBS << 3));
         if (!crc_valid) {
-          n_false_positive++;
+          n_errors++; // all code blocks decoded but the TB CRC failed: a detected error
+        } else if (memcmp(harq_process_gNB->b, test_input, TBS / 8) != 0) {
+          n_false_positive++; // CRC passed with a wrong payload
         }
       } else {
         n_errors++;
