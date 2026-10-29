@@ -5,6 +5,7 @@
 /*!
  * \brief Top-level routines for decoding the PUCCH physical channel
  */
+#include "openair1/PHY/nr_phy_common/inc/nr_rx_norm.h"
 #include "PHY/defs_RU.h"
 #include "nr_common.h"
 #include <stdio.h>
@@ -1442,13 +1443,25 @@ void nr_decode_pucch2(PHY_VARS_gNB *gNB,
     simde__m128i llrs[pucch_pdu->prb_size * 2 * nb_symbols];
     // non-coherent LLR computation on groups of 4 REs (half-PRBs)
     uint64_t corr = 0;
+    /* Amplitude-normalised LLRs (default): the legacy path truncates the int64 metrics (which grow with the 4th power
+     * of the received amplitude) to int32 and then to int16 after a fixed >> 8, so they wrap above ~20 dB over the
+     * simulators' nominal level (failure spikes at isolated levels) and quantise to 0..1 LSB 20 dB under it. Here the
+     * metrics stay 64-bit and the LLRs of the whole PUCCH are scaled so that the largest is 2^15 / E, which keeps the
+     * polar decoder clear of its internal saturation (it fails on clean input once |LLR| x E exceeds ~2^16). */
+    const int rx_norm = nr_rx_norm_enabled(NR_RX_NORM_PUCCH2);
+    int64_t llr64[pucch_pdu->prb_size * 2 * nb_symbols][8];
+    int64_t llr64_max = 0;
     const simde__m128i ones = simde_mm_set1_epi16(1);
     for (int symb = 0; symb < nb_symbols; symb++) {
       for (int half_prb = 0; half_prb < (2 * pucch_pdu->prb_size); half_prb++) {
         simde__m128i llr_num = simde_mm_set1_epi16(0);
         simde__m128i llr_den = simde_mm_set1_epi16(0);
+        int64_t num64[8], den64[8]; // amplitude-normalised path: exact metrics, LLR = max over cw (bit 0) - max (bit 1)
+        for (int j = 0; j < 8; j++)
+          num64[j] = den64[j] = INT64_MIN;
         for (int cw = 0; cw < 256; cw++) {
           int32_t corr_tmp = 0;
+          int64_t corr_tmp64 = 0;
           simde__m128i factor = pucch2_polar_factor_lut[cw];
           for (int aa = 0; aa < Prx; aa++) {
             simde__m128i re = *(simde__m128i *)&r_ext[aa][symb][half_prb * 4];
@@ -1465,14 +1478,35 @@ void nr_decode_pucch2(PHY_VARS_gNB *gNB,
             c64_t prod2 = {simde_mm_extract_epi32(prod, 0), simde_mm_extract_epi32(prod, 1)};
             csum(prod2, prod2, corr64);
             corr_tmp += squaredMod(prod2) >> (Prx / 2);
+            corr_tmp64 += squaredMod(prod2) >> (Prx / 2);
             // this is for UL CQI measurement
             if (cw == 0)
               corr += squaredMod(corr32[symb][half_prb >> 2][aa]);
+          }
+          if (rx_norm) {
+            const int16_t *lut = (const int16_t *)&pucch2_polar_llr_num_lut[cw];
+            for (int j = 0; j < 8; j++) {
+              if (lut[j])
+                num64[j] = max(num64[j], corr_tmp64);
+              else
+                den64[j] = max(den64[j], corr_tmp64);
+            }
+            continue;
           }
           simde__m128i corr16 = simde_mm_set1_epi16((int16_t)(corr_tmp >> 8));
           simde__m128i den = simde_mm_xor_si128(pucch2_polar_llr_num_lut[cw], ones);
           llr_num = simde_mm_max_epi16(simde_mm_mullo_epi16(corr16, pucch2_polar_llr_num_lut[cw]), llr_num);
           llr_den = simde_mm_max_epi16(simde_mm_mullo_epi16(corr16, den), llr_den);
+        }
+        if (rx_norm) {
+          int64_t *l64 = llr64[symb * 2 * pucch_pdu->prb_size + half_prb];
+          for (int j = 0; j < 8; j++) {
+            l64[j] = num64[j] - den64[j];
+            const int64_t a = l64[j] < 0 ? -l64[j] : l64[j];
+            if (a > llr64_max)
+              llr64_max = a;
+          }
+          continue;
         }
         // compute llrs
         llrs[half_prb + symb * 2 * pucch_pdu->prb_size] = simde_mm_subs_epi16(llr_num, llr_den);
@@ -1480,6 +1514,15 @@ void nr_decode_pucch2(PHY_VARS_gNB *gNB,
       } // half_prb
     } // symb
 
+    if (rx_norm) {
+      const int E = 16 * pucch_pdu->prb_size; // the polar code length of PUCCH format 2 (nr_polar_params)
+      const double k = llr64_max > 0 ? (double)(32768 / E) / (double)llr64_max : 0.0;
+      for (int i = 0; i < pucch_pdu->prb_size * 2 * nb_symbols; i++) {
+        int16_t *l16 = (int16_t *)&llrs[i];
+        for (int j = 0; j < 8; j++)
+          l16[j] = (int16_t)lrint(llr64[i][j] * k);
+      }
+    }
     // run polar decoder on llrs
     decoderState =
         polar_decoder_int16((int16_t *)llrs, decodedPayload, 0, NR_POLAR_UCI_PUCCH_MESSAGE_TYPE, nb_bit, pucch_pdu->prb_size);
