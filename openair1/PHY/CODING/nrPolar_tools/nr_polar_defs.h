@@ -109,14 +109,14 @@ typedef struct nrPolar_params {
   nr_polar_sc_t sc;
 } t_nrPolar_params;
 
-void polar_encoder(uint32_t *input, uint32_t *output, int8_t messageType, uint16_t messageLength, uint8_t aggregation_level);
+void polar_encoder(uint32_t *input, uint32_t *output, int8_t messageType, uint16_t messageLength, uint16_t aggregation_level);
 
 void polar_encoder_dci(uint32_t *in,
                        uint32_t *out,
                        uint16_t n_RNTI,
                        int8_t messageType,
                        uint16_t messageLength,
-                       uint8_t aggregation_level);
+                       uint16_t aggregation_level);
 
 void polar_encoder_fast(uint64_t *A,
                         void *out,
@@ -124,21 +124,21 @@ void polar_encoder_fast(uint64_t *A,
                         uint8_t ones_flag,
                         int8_t messageType,
                         uint16_t messageLength,
-                        uint8_t aggregation_level);
+                        uint16_t aggregation_level);
 
 int8_t polar_decoder(double *input,
                      uint32_t *output,
                      uint8_t listSize,
                      int8_t messageType,
                      uint16_t messageLength,
-                     uint8_t aggregation_level);
+                     uint16_t aggregation_level);
 
 uint32_t polar_decoder_int16(const int16_t *input,
                              uint64_t *out,
                              uint8_t ones_flag,
                              int8_t messageType,
                              uint16_t messageLength,
-                             uint8_t aggregation_level);
+                             uint16_t aggregation_level);
 
 int8_t polar_decoder_dci(double *input,
                          uint32_t *out,
@@ -146,7 +146,7 @@ int8_t polar_decoder_dci(double *input,
                          uint16_t n_RNTI,
                          int8_t messageType,
                          uint16_t messageLength,
-                         uint8_t aggregation_level);
+                         uint16_t aggregation_level);
 
 void nr_polar_build_sc_decoder(t_nrPolar_params *pp);
 void nr_polar_free_sc_decoder(t_nrPolar_params *pp);
