@@ -935,7 +935,7 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
 
     nr_uci_encoding(pusch_pdu->pusch_uci.harq_payload,
                     pusch_pdu->pusch_uci.harq_ack_bit_length,
-                    pucch_pdu->prb_size,
+                    0 /* UCI on PUSCH: rate matching to E */,
                     rm_info.E_uci_ACK,
                     mod_order,
                     &b_ack[0]);
@@ -953,7 +953,7 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
   if (pusch_pdu->pusch_uci.csi_payload.p1_bits != 0) {
     nr_uci_encoding(pusch_pdu->pusch_uci.csi_payload.part1_payload,
                     pusch_pdu->pusch_uci.csi_payload.p1_bits,
-                    pucch_pdu->prb_size,
+                    0 /* UCI on PUSCH: rate matching to E */,
                     rm_info.E_uci_CSI1,
                     mod_order,
                     &b_csi1[0]);
@@ -962,7 +962,7 @@ void nr_ue_ulsch_procedures(PHY_VARS_NR_UE *UE,
     if (pusch_pdu->pusch_uci.csi_payload.p2_bits > 0)
       nr_uci_encoding(pusch_pdu->pusch_uci.csi_payload.part2_payload,
                       pusch_pdu->pusch_uci.csi_payload.p2_bits,
-                      pucch_pdu->prb_size,
+                      0 /* UCI on PUSCH: rate matching to E */,
                       rm_info.E_uci_CSI2,
                       mod_order,
                       &b_csi2[0]);

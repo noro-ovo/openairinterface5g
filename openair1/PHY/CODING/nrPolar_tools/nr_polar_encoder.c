@@ -15,7 +15,7 @@
 // input  [a_31 a_30 ... a_0]
 // output [f_31 f_30 ... f_0] [f_63 f_62 ... f_32] ...
 
-void polar_encoder(uint32_t *in, uint32_t *out, int8_t messageType, uint16_t messageLength, uint8_t aggregation_level)
+void polar_encoder(uint32_t *in, uint32_t *out, int8_t messageType, uint16_t messageLength, uint16_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
   uint8_t nr_polar_A[polarParams->payloadBits];
@@ -114,7 +114,7 @@ void polar_encoder_dci(uint32_t *in,
                        uint16_t n_RNTI,
                        int8_t messageType,
                        uint16_t messageLength,
-                       uint8_t aggregation_level)
+                       uint16_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
 
@@ -268,7 +268,7 @@ void nr_polar_rm_interleaving_cb(void *in, void *out, uint16_t E)
 
   k = 0;
   uint64_t *out64 = (uint64_t *)out;
-  memset(out64, 0, E >> 3);
+  memset(out64, 0, (E + 7) >> 3); // in place: the bits of a last partial byte must be cleared too
   for (int j = 0; j < T; j++) {
     for (int i = 0; i < T - j; i++) {
       if (v[i][j] != -1) {
@@ -286,42 +286,14 @@ __attribute__((always_inline)) static inline void polar_rate_matching(const t_nr
   // handle rate matching with a single 128 bit word using bit shuffling
   // can be done with SIMD intrisics if needed
   if (polarParams->groupsize < 8) {
-    AssertFatal(polarParams->encoderLength <= 512,
-                "Need to handle groupsize(%d)<8 and N(%d)>512\n",
-                polarParams->groupsize,
-                polarParams->encoderLength);
-    uint128_t *out128 = (uint128_t *)out;
-    uint128_t *in128 = (uint128_t *)in;
-    for (int i = 0; i < polarParams->encoderLength >> 7; i++)
-      out128[i] = 0;
-#ifdef DEBUG_POLAR_ENCODER
-    uint128_t tmp1;
-#endif
+    // bit-wise: any E (bit i of out = bit rate_matching_pattern[i] of in, little-endian bit order)
+    const uint8_t *in8 = (const uint8_t *)in;
+    uint8_t *out8 = (uint8_t *)out;
+    memset(out8, 0, (polarParams->encoderLength + 7) >> 3);
     for (int i = 0; i < polarParams->encoderLength; i++) {
-#ifdef DEBUG_POLAR_ENCODER
-      printf("%d<-%u : %llx.%llx =>", i, polarParams->rate_matching_pattern[i], ((uint64_t *)out)[1], ((uint64_t *)out)[0]);
-#endif
-      uint8_t pi = polarParams->rate_matching_pattern[i];
-      uint8_t pi7 = pi >> 7;
-      uint8_t pimod128 = pi & 127;
-      uint8_t imod128 = i & 127;
-      uint8_t i7 = i >> 7;
-      uint128_t tmp0 = (in128[pi7] & (((uint128_t)1) << (pimod128)));
-
-      if (tmp0 != 0) {
-        out128[i7] = out128[i7] | ((uint128_t)1) << imod128;
-#ifdef DEBUG_POLAR_ENCODER
-        printf("%llx.%llx<->%llx.%llx => %llx.%llx\n",
-               ((uint64_t *)&tmp0)[1],
-               ((uint64_t *)&tmp0)[0],
-               ((uint64_t *)&tmp1)[1],
-               ((uint64_t *)&tmp1)[0],
-               ((uint64_t *)out)[1],
-               ((uint64_t *)out)[0]);
-#endif
-      }
+      const int pi = polarParams->rate_matching_pattern[i];
+      out8[i >> 3] |= ((in8[pi >> 3] >> (pi & 7)) & 1) << (i & 7);
     }
-
   }
   // These are based on LUTs for byte and short word groups
   else if (polarParams->groupsize == 8)
@@ -706,7 +678,7 @@ void polar_encoder_fast(uint64_t *A,
                         uint8_t ones_flag,
                         int8_t messageType,
                         uint16_t messageLength,
-                        uint8_t aggregation_level)
+                        uint16_t aggregation_level)
 {
   t_nrPolar_params *polarParams = nr_polar_params(messageType, messageLength, aggregation_level);
   if (polarParams->enc_invalid) {
