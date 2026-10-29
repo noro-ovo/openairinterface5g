@@ -1061,6 +1061,8 @@ int main(int argc, char *argv[])
 
     int error_flag = 0;
     n_false_positive = 0;
+    int amp_tb[3] = {0}; // experiment counters: delivered ok / CRC ok but wrong payload / CRC failed (per trial)
+    double amp_llr_sabs = 0, amp_llr_n = 0, amp_llr_zero = 0, amp_llr_rail = 0, amp_llr_ge127 = 0, amp_llr_max = 0; // int16 PHY LLRs
     effRate = 0;
     effTP = 0;
     roundStats = 0;
@@ -1576,6 +1578,16 @@ int main(int argc, char *argv[])
 
         for (i = 0; i < available_bits; i++) {
           const uint8_t current_bit = (UE->phy_sim_ulsch_f[i / 8] >> (i & 7)) & 1;
+          if (round == 0) {
+            const double a = fabs((double)pusch_vars->ulsch_llrs[i]);
+            amp_llr_sabs += a;
+            amp_llr_n++;
+            amp_llr_zero += a == 0;
+            amp_llr_rail += a >= 32767;
+            amp_llr_ge127 += a >= 127;
+            if (a > amp_llr_max)
+              amp_llr_max = a;
+          }
           if (((current_bit == 0) && (pusch_vars->ulsch_llrs[i] <= 0)) || ((current_bit == 1) && (pusch_vars->ulsch_llrs[i] >= 0))) {
             errors_scrambling[round]++;
           }
@@ -1597,6 +1609,7 @@ int main(int argc, char *argv[])
           errors_decoding++;
         }
       }
+      amp_tb[crc_status ? 2 : errors_decoding > 0 ? 1 : 0]++;
       if (errors_decoding > 0 && error_flag == 0) {
         n_false_positive++;
         if (n_trials==1)
@@ -1632,6 +1645,10 @@ int main(int argc, char *argv[])
 
     // adding values into file
     printf("*****************************************\n");
+    printf("AMP_TB: SNR %f trials %d ok %d crcok_wrong %d crcfail %d\n", SNR, trial, amp_tb[0], amp_tb[1], amp_tb[2]);
+    printf("AMP_LLR16: n %.0f mean_abs %.2f zero %.4e ge127 %.4e rail %.4e max %.0f\n",
+           amp_llr_n, amp_llr_n ? amp_llr_sabs / amp_llr_n : 0, amp_llr_n ? amp_llr_zero / amp_llr_n : 0,
+           amp_llr_n ? amp_llr_ge127 / amp_llr_n : 0, amp_llr_n ? amp_llr_rail / amp_llr_n : 0, amp_llr_max);
     printf("SNR %f: n_errors (%d/%d", SNR, n_errors[0], round_trials[0]);
     for (int r = 1; r < max_rounds; r++)
       printf(",%d/%d", n_errors[r], round_trials[r]);
