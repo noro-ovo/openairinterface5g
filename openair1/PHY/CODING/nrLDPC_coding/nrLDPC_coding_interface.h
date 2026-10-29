@@ -51,6 +51,8 @@ typedef struct nrLDPC_TB_decoding_parameters_s{
   uint8_t Qm;
   uint8_t mcs;
   uint8_t nb_layers;
+  /// LLRs already in true-LLR units (gNB PUSCH true-LLR scaling): packed to int8 without the Qm pre-scale
+  bool llr_true_scale;
 
   uint8_t BG;
   uint8_t rv_index;

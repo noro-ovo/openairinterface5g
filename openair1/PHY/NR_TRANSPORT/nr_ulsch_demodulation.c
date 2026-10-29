@@ -23,6 +23,8 @@
 #include "T.h"
 #include "T_messages_creator.h"
 #include <sys/time.h>
+#include <math.h>
+#include <pthread.h>
 #include "openair1/SCHED_NR/sched_nr.h"
 
 #define NR_MAX_PUSCH_CTX_STACK_BYTES (4 * 1024 * 1024) // channel estimates and compensated symbols of a group
@@ -658,6 +660,62 @@ static void symbol_unscrambling_demux(puschSymbolProc_t *rdata, int ue_idx, int 
   }
 }
 
+/* True-LLR scaling of the 1-layer PUSCH LLRs. OAI's LLRs follow the compensated signal amplitude (no 1/N0), so the
+ * saturating int16 -> int8 pack before the LDPC decoder clips most QAM LLRs. They are rescaled to max-log LLR units
+ * quantised with D[Qm] nats per LSB: g = 4 d_Qm 2^shift / (nvf nvar) / D[Qm], d_Qm = half the minimum distance of the
+ * unit-power constellation (x16 for QPSK, whose LLRs are comp >> 4), N0 = nvf nvar (the DMRS nvar is ~N0/6).
+ * env OAI_LLR_TRUE = "D" or "D2,D4,D6,D8" (default 0.125), "0" = off (legacy LLRs); OAI_LLR_TRUE_NVF overrides 6. */
+static float llr_true_step[9], llr_true_nvf = 6.0f;
+static pthread_once_t llr_true_once = PTHREAD_ONCE_INIT;
+static void llr_true_init(void)
+{
+  const char *e = getenv("OAI_LLR_TRUE");
+  float v[4] = {0.125f, 0.125f, 0.125f, 0.125f};
+  if (e) {
+    const int n = sscanf(e, "%f,%f,%f,%f", &v[0], &v[1], &v[2], &v[3]);
+    for (int i = n > 0 ? n : 0; i < 4; i++)
+      v[i] = n > 0 ? v[n - 1] : 0;
+  }
+  for (int i = 0; i < 4; i++)
+    llr_true_step[2 * i + 2] = v[i] > 0 ? v[i] : 0;
+  if (getenv("OAI_LLR_TRUE_NVF"))
+    llr_true_nvf = atof(getenv("OAI_LLR_TRUE_NVF"));
+  LOG_I(PHY, "PUSCH true-LLR scaling (1 layer), nats per LSB for Qm 2/4/6/8: %g %g %g %g (0 = off)\n", v[0], v[1], v[2], v[3]);
+}
+
+float nr_pusch_llr_true_step(int qm)
+{
+  pthread_once(&llr_true_once, llr_true_init);
+  return qm >= 0 && qm <= 8 ? llr_true_step[qm] : 0;
+}
+
+void nr_pusch_llr_true_scale(int16_t *llr, int n, int qm, int shift, uint32_t nvar)
+{
+  const float step = nr_pusch_llr_true_step(qm);
+  if (step <= 0 || nvar == 0)
+    return;
+  static const float dq[9] = {0, 0, 0.70710678f * 16, 0, 0.31622777f, 0, 0.15430335f, 0, 0.07669650f};
+  const float g = 4 * dq[qm] * (float)(1 << shift) / (llr_true_nvf * (float)nvar) / step;
+  // g = q / 2^15 * 2^e: Q15 mulhrs, then e saturating doublings
+  int e = 0;
+  while (g / (float)(1 << e) >= 1.0f && e < 14)
+    e++;
+  int q = (int)lrintf(g / (float)(1 << e) * 32768.0f);
+  q = q > 32767 ? 32767 : q;
+  const simde__m256i vq = simde_mm256_set1_epi16(q);
+  int k = 0;
+  for (; k + 16 <= n; k += 16) {
+    simde__m256i v = simde_mm256_mulhrs_epi16(simde_mm256_loadu_si256((simde__m256i *)&llr[k]), vq);
+    for (int i = 0; i < e; i++)
+      v = simde_mm256_adds_epi16(v, v);
+    simde_mm256_storeu_si256((simde__m256i *)&llr[k], v);
+  }
+  for (; k < n; k++) {
+    int v = ((llr[k] * q + 16384) >> 15) << e;
+    llr[k] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+  }
+}
+
 static void nr_pusch_symbol_processing(void *arg)
 {
   puschSymbolProc_t *rdata=(puschSymbolProc_t*)arg;
@@ -708,6 +766,11 @@ static void nr_pusch_symbol_processing(void *arg)
       const int layer_off = rdata->layer_offsets[u];
       if (ue_layers == 1) {
         llr_ptr = llrss[layer_off];  // zero-copy
+        nr_pusch_llr_true_scale(llr_ptr,
+                                nb_re_pusch * rdata->rel15_ul_group[u]->qam_mod_order,
+                                rdata->rel15_ul_group[u]->qam_mod_order,
+                                rdata->log2_maxh + rdata->layers_attenuation,
+                                rdata->nvar);
       } else {
         llr_ptr = llr_buf;
         const int qam = rdata->rel15_ul_group[u]->qam_mod_order;

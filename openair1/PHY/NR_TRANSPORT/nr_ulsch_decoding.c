@@ -146,6 +146,7 @@ int nr_ulsch_decoding(PHY_VARS_gNB *phy_vars_gNB,
     TB_parameters->Qm = pusch_pdu->qam_mod_order;
     TB_parameters->mcs = pusch_pdu->mcs_index;
     TB_parameters->nb_layers = pusch_pdu->nrOfLayers;
+    TB_parameters->llr_true_scale = pusch_pdu->nrOfLayers == 1 && nr_pusch_llr_true_step(pusch_pdu->qam_mod_order) > 0;
     // ------------------------------------------------------------------
 
     TB_parameters->processedSegments = &harq_process->processedSegments;
