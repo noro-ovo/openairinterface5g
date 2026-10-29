@@ -26,6 +26,7 @@
 #include "PHY/NR_UE_TRANSPORT/pucch_nr.h"
 #include "SCHED_NR/sched_nr.h"
 #include "openair1/SIMULATION/TOOLS/sim.h"
+#include "openair1/SIMULATION/TOOLS/sim_rx_gain.h"
 #include "openair1/SIMULATION/RF/rf.h"
 #include "openair1/SIMULATION/NR_PHY/nr_unitary_defs.h"
 #include "executables/nr-uesoftmodem.h"
@@ -577,8 +578,14 @@ int main(int argc, char **argv)
             for (int aarx = 0; aarx < n_rx; aarx++) {
               double nr = sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0);
               double ni = sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0);
+              const sim_rx_gain_t *G = sim_rx_gain_get();
+              if (G->active) { // experiment: receive gain + int16 quantiser (sim_rx_gain.h)
+                rxdataF[aarx][i].r = sim_rx_adc(G->g * tx_level_fp * (nr) / sqrt((double)txlev));
+                rxdataF[aarx][i].i = sim_rx_adc(G->g * tx_level_fp * (ni) / sqrt((double)txlev));
+              } else {
               rxdataF[aarx][i].r = (int16_t)(tx_level_fp * (nr) / sqrt((double)txlev));
               rxdataF[aarx][i].i = (int16_t)(tx_level_fp * (ni) / sqrt((double)txlev));
+              }
             }
           }
         }
@@ -606,8 +613,14 @@ int main(int argc, char **argv)
             rxr = rxr_tmp;
             double nr = sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0);
             double ni = sqrt(sigma2 / 2) * gaussdouble(0.0, 1.0);
+            const sim_rx_gain_t *G = sim_rx_gain_get();
+            if (G->active) { // experiment: receive gain + int16 quantiser (sim_rx_gain.h)
+              rxdataF[aarx][i0 + re].r = sim_rx_adc(G->g * tx_level_fp * (rxr + nr) / sqrt((double)txlev));
+              rxdataF[aarx][i0 + re].i = sim_rx_adc(G->g * tx_level_fp * (rxi + ni) / sqrt((double)txlev));
+            } else {
             rxdataF[aarx][i0 + re].r = (int16_t)(tx_level_fp * (rxr + nr) / sqrt((double)txlev));
             rxdataF[aarx][i0 + re].i = (int16_t)(tx_level_fp * (rxi + ni) / sqrt((double)txlev));
+            }
 
             if (n_trials == 1 && fabs(txr) > 0)
               printf("symb %d, re %d , aarx %d : txr %f, txi %f, chr %f, chi %f, nr %f, ni %f, rxr %f, rxi %f => %d,%d\n",
