@@ -14,6 +14,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include <assert.h>
 #include "common/platform_types.h"
 #include "PHY/sse_intrin.h"
@@ -301,41 +302,34 @@ extern "C" {
     return (c16_t){.r = (int16_t)(n.r * amp), .i = (int16_t)(n.i * amp)};
   }
 
-  // On N complex numbers
-  //   y.r += (x * alpha.r) >> 14
-  //   y.i += (x * alpha.i) >> 14
-  // See regular C implementation at the end
+  // On N complex numbers, rounded to nearest, saturated to int16
+  //   y.r += (x * alpha.r + 2^13) >> 14
+  //   y.i += (x * alpha.i + 2^13) >> 14
   static __attribute__((always_inline)) inline void c16multaddVectRealComplex(const int16_t *x,
                                                                               const c16_t *alpha,
                                                                               c16_t *y,
                                                                               const int N)
   {
-    // Default implementation for x86
-    const int8_t makePairs[32] __attribute__((aligned(32)))={
-      0,1,0+16,1+16,
-      2,3,2+16,3+16,
-      4,5,4+16,5+16,
-      6,7,6+16,7+16,
-      8,9,8+16,9+16,
-      10,11,10+16,11+16,
-      12,13,12+16,13+16,
-      14,15,14+16,15+16};
-    
-    simde__m256i alpha256= simde_mm256_set1_epi32(*(int32_t *)alpha);
-    simde__m128i *x128=(simde__m128i *)x;
-    simde__m128i *y128=(simde__m128i *)y;
-    AssertFatal(N%8==0,"Not implemented\n");
-    for (int i=0; i<N/8; i++) {
-      const simde__m256i xduplicate=simde_mm256_broadcastsi128_si256(*x128);
-      const simde__m256i x_duplicate_ordered=simde_mm256_shuffle_epi8(xduplicate,*(simde__m256i*)makePairs);
-      const simde__m256i x_mul_alpha_shift15 =simde_mm256_mulhrs_epi16(alpha256, x_duplicate_ordered);
-      // Existing multiplication normalization is weird, constant table in alpha need to be doubled
-      const simde__m256i x_mul_alpha_x2= simde_mm256_adds_epi16(x_mul_alpha_shift15,x_mul_alpha_shift15);
-      *y128 = simde_mm_adds_epi16(simde_mm256_extracti128_si256(x_mul_alpha_x2,0),*y128);
-      y128++;
-      *y128= simde_mm_adds_epi16(simde_mm256_extracti128_si256(x_mul_alpha_x2,1),*y128);
-      y128++;
-      x128++;
+    // 32-bit lanes (x, 1) . (alpha, 2^13) = x * alpha + 2^13: exact product with the rounding term in one madd
+    int32_t alpha32;
+    memcpy(&alpha32, alpha, sizeof(alpha32));
+    const simde__m256i coef = simde_mm256_unpacklo_epi16(simde_mm256_set1_epi32(alpha32), simde_mm256_set1_epi16(1 << 13));
+    const simde__m256i one_hi = simde_mm256_set1_epi32(1 << 16);
+    AssertFatal(N % 8 == 0, "Not implemented\n");
+    for (int i = 0; i < N; i += 8) {
+      // (x0, 1) .. (x3, 1) | (x4, 1) .. (x7, 1)
+      const simde__m256i x1 =
+          simde_mm256_or_si256(simde_mm256_cvtepu16_epi32(simde_mm_loadu_si128((simde__m128i *)(x + i))), one_hi);
+      // x0 x0 x1 x1 | x4 x4 x5 x5 and x2 x2 x3 x3 | x6 x6 x7 x7
+      const simde__m256i lo = simde_mm256_srai_epi32(simde_mm256_madd_epi16(simde_mm256_unpacklo_epi32(x1, x1), coef), 14);
+      const simde__m256i hi = simde_mm256_srai_epi32(simde_mm256_madd_epi16(simde_mm256_unpackhi_epi32(x1, x1), coef), 14);
+      // packs works per 128-bit lane: re/im of x0..x3 | x4..x7, in order
+      const simde__m256i prod = simde_mm256_packs_epi32(lo, hi);
+      // 128-bit accesses on y: callers step y by 4 elements between overlapping calls, a 256-bit load would straddle
+      // the previous call's stores and miss store forwarding
+      simde__m128i *y128 = (simde__m128i *)(y + i);
+      simde_mm_storeu_si128(y128, simde_mm_adds_epi16(simde_mm256_castsi256_si128(prod), simde_mm_loadu_si128(y128)));
+      simde_mm_storeu_si128(y128 + 1, simde_mm_adds_epi16(simde_mm256_extracti128_si256(prod, 1), simde_mm_loadu_si128(y128 + 1)));
     }
   }
 
