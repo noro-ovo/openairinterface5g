@@ -888,12 +888,16 @@ uint32_t nr_rx_pdsch(PHY_VARS_NR_UE *ue,
       *log2_maxh = (log2_approx(avgs) >> 1) + 1 + log2_approx(nbRx >> 1);
     else
       *log2_maxh = (log2_approx(avgs) >> 1) + log2_approx(nbRx >> 1);
-    // Amplitude-invariant shift (normalise by |h|^2 instead of |h|), equal to the legacy shift at the simulators'
-    // nominal level log2(avg) = 17 (1 and 2 layers). The 2-layer MMSE receiver overflowed ~25 dB above that level,
-    // the 1-layer LLRs saturated the int8 decoder input from ~5-10 dB.
+    // Amplitude-robust shift. 1 layer: normalise by |h|^2 instead of |h| (log2(avg) - 8, the legacy shift at the
+    // simulators' nominal level log2(avg) = 17); the LLRs no longer saturate the int8 decoder input from +5-10 dB.
+    // 2+ layers (MMSE): the shift enters H^H H, its Q15 inverse and the determinant, so the output scale is not a power
+    // law of the shift (each extra bit shrinks the LLRs ~8x, with level-dependent jumps). Measured on 2x2 16QAM at 17.1
+    // and 20 dB SNR: the legacy log2(avg)/2 overflows at +25 and +30 dB, log2(avg) overflows from -15 dB down, a 3/4
+    // slope decodes from -30 to +30 dB with fewer raw errors than legacy at every level (equal to legacy for
+    // log2(avg) = 16..18).
     if (nr_rx_norm_enabled(NR_RX_NORM_PDSCH)) {
       const int l2 = log2_approx(avgs);
-      *log2_maxh = (nl == 1 ? l2 - 8 : l2 - 9) + log2_approx(nbRx >> 1);
+      *log2_maxh = (nl == 1 ? l2 - 8 : (3 * l2) / 4 - 4) + log2_approx(nbRx >> 1);
       *log2_maxh = *log2_maxh < 0 ? 0 : *log2_maxh > 24 ? 24 : *log2_maxh;
     }
     LOG_D(PHY, "[DLSCH] AbsSubframe %d.%d log2_maxh = %d (%d)\n", frame % 1024, nr_slot_rx, *log2_maxh, avgs);
