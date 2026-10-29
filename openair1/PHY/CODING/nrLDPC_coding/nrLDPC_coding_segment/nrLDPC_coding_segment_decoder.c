@@ -223,7 +223,11 @@ static void nr_process_decode_segment(void *arg)
   memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
   // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
   int8_t l[68 * 384 + 16] __attribute__((aligned(16)));
-  nrLDPC_llr_pack_int8(z, l, ((Kc * rdata->Z) >> 4) + 1, nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, p_decoderParms->nb_layers));
+  nrLDPC_llr_pack_int8(z,
+                       l,
+                       ((Kc * rdata->Z) >> 4) + 1,
+                       p_decoderParms->llr_prescale_q8 == 256 ? NULL
+                                                              : nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, p_decoderParms->nb_layers));
   //////////////////////////////////////////////////////////////////////////////////////////
 
   //////////////////////////////////////////////////////////////////////////////////////////
@@ -265,7 +269,8 @@ int nrLDPC_prepare_TB_decoding(nrLDPC_slot_decoding_parameters_t *nrLDPC_slot_de
   const uint8_t Qm = nrLDPC_TB_decoding_parameters->Qm;
   decParams.Qm = Qm;
   decParams.nb_layers = nrLDPC_TB_decoding_parameters->nb_layers;
-  const nr_ldpc_llr_prescale_t *ps = nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, decParams.nb_layers);
+  const nr_ldpc_llr_prescale_t *ps =
+      nrLDPC_TB_decoding_parameters->llr_true_scale ? NULL : nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, decParams.nb_layers);
   decParams.llr_prescale_q8 = ps ? ps->q8 : 256;
 
   for (int r = 0; r < nrLDPC_TB_decoding_parameters->C; r++) {
