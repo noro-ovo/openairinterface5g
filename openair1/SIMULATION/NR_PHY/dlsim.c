@@ -1436,7 +1436,8 @@ int main(int argc, char **argv)
       ////////////////////////////////////////////////////////////
 
       amp_tb[!UE_harq_process->decodeResult ? 2 : errors_bit > 0 ? 1 : 0]++;
-      if (errors_bit > 0) {
+      // false positive = CRC passed but the payload is wrong (a failed TB is already counted in n_errors)
+      if (errors_bit > 0 && UE_harq_process->decodeResult) {
 	n_false_positive++;
 	if (n_trials == 1)
 	  printf("errors_bit = %u (trial %d)\n", errors_bit, trial);
