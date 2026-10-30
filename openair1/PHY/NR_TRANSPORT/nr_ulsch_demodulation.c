@@ -54,7 +54,8 @@ void nr_idft(int32_t *z, uint32_t Msc_PUSCH)
   memcpy(z, idft_output, bytes);
 }
 
-static void nr_ulsch_extract_rbs(c16_t *const rxF,
+/// returns the number of REs written to rxFext / chFext
+static int nr_ulsch_extract_rbs(c16_t *const rxF,
                                  c16_t *const chF,
                                  c16_t *rxFext,
                                  c16_t *chFext,
@@ -115,6 +116,7 @@ static void nr_ulsch_extract_rbs(c16_t *const rxF,
   } else if (is_dmrs_symbol == 0) {
     memcpy(rxF_ext, &rxF[start_re], nb_re_pusch * sizeof(c16_t));
     memcpy(ul_ch0_ext, ul_ch0, nb_re_pusch * sizeof(c16_t));
+    return nb_re_pusch;
   } else if (pusch_pdu->dmrs_config_type == pusch_dmrs_type1) { // 6 REs / PRB
     AssertFatal(delta == 0 || delta == 1, "Illegal delta %d\n",delta);
     c16_t *rxF32 = &rxF[start_re];
@@ -132,6 +134,7 @@ static void nr_ulsch_extract_rbs(c16_t *const rxF,
       *ul_ch0_ext++ = ul_ch0[idx];
     }
   }
+  return rxF_ext - rxFext;
 }
 
 static int get_nb_re_pusch(NR_DL_FRAME_PARMS *frame_parms,
@@ -183,8 +186,6 @@ static void inner_rx(PHY_VARS_gNB *gNB,
   c16_t rxFext[nb_rx_ant][buffer_length] __attribute__((aligned(64)));
   c16_t chFext[nb_layer][nb_rx_ant][buffer_length] __attribute__((aligned(64)));
 
-  memset(rxFext, 0, sizeof(rxFext));
-  memset(chFext, 0, sizeof(chFext));
   int dmrs_symbol;
   if (gNB->chest_time == 0)
     dmrs_symbol = dmrs_symbol_flag ? symbol : get_valid_dmrs_idx_for_channel_est(rel15_ul->ul_dmrs_symb_pos, symbol);
@@ -195,7 +196,8 @@ static void inner_rx(PHY_VARS_gNB *gNB,
 
   for (int aarx = 0; aarx < nb_rx_ant; aarx++) {
     for (int aatx = 0; aatx < nb_layer; aatx++) {
-      nr_ulsch_extract_rbs(rxF[aarx] + soffset + symbol * frame_parms->ofdm_symbol_size,
+      // only the padding beyond the extracted REs has to be cleared (the compensation reads buffer_length REs)
+      const int n_ext = nr_ulsch_extract_rbs(rxF[aarx] + soffset + symbol * frame_parms->ofdm_symbol_size,
                            ul_ch_estimates[aatx * nb_rx_ant + aarx],
                            rxFext[aarx],
                            chFext[aatx][aarx],
@@ -205,6 +207,8 @@ static void inner_rx(PHY_VARS_gNB *gNB,
                            frame_parms,
                            rel15_ul->rnti,
                            IS_BIT_SET(ptrs_symb_pos, symbol));
+      memset(rxFext[aarx] + n_ext, 0, sizeof(c16_t) * (buffer_length - n_ext));
+      memset(chFext[aatx][aarx] + n_ext, 0, sizeof(c16_t) * (buffer_length - n_ext));
 #if T_TRACER
       // Data Recording application supports only 1 layer and 1 Tx antenna, so only record the first layer and first Tx antenna
       if (aatx == 0 && aarx == 0) {
@@ -225,9 +229,7 @@ static void inner_rx(PHY_VARS_gNB *gNB,
   c16_t rxF_ch_magb[nb_layer][buffer_length] __attribute__((aligned(64)));
   c16_t rxF_ch_magc[nb_layer][buffer_length] __attribute__((aligned(64)));
 
-  memset(rho, 0, sizeof(rho));
-  for (int i = 0; i < nb_layer; i++)
-    memset(&rxdataF_comp[i][symbol * buffer_length], 0, sizeof(int32_t) * buffer_length);
+  // rho and rxdataF_comp: nr_channel_compensation() stores every element on the first rx antenna
 
   nr_channel_compensation(buffer_length,
                           buffer_length,
