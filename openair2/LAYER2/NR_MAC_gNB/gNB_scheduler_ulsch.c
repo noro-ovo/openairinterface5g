@@ -216,7 +216,10 @@ static int estimate_ul_buffer_short_bsr(const NR_BSR_SHORT *bsr)
   return estim_size;
 }
 
-static int estimate_ul_buffer_long_bsr(const NR_BSR_LONG *bsr)
+/* bytes assumed for an LCG with data whose Buffer Size field did not fit in a Long Truncated BSR */
+#define NR_BSR_UNREPORTED_LCG_BYTES 128
+
+static int estimate_ul_buffer_long_bsr(const NR_BSR_LONG *bsr, int ce_len)
 {
   LOG_D(NR_MAC,
         "LONG BSR, LCG ID(7-0) %d/%d/%d/%d/%d/%d/%d/%d\n",
@@ -238,6 +241,11 @@ static int estimate_ul_buffer_long_bsr(const NR_BSR_LONG *bsr)
   for (int n = 0; n < total_lcgids; n++) {
     if (!bsr_active[n])
       continue;
+    /* Long Truncated BSR (38.321 6.1.3.1): the bitmap may announce more LCGs than there are Buffer Size fields */
+    if (m + 1 >= ce_len) {
+      estim_size += NR_BSR_UNREPORTED_LCG_BYTES;
+      continue;
+    }
     int rep_idx = payload[m];
     int estim_idx = overestim_bsr_index(rep_idx);
     int idx = min(estim_idx, max);
@@ -606,7 +614,7 @@ static int nr_process_mac_pdu(gNB_MAC_INST *nrmac,
       case UL_SCH_LCID_L_BSR:
         /* Extract long BSR value */
         ce_ptr = &pduP[mac_subheader_len];
-        sched_ctrl->estimated_ul_buffer = estimate_ul_buffer_long_bsr((NR_BSR_LONG *)ce_ptr);
+        sched_ctrl->estimated_ul_buffer = estimate_ul_buffer_long_bsr((NR_BSR_LONG *)ce_ptr, mac_len);
         sched_ctrl->sched_ul_bytes = 0;
         LOG_D(NR_MAC, "LONG BSR at %4d.%2d, estim buf %d\n", frameP, slot, sched_ctrl->estimated_ul_buffer);
         break;

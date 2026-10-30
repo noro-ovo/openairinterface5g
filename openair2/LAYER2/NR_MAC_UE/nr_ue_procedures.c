@@ -4429,38 +4429,13 @@ int nr_write_ce_ulsch_pdu(uint8_t *mac_ce, NR_SINGLE_ENTRY_PHR_MAC_CE *power_hea
       NR_BSR_LONG *ceLong = (NR_BSR_LONG *)mac_ce;
       *ceLong = (NR_BSR_LONG){0};
       mac_ce += sizeof(NR_BSR_LONG);
-      // int NR_BSR_LONG_SIZE = 1;
-      if (bsr->bsr.lcg_bsr[0] && mac_ce < mac_ce_end) {
-        ceLong->LcgID0 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[0];
-      }
-      if (bsr->bsr.lcg_bsr[1] && mac_ce < mac_ce_end) {
-        ceLong->LcgID1 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[1];
-      }
-      if (bsr->bsr.lcg_bsr[2] && mac_ce < mac_ce_end) {
-        ceLong->LcgID2 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[2];
-      }
-      if (bsr->bsr.lcg_bsr[3] && mac_ce < mac_ce_end) {
-        ceLong->LcgID3 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[3];
-      }
-      if (bsr->bsr.lcg_bsr[4] && mac_ce < mac_ce_end) {
-        ceLong->LcgID4 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[4];
-      }
-      if (bsr->bsr.lcg_bsr[5] && mac_ce < mac_ce_end) {
-        ceLong->LcgID5 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[5];
-      }
-      if (bsr->bsr.lcg_bsr[6] && mac_ce < mac_ce_end) {
-        ceLong->LcgID6 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[6];
-      }
-      if (bsr->bsr.lcg_bsr[7] && mac_ce < mac_ce_end) {
-        ceLong->LcgID7 = 1;
-        *mac_ce++ = bsr->bsr.lcg_bsr[7];
+      // the LCG bitmap tells which LCGs have data, also those whose Buffer Size field does not fit in a truncated BSR
+      for (int lcg = 0; lcg < 8; lcg++) {
+        if (!bsr->bsr.lcg_bsr[lcg])
+          continue;
+        *(uint8_t *)ceLong |= 1 << lcg;
+        if (mac_ce < mac_ce_end)
+          *mac_ce++ = bsr->bsr.lcg_bsr[lcg];
       }
       *mac_pdu_subheader_ptr =
           (NR_MAC_SUBHEADER_SHORT){.LCID = bsr->type_bsr == b_long ? UL_SCH_LCID_L_BSR : UL_SCH_LCID_L_TRUNCATED_BSR,
