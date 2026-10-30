@@ -4396,6 +4396,26 @@ static void nr_ue_process_mac_pdu(NR_UE_MAC_INST_t *mac, nr_downlink_indication_
  * @mac_ce        pointer to the MAC sub-PDUs including the MAC CEs
  * Return:        number of written bytes
  */
+/* TS 38.321 5.4.5, Long Truncated BSR: the nb_fields LCGs with data that get a Buffer Size field, in decreasing order
+   of the highest priority logical channel of each LCG (lower value = higher priority), then in increasing LCGID */
+uint8_t nr_long_trunc_bsr_fields(const long *lcg_priority, const uint32_t *lcg_bytes, int nb_fields)
+{
+  uint8_t fields = 0;
+  for (; nb_fields > 0; nb_fields--) {
+    int best = -1;
+    for (int lcg = 0; lcg < NR_MAX_NUM_LCGID; lcg++) {
+      if (!lcg_bytes[lcg] || (fields & (1 << lcg)))
+        continue;
+      if (best < 0 || lcg_priority[lcg] < lcg_priority[best])
+        best = lcg;
+    }
+    if (best < 0)
+      break;
+    fields |= 1 << best;
+  }
+  return fields;
+}
+
 int nr_write_ce_ulsch_pdu(uint8_t *mac_ce, NR_SINGLE_ENTRY_PHR_MAC_CE *power_headroom, const type_bsr_t *bsr, uint8_t *mac_ce_end)
 {
   uint8_t *pdu = mac_ce;
@@ -4434,7 +4454,7 @@ int nr_write_ce_ulsch_pdu(uint8_t *mac_ce, NR_SINGLE_ENTRY_PHR_MAC_CE *power_hea
         if (!bsr->bsr.lcg_bsr[lcg])
           continue;
         *(uint8_t *)ceLong |= 1 << lcg;
-        if (mac_ce < mac_ce_end)
+        if (mac_ce < mac_ce_end && (bsr->lcg_fields & (1 << lcg)))
           *mac_ce++ = bsr->bsr.lcg_bsr[lcg];
       }
       *mac_pdu_subheader_ptr =
