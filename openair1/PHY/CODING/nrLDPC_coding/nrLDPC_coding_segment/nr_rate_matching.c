@@ -1143,8 +1143,46 @@ int nr_rate_matching_ldpc_rx_simd(uint32_t Tbslbrm,
    * never transmitted, so they must reach the decoder as erasures. The decoder always reads out
    * to N, so leaving them at whatever the previous transport block on this HARQ process wrote
    * feeds it confident parity LLRs for bits that were never sent. */
-  if (clear == 1)
-    memset(d, 0, N * sizeof(int16_t));
+  if (clear == 1) {
+    // first transmission: the first pass over the circular buffer writes the LLRs (0 + x), and only the positions
+    // it does not write are cleared, instead of clearing all N positions and adding
+    uint32_t k = 0, w[2][2] = {{0, 0}, {0, 0}};
+    if (ind < Foffset) {
+      int ind2 = ind + min(Foffset - ind, E);
+      w[0][0] = ind;
+      w[0][1] = ind2;
+      memcpy(&d[ind], &soft_input[k], (ind2 - ind) * sizeof(int16_t));
+      k += ind2 - ind;
+      ind = ind2;
+    }
+    if (ind >= Foffset && ind < Foffset + F)
+      ind = Foffset + F;
+    int ind2 = ind + min(Ncb - ind, E - k);
+    w[1][0] = ind;
+    w[1][1] = ind2;
+    memcpy(&d[ind], &soft_input[k], (ind2 - ind) * sizeof(int16_t));
+    k += ind2 - ind;
+    // clear [0, N) outside the two written intervals (w[0] lies before the fillers, w[1] after them)
+    uint32_t pos = 0;
+    for (int i = 0; i < 2; i++) {
+      if (w[i][1] <= w[i][0])
+        continue;
+      if (w[i][0] > pos)
+        memset(&d[pos], 0, (w[i][0] - pos) * sizeof(int16_t));
+      pos = w[i][1];
+    }
+    if (N > pos)
+      memset(&d[pos], 0, (N - pos) * sizeof(int16_t));
+    while (k < E) {
+      ind = 0;
+      ind2 = min(Foffset, E - k);
+      RMLOOP;
+      ind = Foffset + F;
+      ind2 = ind + min(Ncb - ind, E - k);
+      RMLOOP;
+    }
+    return 0;
+  }
 
   uint32_t k = 0;
   if (ind < Foffset) {
