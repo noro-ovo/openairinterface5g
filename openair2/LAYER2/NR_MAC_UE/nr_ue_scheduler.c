@@ -7,6 +7,7 @@
  */
 
 #include <stdio.h>
+#include <limits.h>
 #include <math.h>
 #include <pthread.h>
 
@@ -2193,6 +2194,7 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
     for (int lcg_id = 0; lcg_id < 8; lcg_id++) {
       tmp[lcg_id] = nr_locate_BsrIndexByBufferSize(NR_LONG_BSR_TABLE_SIZE, LCG_bytes[lcg_id]);
     }
+    mac_ce_p->bsr.lcg_fields = 0xff;
     LOG_D(NR_MAC,
           "[UE %d] sfn %d.%d BSR Trig=0x%x report LONG BSR (level LCGID %d %d %d %d %d %d %d %d)\n",
           mac->ue_id,
@@ -2214,14 +2216,23 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
         nr_locate_BsrIndexByBufferSize(NR_SHORT_BSR_TABLE_SIZE, LCG_bytes[lcg_id_bsr_max]);
   } else if (padding_len >= sizeof(NR_BSR_LONG) + sizeof(NR_MAC_SUBHEADER_SHORT)) {
     mac_ce_p->bsr.type_bsr = b_long_trunc;
-    //  Fixme: this should be sorted by (TS 38.321, 5.4.5)
-    // the logical channels having data available for
-    // transmission following a decreasing order of the highest priority logical channel (with or without data
-    // available for transmission) in each of these LCG(s), and in case of equal priority, in increasing order of LCGID
+    // TS 38.321 5.4.5: the Buffer Size fields that fit go to the LCGs with the highest priority logical channels,
+    // with or without data available for transmission
+    long lcg_priority[NR_MAX_NUM_LCGID];
+    for (int lcg_id = 0; lcg_id < NR_MAX_NUM_LCGID; lcg_id++)
+      lcg_priority[lcg_id] = LONG_MAX;
+    for (int i = 0; i < mac->lc_ordered_list.count; i++) {
+      const nr_lcordered_info_t *lc_info = mac->lc_ordered_list.array[i];
+      const long lcg_id = get_scheduling_info_from_lcid(mac, lc_info->lcid)->LCGID;
+      if (lcg_id >= 0 && lcg_id < NR_MAX_NUM_LCGID && lc_info->priority < lcg_priority[lcg_id])
+        lcg_priority[lcg_id] = lc_info->priority;
+    }
     uint8_t *tmp = mac_ce_p->bsr.bsr.lcg_bsr;
     for (int lcg_id = 0; lcg_id < 8; lcg_id++) {
       tmp[lcg_id] = nr_locate_BsrIndexByBufferSize(NR_LONG_BSR_TABLE_SIZE, LCG_bytes[lcg_id]);
     }
+    const int nb_fields = padding_len - sizeof(NR_BSR_LONG) - sizeof(NR_MAC_SUBHEADER_SHORT);
+    mac_ce_p->bsr.lcg_fields = nr_long_trunc_bsr_fields(lcg_priority, LCG_bytes, nb_fields);
   } else
     LOG_D(NR_MAC, "Can't add any BSR, not enough padding\n");
 
