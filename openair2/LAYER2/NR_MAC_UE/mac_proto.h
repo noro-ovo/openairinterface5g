@@ -140,7 +140,10 @@ typedef struct {
     uint8_t lcg_bsr[8];
   } bsr;
   enum { b_none, b_long, b_short, b_short_trunc, b_long_trunc } type_bsr;
+  uint8_t lcg_fields; // bitmap of the LCGs with a Buffer Size field (Long BSR, Long Truncated BSR)
 } type_bsr_t;
+
+uint8_t nr_long_trunc_bsr_fields(const long *lcg_priority, const uint32_t *lcg_bytes, int nb_fields);
 
 int nr_write_ce_ulsch_pdu(uint8_t *mac_ce, NR_SINGLE_ENTRY_PHR_MAC_CE *power_headroom, const type_bsr_t *bsr, uint8_t *mac_ce_end);
 
