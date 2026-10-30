@@ -105,7 +105,7 @@ void check_all(const rm_case &c, std::mt19937 &rng)
                                     << " rv " << int(c.rv) << " Tbslbrm " << c.Tbslbrm << " C " << int(c.C) << " E " << c.E);
   check_tx(c, rng);
   check_rx(nr_rate_matching_ldpc_rx_simd, c, rng);
-  check_rx(nr_rate_matching_ldpc_rx, c, rng); // scalar for BG2
+  check_rx(nr_rate_matching_ldpc_rx, c, rng);
 }
 
 } // namespace
