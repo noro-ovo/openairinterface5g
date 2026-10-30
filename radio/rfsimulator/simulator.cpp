@@ -1076,6 +1076,16 @@ static void process_recv_header(buffer_t *b, bool first_time)
   return;
 }
 
+// read-only access to the container of a std::queue, to walk the received packets without copying the queue
+template <class Q>
+static const typename Q::container_type &queue_items(const Q &q)
+{
+  struct access : Q {
+    static const typename Q::container_type &get(const Q &q) { return q.*(&access::c); }
+  };
+  return access::get(q);
+}
+
 /**
  * @brief Combines samples from received packets into a single buffer for the rx beam
  *
@@ -1101,12 +1111,9 @@ static void combine_received_beams(rfsimulator_state_t *t,
                                    c16_t **samples)
 {
   // Assume received_packets is ordered by timestamp
-  std::queue<rfsim_packet_t *> packets_copy = received_packets;
-  while (!packets_copy.empty()) {
-    rfsim_packet_t *pkt = packets_copy.front();
+  for (rfsim_packet_t *pkt : queue_items(received_packets)) {
     if (pkt->header.timestamp + pkt->header.size <= start_timestamp) {
-      // This packet is before the start timestamp, discard it
-      packets_copy.pop();
+      // This packet is before the start timestamp, skip it
       continue;
     }
     if (pkt->header.timestamp > start_timestamp + num_samples) {
@@ -1129,13 +1136,21 @@ static void combine_received_beams(rfsimulator_state_t *t,
     for (uint aatx = 0; aatx < pkt->header.nbAnt; aatx++) {
       float gain_linear = powf(10, (own_gain_dB + sender_gain_db[aatx]) / 20.0);
       c16_t *tx_ant_buffer_in = &buffer[aatx * pkt->header.size + read_start_idx];
-      for (int s = write_start_idx; s < write_end_idx; s++) {
-        samples[aatx][s].r += tx_ant_buffer_in->r * gain_linear;
-        samples[aatx][s].i += tx_ant_buffer_in->i * gain_linear;
-        tx_ant_buffer_in++;
+      if (gain_linear == 1.0f) {
+        // 0 dB (no beam gains): s + in * 1.0f is the exact integer sum, converted back to int16 as a wrapping add;
+        // plain 16-bit adds, vectorised by the compiler
+        int16_t *dst = &samples[aatx][write_start_idx].r;
+        const int16_t *src = &tx_ant_buffer_in->r;
+        for (int k = 0; k < 2 * (write_end_idx - write_start_idx); k++)
+          dst[k] = (int16_t)(dst[k] + src[k]);
+      } else {
+        for (int s = write_start_idx; s < write_end_idx; s++) {
+          samples[aatx][s].r += tx_ant_buffer_in->r * gain_linear;
+          samples[aatx][s].i += tx_ant_buffer_in->i * gain_linear;
+          tx_ant_buffer_in++;
+        }
       }
     }
-    packets_copy.pop();
   }
 }
 
@@ -1254,12 +1269,9 @@ static void rfsimulator_read_internal(rfsimulator_state_t *t,
         // Apply propagation delay
         const int64_t read_timestamp = timestamp - t->chan_offset;
         // Assume received_packets is ordered by timestamp
-        std::queue<rfsim_packet_t *> packets_copy = ptr->received_packets;
-        while (!packets_copy.empty()) {
-          rfsim_packet_t *pkt = packets_copy.front();
+        for (rfsim_packet_t *pkt : queue_items(ptr->received_packets)) {
           if (static_cast<int64_t>(pkt->header.timestamp + pkt->header.size) <= read_timestamp) {
-            // This packet is before the start timestamp, discard it
-            packets_copy.pop();
+            // This packet is before the start timestamp, skip it
             continue;
           }
           if (static_cast<int64_t>(pkt->header.timestamp) > read_timestamp + nsamps) {
@@ -1288,6 +1300,14 @@ static void rfsimulator_read_internal(rfsimulator_state_t *t,
 
             for (uint aatx = 0; aatx < pkt->header.nbAnt; aatx++) {
               c16_t *tx_ant_buffer_in = &buffer[aatx * pkt->header.size + read_start_idx];
+              if (H_awgn_mimo_coeff[aatx] == 1.0) {
+                // s + in * 1.0 is the exact integer sum, converted back to int16 as a wrapping add: plain 16-bit adds
+                int16_t *dst = &samples[aarx][write_start_idx].r;
+                const int16_t *src = &tx_ant_buffer_in->r;
+                for (int k = 0; k < 2 * (write_end_idx - write_start_idx); k++)
+                  dst[k] = (int16_t)(dst[k] + src[k]);
+                continue;
+              }
               for (int i = write_start_idx; i < write_end_idx; i++) {
                 samples[aarx][i].r += tx_ant_buffer_in->r * H_awgn_mimo_coeff[aatx];
                 samples[aarx][i].i += tx_ant_buffer_in->i * H_awgn_mimo_coeff[aatx];
@@ -1295,7 +1315,6 @@ static void rfsimulator_read_internal(rfsimulator_state_t *t,
               }
             }
           }
-          packets_copy.pop();
         }
       }
     }
