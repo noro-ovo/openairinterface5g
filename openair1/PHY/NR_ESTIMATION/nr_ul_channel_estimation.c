@@ -76,6 +76,145 @@ __attribute__((always_inline)) inline c16_t c32x16cumulVectVectWithSteps(c16_t *
   return c16x32div(cumul, N);
 }
 
+/* DMRS type 1 LS estimate of nr_pusch_antenna_processing(), same results as its per-pilot loop: for pilot pair n
+ * (REs k0 + delta + 4n and + 2), ch = sum over the pair of (pilot * rx) >> 16 per component (int32), max_ch over the
+ * int32 |re|, |im|, and ls[4n..4n+3] = ch truncated to 16 bits. AVX2: 4 pairs per iteration. */
+static void pusch_type1_ls_fast(const c16_t *pil, const c16_t *rx, int npairs, c16_t *ls, int *max_ch)
+{
+  int mx = *max_ch, n = 0;
+  const simde__m256i neg_im = simde_mm256_set1_epi32(0xffff0001);
+  const simde__m256i even = simde_mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+  simde__m256i vmax = simde_mm256_setzero_si256();
+  for (; n + 4 <= npairs; n += 4) {
+    const simde__m256i x0 = simde_mm256_permutevar8x32_epi32(simde_mm256_loadu_si256((simde__m256i *)&rx[4 * n]), even);
+    const simde__m256i x1 = simde_mm256_permutevar8x32_epi32(simde_mm256_loadu_si256((simde__m256i *)&rx[4 * n + 8]), even);
+    const simde__m256i x = simde_mm256_permute2x128_si256(x0, x1, 0x20); // REs 0, 2, 4, .., 14: pairs n..n+3, 2 each
+    const simde__m256i p = simde_mm256_loadu_si256((simde__m256i *)&pil[2 * n]);
+    const simde__m256i psw = simde_mm256_shufflehi_epi16(simde_mm256_shufflelo_epi16(p, 0xb1), 0xb1);
+    const simde__m256i re = simde_mm256_srai_epi32(simde_mm256_madd_epi16(x, simde_mm256_sign_epi16(p, neg_im)), 16);
+    const simde__m256i im = simde_mm256_srai_epi32(simde_mm256_madd_epi16(x, psw), 16);
+    // per 128-bit lane: re(n) re(n+1) im(n) im(n+1) | re(n+2) re(n+3) im(n+2) im(n+3)
+    const simde__m256i h = simde_mm256_hadd_epi32(re, im);
+    vmax = simde_mm256_max_epi32(vmax, simde_mm256_abs_epi32(h));
+    int32_t v[8];
+    simde_mm256_storeu_si256((simde__m256i *)v, h);
+    const int32_t rr[4] = {v[0], v[1], v[4], v[5]}, ii[4] = {v[2], v[3], v[6], v[7]};
+    for (int j = 0; j < 4; j++) {
+      const c16_t c = {.r = (int16_t)rr[j], .i = (int16_t)ii[j]};
+      c16_t *d = &ls[4 * (n + j)];
+      d[0] = d[1] = d[2] = d[3] = c;
+    }
+  }
+  int32_t m8[8];
+  simde_mm256_storeu_si256((simde__m256i *)m8, vmax);
+  for (int j = 0; j < 8; j++)
+    mx = max(mx, m8[j]);
+  for (; n < npairs; n++) {
+    c32_t ch = {0};
+    ch = c32x16maddShift(pil[2 * n], rx[4 * n], ch, 16);
+    ch = c32x16maddShift(pil[2 * n + 1], rx[4 * n + 2], ch, 16);
+    mx = max(mx, max(abs(ch.r), abs(ch.i)));
+    const c16_t c = {.r = (int16_t)ch.r, .i = (int16_t)ch.i};
+    ls[4 * n] = ls[4 * n + 1] = ls[4 * n + 2] = ls[4 * n + 3] = c;
+  }
+  *max_ch = mx;
+}
+
+/* DMRS type 1 frequency interpolation, delay revert and noise of nr_pusch_antenna_processing(), same results as the
+ * per-pilot filter loop. Pilot pc adds round(w * a / 2^14) (a = delayed LS of the pilot, w = filter tap) to a window of
+ * 16 REs whose taps are constant per group of 4 REs, so the interpolated channel is one value per group of 4 REs.
+ * Middle pilots (3 .. npil-2, tap 2048) cover groups (pc-3)/2 .. +3, so group g gets the middle pilots 2g-3 .. 2g+4:
+ * a difference of prefix sums. Edge pilots: pc 0 (4096 on groups 0, 1), pc 1 and 2 (4096 on group 0, 2048 on 1, 2),
+ * the last one (4096 on group 3 nb_rb - 2, 8192 on 3 nb_rb - 1). With |a| <= 32768 the terms of any RE add up to at
+ * most 32768 in magnitude, so the saturating adds of the filter loop equal an int32 sum saturated once. Groups
+ * 0 .. 3 nb_rb (the last one only holds the tail of the last middle windows beyond the 12 nb_rb REs, as written by the
+ * filter loop). */
+static void pusch_type1_interp_fast(const c16_t *ls,
+                                    const c16_t *delay_tab,
+                                    const c16_t *inv_delay_tab,
+                                    int nb_rb,
+                                    c16_t *ul_ch,
+                                    uint64_t *noise_amp2,
+                                    int *nest_count)
+{
+  const int npil = 6 * nb_rb, ngrp = 3 * nb_rb + 1, nre = 12 * nb_rb;
+  c16_t a[npil];
+  for (int pc = 0; pc < npil; pc++)
+    a[pc] = c16mulShift(ls[2 * pc], delay_tab[2 * pc], 8);
+  // prefix sums of the middle terms (a + 4) >> 3 = (2048 a + 2^13) >> 14
+  int32_t pr[npil + 1], pi[npil + 1];
+  pr[0] = pi[0] = 0;
+  for (int pc = 0; pc < npil; pc++) {
+    const int mid = pc >= 3 && pc <= npil - 2;
+    pr[pc + 1] = pr[pc] + (mid ? (a[pc].r + 4) >> 3 : 0);
+    pi[pc + 1] = pi[pc] + (mid ? (a[pc].i + 4) >> 3 : 0);
+  }
+  int32_t sr[ngrp], si[ngrp];
+  for (int g = 0; g < ngrp; g++) {
+    const int lo = max(2 * g - 3, 0), hi = min(2 * g + 5, npil);
+    sr[g] = hi > lo ? pr[hi] - pr[lo] : 0;
+    si[g] = hi > lo ? pi[hi] - pi[lo] : 0;
+  }
+#define T4096(x) (((x) + 2) >> 2)
+#define T2048(x) (((x) + 4) >> 3)
+#define T8192(x) (((x) + 1) >> 1)
+  sr[0] += T4096(a[0].r) + T4096(a[1].r) + T4096(a[2].r);
+  si[0] += T4096(a[0].i) + T4096(a[1].i) + T4096(a[2].i);
+  sr[1] += T4096(a[0].r) + T2048(a[1].r) + T2048(a[2].r);
+  si[1] += T4096(a[0].i) + T2048(a[1].i) + T2048(a[2].i);
+  sr[2] += T2048(a[1].r) + T2048(a[2].r);
+  si[2] += T2048(a[1].i) + T2048(a[2].i);
+  sr[3 * nb_rb - 2] += T4096(a[npil - 1].r);
+  si[3 * nb_rb - 2] += T4096(a[npil - 1].i);
+  sr[3 * nb_rb - 1] += T8192(a[npil - 1].r);
+  si[3 * nb_rb - 1] += T8192(a[npil - 1].i);
+#undef T4096
+#undef T2048
+#undef T8192
+  for (int g = 0; g < ngrp; g++) {
+    const c16_t v = {.r = (int16_t)(sr[g] > 32767 ? 32767 : sr[g] < -32768 ? -32768 : sr[g]),
+                     .i = (int16_t)(si[g] > 32767 ? 32767 : si[g] < -32768 ? -32768 : si[g])};
+    ul_ch[4 * g] = ul_ch[4 * g + 1] = ul_ch[4 * g + 2] = ul_ch[4 * g + 3] = v;
+  }
+  // revert the delay (c16mulShift(x, d, 8): int32 products >> 8, truncated to int16) and the noise |ls - ch|^2
+  int k = 0;
+  const simde__m256i neg_im = simde_mm256_set1_epi32(0xffff0001); // (re, im) -> (re, -im) as 16-bit multipliers
+  const simde__m256i lo16 = simde_mm256_set1_epi32(0xffff);
+  simde__m256i acc = simde_mm256_setzero_si256(); // 4 x uint64
+  for (; k + 8 <= nre; k += 8) {
+    const simde__m256i x = simde_mm256_loadu_si256((simde__m256i *)&ul_ch[k]);
+    const simde__m256i d = simde_mm256_loadu_si256((simde__m256i *)&inv_delay_tab[k]);
+    // re = x.r d.r - x.i d.i: madd(x, (d.r, -d.i)); im = x.r d.i + x.i d.r: madd(x, (d.i, d.r)); |d| <= 256
+    const simde__m256i re = simde_mm256_srai_epi32(simde_mm256_madd_epi16(x, simde_mm256_sign_epi16(d, neg_im)), 8);
+    const simde__m256i dsw = simde_mm256_shufflehi_epi16(simde_mm256_shufflelo_epi16(d, 0xb1), 0xb1);
+    const simde__m256i im = simde_mm256_srai_epi32(simde_mm256_madd_epi16(x, dsw), 8);
+    const simde__m256i ch = simde_mm256_or_si256(simde_mm256_and_si256(re, lo16), simde_mm256_slli_epi32(im, 16));
+    simde_mm256_storeu_si256((simde__m256i *)&ul_ch[k], ch);
+    const simde__m256i diff = simde_mm256_sub_epi16(simde_mm256_loadu_si256((simde__m256i *)&ls[k]), ch);
+    const simde__m256i e2 = simde_mm256_madd_epi16(diff, diff); // r^2 + i^2 per RE, as uint32
+    acc = simde_mm256_add_epi64(acc, simde_mm256_and_si256(e2, simde_mm256_set1_epi64x(0xffffffff)));
+    acc = simde_mm256_add_epi64(acc, simde_mm256_srli_epi64(e2, 32));
+  }
+  uint64_t q[4];
+  simde_mm256_storeu_si256((simde__m256i *)q, acc);
+  uint64_t noise = q[0] + q[1] + q[2] + q[3];
+  for (; k < nre; k++) {
+    ul_ch[k] = c16mulShift(ul_ch[k], inv_delay_tab[k], 8);
+    noise += c16amp2(c16sub(ls[k], ul_ch[k]));
+  }
+  *noise_amp2 += noise;
+  *nest_count += 2 * npil;
+}
+
+static int pusch_chest_mode(void)
+{
+  // 0: fast interpolation (default), 1: per-pilot filter loop (OAI_CHEST_LEGACY=1), 2: both, compared (OAI_CHEST_CHECK=1)
+  static int mode = -1;
+  if (mode < 0)
+    mode = getenv("OAI_CHEST_CHECK") ? 2 : getenv("OAI_CHEST_LEGACY") ? 1 : 0;
+  return mode;
+}
+
 static void nr_pusch_antenna_processing(void *arg)
 {
   puschAntennaProc_t *rdata = (puschAntennaProc_t *)arg;
@@ -141,33 +280,54 @@ static void nr_pusch_antenna_processing(void *arg)
       int ch_est_cnt = 0; // To trace channel coefficients
 #endif
 
-      for (int n = 0; n < 3 * nb_rb_pusch; n++) {
-        // LS estimation
-        c32_t ch = {0};
-
-        for (int k_line = 0; k_line <= 1; k_line++) {
-          re_offset = (k0 + (n << 2) + (k_line << 1) + delta);
-          ch = c32x16maddShift(*pil, rxdataF[re_offset], ch, 16);
-          pil++;
-        }
-
-        c16_t ch16 = {.r = (int16_t)ch.r, .i = (int16_t)ch.i};
-        *max_ch = max(*max_ch, max(abs(ch.r), abs(ch.i)));
-        for (int k = pilot_cnt << 1; k < (pilot_cnt << 1) + 4; k++) {
-          ul_ls_est[k] = ch16;
-        }
-//------------------Write channel parameters to Memory  for data recording ------------------//
+      const int ls_mode = pusch_chest_mode();
 #if T_TRACER
-        if (T_ACTIVE(T_GNB_PHY_UL_FD_CHAN_EST_DMRS_POS) && nl == 0) {
-          // Trace channel coefficients
-          c16_t *pusch_ch_est_dmrs_pos_slot_mem = rdata->pusch_ch_est_dmrs_pos_slot_mem;
-          int dmrs_symbol_start_idx = rdata->dmrs_symbol_start_idx;
-          pusch_ch_est_dmrs_pos_slot_mem[dmrs_symbol_start_idx + delta + ch_est_cnt] = ch16; // 0, 2, 4, 6, 8, location of REs
-          pusch_ch_est_dmrs_pos_slot_mem[dmrs_symbol_start_idx + delta + ch_est_cnt + 2] = ch16; // 0, 2, 4, 6, 8, location of REs
-        }
-        ch_est_cnt += 4;
+      const int ls_traced = T_ACTIVE(T_GNB_PHY_UL_FD_CHAN_EST_DMRS_POS) && nl == 0;
+#else
+      const int ls_traced = 0;
 #endif
-        pilot_cnt += 2;
+      c16_t fast_ls[ls_mode == 2 ? symbolSize : 1] __attribute__((aligned(32)));
+      int fast_max = *max_ch;
+      if (ls_mode == 0 && !ls_traced) {
+        pusch_type1_ls_fast(pilot, &rxdataF[k0 + delta], 3 * nb_rb_pusch, ul_ls_est, max_ch);
+      } else {
+        if (ls_mode == 2)
+          pusch_type1_ls_fast(pilot, &rxdataF[k0 + delta], 3 * nb_rb_pusch, fast_ls, &fast_max);
+        for (int n = 0; n < 3 * nb_rb_pusch; n++) {
+          // LS estimation
+          c32_t ch = {0};
+
+          for (int k_line = 0; k_line <= 1; k_line++) {
+            re_offset = (k0 + (n << 2) + (k_line << 1) + delta);
+            ch = c32x16maddShift(*pil, rxdataF[re_offset], ch, 16);
+            pil++;
+          }
+
+          c16_t ch16 = {.r = (int16_t)ch.r, .i = (int16_t)ch.i};
+          *max_ch = max(*max_ch, max(abs(ch.r), abs(ch.i)));
+          for (int k = pilot_cnt << 1; k < (pilot_cnt << 1) + 4; k++) {
+            ul_ls_est[k] = ch16;
+          }
+  //------------------Write channel parameters to Memory  for data recording ------------------//
+  #if T_TRACER
+          if (T_ACTIVE(T_GNB_PHY_UL_FD_CHAN_EST_DMRS_POS) && nl == 0) {
+            // Trace channel coefficients
+            c16_t *pusch_ch_est_dmrs_pos_slot_mem = rdata->pusch_ch_est_dmrs_pos_slot_mem;
+            int dmrs_symbol_start_idx = rdata->dmrs_symbol_start_idx;
+            pusch_ch_est_dmrs_pos_slot_mem[dmrs_symbol_start_idx + delta + ch_est_cnt] = ch16; // 0, 2, 4, 6, 8, location of REs
+            pusch_ch_est_dmrs_pos_slot_mem[dmrs_symbol_start_idx + delta + ch_est_cnt + 2] = ch16; // 0, 2, 4, 6, 8, location of REs
+          }
+          ch_est_cnt += 4;
+  #endif
+          pilot_cnt += 2;
+        }
+        if (ls_mode == 2) {
+          static int ls_checked, ls_bad;
+          const int bad = memcmp(fast_ls, ul_ls_est, sizeof(c16_t) * 12 * nb_rb_pusch) != 0 || fast_max != *max_ch;
+          ls_bad += bad;
+          if (bad || (++ls_checked % 1000) == 0 || ls_checked == 1)
+            fprintf(stderr, "OAI_CHEST_CHECK LS: %d checked, %d mismatched%s\n", ls_checked, ls_bad, bad ? " (MISMATCH)" : "");
+        }
       }
       c16_t ch_estimates_time[frame_parms->ofdm_symbol_size] __attribute__((aligned(32)));
       nr_est_delay(frame_parms->ofdm_symbol_size, ul_ls_est, ch_estimates_time, delay);
@@ -183,66 +343,94 @@ static void nr_pusch_antenna_processing(void *arg)
       printf("Estimated delay = %i\n", delay->est_delay >> 1);
 #endif
 
-      pilot_cnt = 0;
-      for (int n = 0; n < 3 * nb_rb_pusch; n++) {
-        // Channel interpolation
-        for (int k_line = 0; k_line <= 1; k_line++) {
-          // Apply delay
-          int k = pilot_cnt << 1;
-          c16_t ch16 = c16mulShift(ul_ls_est[k], ul_delay_table[k], 8);
+      const int chest_mode = pusch_chest_mode();
+      c16_t *ul_ch0 = ul_ch;
+      c16_t fast_ch[chest_mode == 2 ? symbolSize : 1] __attribute__((aligned(32)));
+      uint64_t fast_noise = 0;
+      int fast_nest = 0;
+      const uint64_t noise_before = noise_amp2;
+      const int nest_before = nest_count;
+      if (chest_mode != 1) {
+        int inv_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
+        c16_t *dst = chest_mode == 2 ? fast_ch : ul_ch;
+        if (chest_mode == 2)
+          memset(fast_ch, 0, sizeof(c16_t) * symbolSize);
+        pusch_type1_interp_fast(ul_ls_est, ul_delay_table, frame_parms->delay_table[inv_idx], nb_rb_pusch, dst, &fast_noise, &fast_nest);
+      }
+      if (chest_mode != 0) {
+        pilot_cnt = 0;
+        for (int n = 0; n < 3 * nb_rb_pusch; n++) {
+          // Channel interpolation
+          for (int k_line = 0; k_line <= 1; k_line++) {
+            // Apply delay
+            int k = pilot_cnt << 1;
+            c16_t ch16 = c16mulShift(ul_ls_est[k], ul_delay_table[k], 8);
 
-#ifdef DEBUG_PUSCH
-          re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
-          c16_t *rxF = &rxdataF[re_offset];
-          printf("pilot %4d: pil -> (%6d,%6d), rxF -> (%4d,%4d), ch -> (%4d,%4d)\n",
-                 pilot_cnt,
-                 pil->r,
-                 pil->i,
-                 rxF->r,
-                 rxF->i,
-                 ch.r,
-                 ch.i);
-#endif
+  #ifdef DEBUG_PUSCH
+            re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
+            c16_t *rxF = &rxdataF[re_offset];
+            printf("pilot %4d: pil -> (%6d,%6d), rxF -> (%4d,%4d), ch -> (%4d,%4d)\n",
+                   pilot_cnt,
+                   pil->r,
+                   pil->i,
+                   rxF->r,
+                   rxF->i,
+                   ch.r,
+                   ch.i);
+  #endif
 
-          if (pilot_cnt == 0) {
-            c16multaddVectRealComplex(filt16_ul_p0, &ch16, ul_ch, 16);
-          } else if (pilot_cnt == 1 || pilot_cnt == 2) {
-            c16multaddVectRealComplex(filt16_ul_p1p2, &ch16, ul_ch, 16);
-          } else if (pilot_cnt == (6 * nb_rb_pusch - 1)) {
-            c16multaddVectRealComplex(filt16_ul_last, &ch16, ul_ch, 16);
-          } else {
-            c16multaddVectRealComplex(filt16_ul_middle, &ch16, ul_ch, 16);
-            if (pilot_cnt % 2 == 0) {
-              ul_ch += 4;
+            if (pilot_cnt == 0) {
+              c16multaddVectRealComplex(filt16_ul_p0, &ch16, ul_ch, 16);
+            } else if (pilot_cnt == 1 || pilot_cnt == 2) {
+              c16multaddVectRealComplex(filt16_ul_p1p2, &ch16, ul_ch, 16);
+            } else if (pilot_cnt == (6 * nb_rb_pusch - 1)) {
+              c16multaddVectRealComplex(filt16_ul_last, &ch16, ul_ch, 16);
+            } else {
+              c16multaddVectRealComplex(filt16_ul_middle, &ch16, ul_ch, 16);
+              if (pilot_cnt % 2 == 0) {
+                ul_ch += 4;
+              }
             }
+
+            pilot_cnt++;
           }
+        }
 
-          pilot_cnt++;
+        // Revert delay
+        pilot_cnt = 0;
+        ul_ch = ul_ch_estimates[nl * num_sp_streams + antenna] + rdata->ch_row_offset;
+        int inv_delay_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
+        c16_t *ul_inv_delay_table = frame_parms->delay_table[inv_delay_idx];
+        for (int n = 0; n < 3 * nb_rb_pusch; n++) {
+          for (int k_line = 0; k_line <= 1; k_line++) {
+            int k = pilot_cnt << 1;
+            ul_ch[k] = c16mulShift(ul_ch[k], ul_inv_delay_table[k], 8);
+            ul_ch[k + 1] = c16mulShift(ul_ch[k + 1], ul_inv_delay_table[k + 1], 8);
+            noise_amp2 += c16amp2(c16sub(ul_ls_est[k], ul_ch[k]));
+            noise_amp2 += c16amp2(c16sub(ul_ls_est[k + 1], ul_ch[k + 1]));
+
+  #ifdef DEBUG_PUSCH
+            re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
+            printf("ch -> (%4d,%4d), ch_inter -> (%4d,%4d)\n", ul_ls_est[k].r, ul_ls_est[k].i, ul_ch[k].r, ul_ch[k].i);
+  #endif
+            pilot_cnt++;
+            nest_count += 2;
+          }
         }
       }
-
-      // Revert delay
-      pilot_cnt = 0;
-      ul_ch = ul_ch_estimates[nl * num_sp_streams + antenna] + rdata->ch_row_offset;
-      int inv_delay_idx = get_delay_idx(-delay->est_delay, MAX_DELAY_COMP);
-      c16_t *ul_inv_delay_table = frame_parms->delay_table[inv_delay_idx];
-      for (int n = 0; n < 3 * nb_rb_pusch; n++) {
-        for (int k_line = 0; k_line <= 1; k_line++) {
-          int k = pilot_cnt << 1;
-          ul_ch[k] = c16mulShift(ul_ch[k], ul_inv_delay_table[k], 8);
-          ul_ch[k + 1] = c16mulShift(ul_ch[k + 1], ul_inv_delay_table[k + 1], 8);
-          noise_amp2 += c16amp2(c16sub(ul_ls_est[k], ul_ch[k]));
-          noise_amp2 += c16amp2(c16sub(ul_ls_est[k + 1], ul_ch[k + 1]));
-
-#ifdef DEBUG_PUSCH
-          re_offset = (k0 + (n << 2) + (k_line << 1)) % symbolSize;
-          printf("ch -> (%4d,%4d), ch_inter -> (%4d,%4d)\n", ul_ls_est[k].r, ul_ls_est[k].i, ul_ch[k].r, ul_ch[k].i);
-#endif
-          pilot_cnt++;
-          nest_count += 2;
-        }
+      if (chest_mode == 0) {
+        noise_amp2 += fast_noise;
+        nest_count += fast_nest;
+      } else if (chest_mode == 2) {
+        // compare with the filter loop over the REs it writes (12 nb_rb + 4) and the noise / estimate counters
+        static int checked, mismatched;
+        const uint64_t loop_noise = noise_amp2 - noise_before;
+        const int bad = memcmp(fast_ch, ul_ch0, sizeof(c16_t) * (12 * nb_rb_pusch + 4)) != 0 || fast_noise != loop_noise
+                        || fast_nest != nest_count - nest_before;
+        mismatched += bad;
+        if (bad || (++checked % 1000) == 0 || checked == 1)
+          fprintf(stderr, "OAI_CHEST_CHECK: %d checked, %d mismatched%s\n", checked, mismatched, bad ? " (MISMATCH)" : "");
       }
-
       // Align the channel estimates for the delta shift
       if (delta != 0) {
         c16_t *ul_ch_base = ul_ch_estimates[nl * num_sp_streams + antenna] + rdata->ch_row_offset;
