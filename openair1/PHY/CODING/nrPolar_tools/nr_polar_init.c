@@ -64,12 +64,39 @@ static t_nrPolar_params *nr_polar_take(t_nrPolar_params *p, uint32_t key)
   return NULL;
 }
 
+/* per-thread cache of the nodes this thread used last (nodes live until exit): a hit is taken with the same
+ * compare-and-swap of the busy flag as nr_polar_take(), so the exclusive use of a node is unchanged */
+#define POLAR_TCACHE 8
+static __thread t_nrPolar_params *polar_tcache[POLAR_TCACHE];
+static __thread unsigned polar_tcache_next;
+static t_nrPolar_params *nr_polar_take_cached(uint32_t key)
+{
+  for (int i = 0; i < POLAR_TCACHE; i++) {
+    t_nrPolar_params *p = polar_tcache[i];
+    if (p && p->idx == key && !__atomic_load_n(&p->busy, __ATOMIC_RELAXED)) {
+      bool expected = false;
+      if (__atomic_compare_exchange_n(&p->busy, &expected, true, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+        return p;
+    }
+  }
+  return NULL;
+}
+static void nr_polar_cache_add(t_nrPolar_params *p)
+{
+  polar_tcache[polar_tcache_next++ % POLAR_TCACHE] = p;
+}
+
 t_nrPolar_params *nr_polar_params(int8_t messageType, uint16_t messageLength, int aggregation_level)
 {
-  // fast path, without the mutex: a free node with this key
-  t_nrPolar_params *currentPtr = nr_polar_take(__atomic_load_n(&PolarList, __ATOMIC_ACQUIRE), PolarKey);
+  t_nrPolar_params *currentPtr = nr_polar_take_cached(PolarKey);
   if (currentPtr)
     return currentPtr;
+  // fast path, without the mutex: a free node with this key
+  currentPtr = nr_polar_take(__atomic_load_n(&PolarList, __ATOMIC_ACQUIRE), PolarKey);
+  if (currentPtr) {
+    nr_polar_cache_add(currentPtr);
+    return currentPtr;
+  }
 
   pthread_mutex_lock(&PolarListMutex);
   if (!PolarList)
@@ -78,6 +105,7 @@ t_nrPolar_params *nr_polar_params(int8_t messageType, uint16_t messageLength, in
   currentPtr = nr_polar_take(PolarList, PolarKey);
   if (currentPtr) {
     pthread_mutex_unlock(&PolarListMutex);
+    nr_polar_cache_add(currentPtr);
     return currentPtr;
   }
 
@@ -237,6 +265,7 @@ t_nrPolar_params *nr_polar_params(int8_t messageType, uint16_t messageLength, in
   qsort((void *)newPolarInitNode->Q_I_N, newPolarInitNode->K, sizeof(int16_t), intcmp);
 
   build_polar_tables(newPolarInitNode);
+  nr_polar_cache_add(newPolarInitNode);
   return newPolarInitNode;
 }
 
