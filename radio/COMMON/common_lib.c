@@ -14,6 +14,7 @@
 #include <stdlib.h>
 
 #include "common_lib.h"
+#include <simde/x86/avx2.h>
 #include "assertions.h"
 #include "common/utils/load_module_shlib.h"
 #include "common/utils/LOG/log.h"
@@ -191,6 +192,62 @@ int openair0_transport_load(openair0_device_t *device, openair0_config_t *openai
   return rc;
 }
 
+/* first i in [0, n) with (wr[i] & RO_COUNT) < nb_writers, n if none (8 counts per AVX2 compare) */
+static int reorder_count_ready(const int *wr, int n, int nb_writers)
+{
+  const simde__m256i cnt = simde_mm256_set1_epi32(RO_COUNT), nbw = simde_mm256_set1_epi32(nb_writers);
+  int i = 0;
+  for (; i + 8 <= n; i += 8) {
+    const simde__m256i c = simde_mm256_and_si256(simde_mm256_loadu_si256((const simde__m256i *)&wr[i]), cnt);
+    const int m = simde_mm256_movemask_ps(simde_mm256_castsi256_ps(simde_mm256_cmpgt_epi32(nbw, c)));
+    if (m)
+      return i + __builtin_ctz(m);
+  }
+  for (; i < n; i++)
+    if ((wr[i] & RO_COUNT) < nb_writers)
+      break;
+  return i;
+}
+
+/* length of the next chunk of at most limit samples: it stops before a sample i > 0 whose burst state differs from
+ * sample 0 (RO_ACTIVE) or that starts a burst (RO_START), or after a sample that ends one (RO_END);
+ * *boundary tells whether such a sample was found */
+static int reorder_chunk_len(const int *wr, int limit, bool *boundary)
+{
+  const int active = wr[0] & RO_ACTIVE;
+  const simde__m256i act = simde_mm256_set1_epi32(RO_ACTIVE), st = simde_mm256_set1_epi32(RO_START),
+                     en = simde_mm256_set1_epi32(RO_END), vact = simde_mm256_set1_epi32(active);
+  int i = 0;
+  for (; i + 8 <= limit; i += 8) {
+    const simde__m256i v = simde_mm256_loadu_si256((const simde__m256i *)&wr[i]);
+    // cut before i: state change or burst start; cut after i: burst end
+    const simde__m256i before = simde_mm256_or_si256(simde_mm256_xor_si256(simde_mm256_and_si256(v, act), vact),
+                                                     simde_mm256_and_si256(v, st));
+    int mb = simde_mm256_movemask_ps(simde_mm256_castsi256_ps(simde_mm256_cmpgt_epi32(before, simde_mm256_setzero_si256())));
+    const int me = simde_mm256_movemask_ps(simde_mm256_castsi256_ps(simde_mm256_cmpgt_epi32(simde_mm256_and_si256(v, en),
+                                                                                             simde_mm256_setzero_si256())));
+    if (i == 0)
+      mb &= ~1; // sample 0 opens the chunk
+    if (mb | me) {
+      const int b = mb ? __builtin_ctz(mb) : 32, e = me ? __builtin_ctz(me) : 32;
+      *boundary = true;
+      return i + (b <= e ? b : e + 1);
+    }
+  }
+  for (; i < limit; i++) {
+    if (i > 0 && ((wr[i] & RO_ACTIVE) != active || (wr[i] & RO_START))) {
+      *boundary = true;
+      return i;
+    }
+    if (wr[i] & RO_END) {
+      *boundary = true;
+      return i + 1;
+    }
+  }
+  *boundary = false;
+  return limit;
+}
+
 /* Send the samples from nextTS on, in chunks of at most one grain cut at burst boundaries, with the
    flags of the burst state stored with the samples. Samples before force_until are sent even if some
    writer has not written them: a writer that stops must not block the others. A chunk that does not
@@ -204,9 +261,7 @@ static void reorder_flush(nrue_ru_write_t nrue_ru_write,
 {
   re_order_t *ctx = &device->reOrder;
   int *wr = ctx->nb_writers + ctx->nextTS % ctx->sz;
-  int ready = 0;
-  while (ready < ctx->sz && (wr[ready] & RO_COUNT) >= nb_writers)
-    ready++;
+  int ready = reorder_count_ready(wr, ctx->sz, nb_writers);
   const int forced = force_until > ctx->nextTS ? min(force_until - ctx->nextTS, ctx->sz) : 0;
   ready = max(ready, forced);
   const bool gap = force_until - ctx->nextTS > ctx->sz; // nothing was written beyond the ring end
@@ -214,18 +269,8 @@ static void reorder_flush(nrue_ru_write_t nrue_ru_write,
   for (int consumed = 0; ready > 0;) {
     wr = ctx->nb_writers + ctx->nextTS % ctx->sz;
     const int active = wr[0] & RO_ACTIVE;
-    int len = 0;
-    bool boundary = false;
-    while (len < ready && len < ctx->grain) {
-      if (len > 0 && ((wr[len] & RO_ACTIVE) != active || (wr[len] & RO_START))) {
-        boundary = true;
-        break;
-      }
-      if (wr[len++] & RO_END) {
-        boundary = true;
-        break;
-      }
-    }
+    bool boundary;
+    const int len = reorder_chunk_len(wr, min(ready, ctx->grain), &boundary);
     if (len < ctx->grain && !boundary && consumed >= forced)
       break; // wait for more samples
     int flags = TX_BURST_INVALID;
