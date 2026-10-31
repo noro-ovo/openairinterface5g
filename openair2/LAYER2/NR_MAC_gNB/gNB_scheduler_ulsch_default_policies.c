@@ -139,13 +139,24 @@ static bool needs_default_grant(const nr_ul_candidate_t *c)
   return c->sched_long_inactivity || (c->pending_bytes <= NR_UL_SMALL_BSR_BYTES && c->sr_cnt > 0);
 }
 
-/* RBs of a default grant. After an SR the UE has data and the gNB does not know how much: the grant has to carry its
- * BSR. At the lowest MCS and on a mixed slot min_rb gives 3 or 4 bytes, not enough for a Long BSR of two LCGs (5 bytes),
- * and a PHR can take them all, the same grant would then repeat. */
-#define NR_UL_SR_GRANT_RB_FACTOR 3
+/* Bytes a default grant needs after an SR: the UE has data and the gNB does not know how much, so the grant has to carry
+ * a Long BSR of its two LCGs, SRB and DRB (3 + 2 bytes), and a PHR (3 bytes), which would otherwise take a smaller grant
+ * for itself. It is also the size from which TS 38.321 5.4.3.1.3 forbids sending only a padding BSR with data available */
+#define NR_UL_SR_GRANT_BYTES 8
+
+/* RBs of a default grant: min_rb, or after an SR what gives NR_UL_SR_GRANT_BYTES at the MCS and TDA of this grant */
 static int default_grant_rbs(const nr_ul_candidate_t *c, int min_rb, int block_len)
 {
-  return c->sr_cnt > 0 ? min(min_rb * NR_UL_SR_GRANT_RB_FACTOR, block_len) : min_rb;
+  if (c->sr_cnt == 0)
+    return min_rb;
+  const NR_sched_pusch_t *p = &c->sched_pusch;
+  const uint16_t R = nr_get_code_rate_ul(p->mcs, c->mcs_table);
+  const uint8_t Qm = nr_get_Qm_ul(p->mcs, c->mcs_table);
+  const int dmrs = p->dmrs_info.N_PRB_DMRS * p->dmrs_info.num_dmrs_symb;
+  int rb = min_rb;
+  while (rb < block_len && (nr_compute_tbs(Qm, R, rb, p->tda_info.nrOfSymbols, dmrs, 0, 0, p->nrOfLayers) >> 3) < NR_UL_SR_GRANT_BYTES)
+    rb++;
+  return check_sc_fdma_rbsize(c->UE->current_UL_BWP.transform_precoding, rb);
 }
 
 /* Orders the candidates the way nr_ul_proportional_fair() allocates them:
