@@ -2989,11 +2989,17 @@ void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, post_pro
     int slots_per_frame = cell->frame_structure.numb_slots_frame;
     fsn_t sched_fs = get_fb_frame_slot(frame, slot, k2, slots_per_frame, koffset);
 
-    /* Check that at least one TDA can reach this slot, if not, no future slot is reachable either */
+    /* Check that at least one TDA can reach this slot. If not, a later DL slot may still reach it with a smaller k2,
+     * unless this is already the smallest k2: then no slot ever reaches it (e.g. a mixed slot without TDA for that
+     * k2), and a later UL slot can be, with a larger k2 */
     {
       const NR_tda_info_t *tda_check = NULL;
-      if (get_num_ul_tda(nr_mac, cell, sched_fs.s, k2, &tda_check) == 0)
-        break;
+      if (get_num_ul_tda(nr_mac, cell, sched_fs.s, k2, &tda_check) == 0) {
+        if (k2 != min_rxtx - koffset)
+          break;
+        *next = fsn_add_delta(*next, 1);
+        continue;
+      }
     }
 
     /* Step 1: Collect candidates fresh each iteration. Although the candidate
