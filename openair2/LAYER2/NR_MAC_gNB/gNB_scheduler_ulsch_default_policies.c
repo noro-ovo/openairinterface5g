@@ -139,6 +139,15 @@ static bool needs_default_grant(const nr_ul_candidate_t *c)
   return c->sched_long_inactivity || (c->pending_bytes <= NR_UL_SMALL_BSR_BYTES && c->sr_cnt > 0);
 }
 
+/* RBs of a default grant. After an SR the UE has data and the gNB does not know how much: the grant has to carry its
+ * BSR. At the lowest MCS and on a mixed slot min_rb gives 3 or 4 bytes, not enough for a Long BSR of two LCGs (5 bytes),
+ * and a PHR can take them all, the same grant would then repeat. */
+#define NR_UL_SR_GRANT_RB_FACTOR 3
+static int default_grant_rbs(const nr_ul_candidate_t *c, int min_rb, int block_len)
+{
+  return c->sr_cnt > 0 ? min(min_rb * NR_UL_SR_GRANT_RB_FACTOR, block_len) : min_rb;
+}
+
 /* Orders the candidates the way nr_ul_proportional_fair() allocates them:
  * retransmissions, default grants, then UEs with data. mcs_a/mcs_b is the MCS
  * as known at the calling stage, see the two comparators below. */
@@ -364,7 +373,7 @@ int nr_ul_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_
     if (block_len < min_rb)
       continue;
 
-    COMMIT_UL_ALLOC(params, cand, rbStart, min_rb, cand->sched_pusch.mcs, n_scheduled);
+    COMMIT_UL_ALLOC(params, cand, rbStart, default_grant_rbs(cand, min_rb, block_len), cand->sched_pusch.mcs, n_scheduled);
     if (cand->scheduled)
       n++;
   }
@@ -455,8 +464,8 @@ int nr_ul_proportional_fair(const nr_ul_sched_params_t *params, nr_ul_candidate_
       continue;
 
     // min_rb without data. A UE past the UL inactivity limit, or with a small BSR and an SR, can have data: these RBs
-    // are left over by the UEs with data, so size the grant for it, within the free block
-    const int rbSize = ul_needed_rbs(cand, min_rb, block_len);
+    // are left over by the UEs with data, so size the grant for it, and after an SR large enough for a BSR, within the free block
+    const int rbSize = max(ul_needed_rbs(cand, min_rb, block_len), default_grant_rbs(cand, min_rb, block_len));
     COMMIT_UL_ALLOC(params, cand, rbStart, rbSize, cand->sched_pusch.mcs, n_scheduled);
   }
 
