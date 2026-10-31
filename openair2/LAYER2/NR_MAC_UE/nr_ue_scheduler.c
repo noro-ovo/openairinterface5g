@@ -1445,6 +1445,7 @@ static void nr_update_sr(NR_UE_MAC_INST_t *mac, bool BSRsent)
   }
 
   if (lc_info == NULL) { // all queues are empty
+    sched_info->BSR_reporting_active &= ~NR_BSR_TRIGGER_REGULAR;
     for (int i = 0; i < NR_MAX_SR_ID; i++) {
       nr_sr_info_t *sr = &sched_info->sr_info[i];
       if (sr->active_SR_ID) {
@@ -2108,11 +2109,15 @@ static void nr_ue_get_sdu_mac_ce_pre(NR_UE_MAC_INST_t *mac,
     // as transmitting only a BSR is not allowed if UE has data to transmit
     int size_for_long = num_lcg_id_with_data + sizeof(NR_BSR_LONG) + sizeof(NR_MAC_SUBHEADER_SHORT);
     int size_for_short = sizeof(NR_BSR_SHORT) + sizeof(NR_MAC_SUBHEADER_FIXED);
-    if (num_lcg_id_with_data > 1 && buflen >= size_for_long)
-      bsr_len = size_for_long;
-    else if ((num_lcg_id_with_data > 0 && buflen >= size_for_short)
-             || mac->scheduling_info.BSR_reporting_active & NR_BSR_TRIGGER_PERIODIC)
+    // With several LCGs with data only a Long BSR can be a Regular or Periodic BSR (TS 38.321 5.4.5): the truncated
+    // formats are for the padding BSR, which is not given any room before the data
+    if (num_lcg_id_with_data > 1) {
+      if (buflen >= size_for_long)
+        bsr_len = size_for_long;
+    } else if ((num_lcg_id_with_data > 0 && buflen >= size_for_short)
+               || mac->scheduling_info.BSR_reporting_active & NR_BSR_TRIGGER_PERIODIC) {
       bsr_len = size_for_short;
+    }
   }
   nr_phr_info_t *phr_info = &mac->scheduling_info.phr_info;
   if (phr_info->is_configured && phr_info->phr_reporting > 0) {
@@ -2146,7 +2151,8 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
                                       slot_t slot,
                                       NR_UE_MAC_CE_INFO *mac_ce_p,
                                       uint32_t *LCG_bytes,
-                                      bool *BSRsent)
+                                      bool *BSRsent,
+                                      bool *BSRcancel)
 {
   // Compute BSR Values and update Nb LCGID with data after multiplexing
   int lcg_id_bsr_max = 0;
@@ -2260,7 +2266,11 @@ static void nr_ue_get_sdu_mac_ce_post(NR_UE_MAC_INST_t *mac,
       LOG_D(NR_MAC, "[UE %d] MAC Periodic BSR Timer Reset\n", mac->ue_id);
     }
 
-    if (sched_info->regularBSR_trigger_lcid > 0) {
+    // TS 38.321 5.4.4, 5.4.5: only a Long or Short BSR cancels the triggered BSRs and their pending SR
+    const bool truncated = mac_ce_p->bsr.type_bsr == b_long_trunc || mac_ce_p->bsr.type_bsr == b_short_trunc;
+    if (!truncated)
+      *BSRcancel = true;
+    if (!truncated && sched_info->regularBSR_trigger_lcid > 0) {
       nr_lcordered_info_t *lc_info = get_lc_info_from_lcid(mac, sched_info->regularBSR_trigger_lcid);
       AssertFatal(lc_info, "Couldn't find logical channel with LCID %ld\n", sched_info->regularBSR_trigger_lcid);
       if (lc_info->sr_id >= 0 && lc_info->sr_id < NR_MAX_SR_ID) {
@@ -2517,7 +2527,8 @@ static bool nr_ue_get_sdu(NR_UE_MAC_INST_t *mac,
                           const uint32_t buflen,
                           int tx_power,
                           int P_CMAX,
-                          bool *BSRsent)
+                          bool *BSRsent,
+                          bool *BSRcancel)
 {
   NR_UE_MAC_CE_INFO mac_ce_info;
 
@@ -2621,7 +2632,7 @@ static bool nr_ue_get_sdu(NR_UE_MAC_INST_t *mac,
   } while (mac_ce_info.end_for_tailer - mac_ce_info.cur_ptr > sizeof(NR_MAC_SUBHEADER_LONG)
            && get_dataavailability_buffers(avail_lcids_count, lcids_bj_pos, mac_ce_info.lcids_data_status));
 
-  nr_ue_get_sdu_mac_ce_post(mac, frame, slot, &mac_ce_info, LCG_bytes, BSRsent);
+  nr_ue_get_sdu_mac_ce_post(mac, frame, slot, &mac_ce_info, LCG_bytes, BSRsent, BSRcancel);
 
   // Compute final offset for padding and fill remainder of ULSCH with 0
   int remain = mac_ce_info.pdu_end - mac_ce_info.cur_ptr;
@@ -2669,6 +2680,7 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
     nr_ue_prach_scheduler(mac, frame_tx, slot_tx);
 
   bool BSRsent = false;
+  bool BSRcancel = false;
   if (mac->state == UE_CONNECTED) {
     nr_ue_periodic_srs_scheduling(mac, frame_tx, slot_tx);
     nr_update_rlc_buffers_status(mac, frame_tx, slot_tx);
@@ -2737,7 +2749,7 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
                                       tp_enabled,
                                       pdu->rb_size,
                                       pdu->rb_start);
-            if (nr_ue_get_sdu(mac, frame_tx, slot_tx, ulsch_input_buffer, TBS_bytes, tx_power, P_CMAX, &BSRsent)) {
+            if (nr_ue_get_sdu(mac, frame_tx, slot_tx, ulsch_input_buffer, TBS_bytes, tx_power, P_CMAX, &BSRsent, &BSRcancel)) {
               pdu->tx_request_body.fapiTxPdu = ulsch_input_buffer;
               pdu->tx_request_body.pdu_length = TBS_bytes;
               number_of_pdus++;
@@ -2792,7 +2804,9 @@ void nr_ue_ul_scheduler(NR_UE_MAC_INST_t *mac, nr_uplink_indication_t *ul_info)
     nr_update_sr(mac, BSRsent);
   // Global variables implicit logic
   // far away, BSR_reporting_active is set
-  mac->scheduling_info.BSR_reporting_active = NR_BSR_TRIGGER_NONE;
+  // a triggered BSR stays until a Long or Short BSR is sent (TS 38.321 5.4.5)
+  if (BSRcancel || mac->state != UE_CONNECTED)
+    mac->scheduling_info.BSR_reporting_active = NR_BSR_TRIGGER_NONE;
 
   // update Bj for all active lcids before LCP procedure
   if (mac->current_UL_BWP) {
