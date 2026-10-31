@@ -1268,6 +1268,25 @@ void nr_rrc_config_ul_tda(NR_ServingCellConfigCommon_t *scc, int min_fb_delay, n
           asn1cSeqAdd(&tda_list->list, tda);
         }
       }
+    } else if (!p2) {
+      // k2 alone can miss UL slots: with DDSUU and k2 6 the last U would need a DCI in the U before it. Add the smallest
+      // k2 reaching each UL slot from the last slot with DL symbols or before
+      const int last_dl = N_dl1 - (p1->nrofDownlinkSymbols > 0 ? 0 : 1);
+      int max_k2 = k2;
+      for (int u = nb_slots_per_period - N_ul; u < nb_slots_per_period; u++) {
+        int d = k2;
+        while ((((u - d) % nb_slots_per_period) + nb_slots_per_period) % nb_slots_per_period > last_dl)
+          d++;
+        if (d <= max_k2)
+          continue;
+        max_k2 = d;
+        tda = set_TimeDomainResourceAllocation(d, get_SLIV(0, 13));
+        asn1cSeqAdd(&tda_list->list, tda);
+        if (do_SRS != NO_SRS) {
+          tda = set_TimeDomainResourceAllocation(d, get_SLIV(0, 12));
+          asn1cSeqAdd(&tda_list->list, tda);
+        }
+      }
     }
 
     // for Msg3, an additional get_delta_for_k2(mu) is added to k2.
