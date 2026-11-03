@@ -124,6 +124,17 @@ typedef struct {
 void nrLDPC_llr_copy_stats(int16_t *dst, const int16_t *src, int n, nr_ldpc_llr_stats_t *st);
 
 /**
+ * \brief decoder input straight from the rate-matching buffer d, in one pass (same bytes as building the int16 z buffer
+ *        with nrLDPC_llr_copy_stats() / memcpy and packing it with nrLDPC_llr_pack_int8()):
+ *        l[0, 2Z) = 0, l[2Z, Kprime) = pack(d[0, Kprime - 2Z)), l[Kprime, K) = 127 (fillers),
+ *        l[K, n_all) = pack(d[K - 2Z, n_all - 2Z)), l[n_all, n_all + 64) = 0; pack = gain ps (NULL = none) then int8
+ *        saturation. If st is not NULL, the statistics of the two LLR ranges are accumulated into it.
+ * \return 0, or -1 if not available (no AVX-512BW build, or mode LSHIFT): the caller then uses the two-pass path
+ */
+int nrLDPC_llr_pack_d_int8(const int16_t *d, int8_t *l, int Z, int K, int Kprime, int n_all,
+                           const nr_ldpc_llr_prescale_t *ps, nr_ldpc_llr_stats_t *st);
+
+/**
  * \brief gain (mode GAIN, or NONE if exactly 1) that maps the measured mean |LLR| to target; gain in [2^-15, 256]
  */
 nr_ldpc_llr_prescale_t nrLDPC_llr_agc_gain(float target, const nr_ldpc_llr_stats_t *st);
