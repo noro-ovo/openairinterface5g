@@ -2224,7 +2224,7 @@ static void generateDeregistrationRequest(nr_ue_nas_t *nas, as_nas_info_t *initi
   int size = sizeof(sp_msg.header);
 
   // Plain 5GMM header
-  sp_msg.plain.header = set_mm_header(FGS_DEREGISTRATION_REQUEST_UE_ORIGINATING, INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_SECU_CTX);
+  sp_msg.plain.header = set_mm_header(FGS_DEREGISTRATION_REQUEST_UE_ORIGINATING, PLAIN_5GS_MSG);
   size += sizeof(sp_msg.plain.header);
 
   // Plain 5GMM
@@ -2232,7 +2232,7 @@ static void generateDeregistrationRequest(nr_ue_nas_t *nas, as_nas_info_t *initi
   mm_msg->deregistrationtype.switchoff = NORMAL_DEREGISTRATION; // note: in case this is changed to SWITCH_OFF, handle in unprotected_allowed
   mm_msg->deregistrationtype.reregistration_required = REREGISTRATION_NOT_REQUIRED;
   mm_msg->deregistrationtype.access_type = TGPP_ACCESS;
-  mm_msg->naskeysetidentifier.naskeysetidentifier = 1;
+  mm_msg->naskeysetidentifier.naskeysetidentifier = set_fgs_ksi(nas);
   size += 1;
   size += fill_guti(&mm_msg->fgsmobileidentity, nas->guti);
 
