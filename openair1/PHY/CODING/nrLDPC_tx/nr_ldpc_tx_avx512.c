@@ -5,6 +5,7 @@
 /* x86-64 AVX-512 kernels of the packed LDPC transmit chain: encoder rows with 64-byte chunks, masked tail store and
  * vpternlogd 3-way XOR (F/BW/VL); output stage with VBMI interleaving and a GFNI 8x8 bit transpose (VBMI + GFNI). */
 #include "nr_ldpc_tx_internal.h"
+#include <stdlib.h>
 #if defined(__x86_64__)
 #include <immintrin.h>
 
@@ -175,6 +176,80 @@ static TGT void tcols_avx512(const uint8_t *const in[8], int z, int ncols, uint8
     for (int j = 0; j < 8; j++)
       r[j] = _mm512_maskz_loadu_epi8(kin, in[j] + c * nb);
     tr512(r, Q);
+    uint8_t *w0 = work + c * S, *w1 = w0 + z, *o = out + (c - 2) * z;
+    const int wo = c >= 2 && c < cw;
+    for (int q = 0; q < nq - 1; q++) {
+      _mm512_storeu_si512(w0 + 64 * q, Q[q]);
+      _mm512_storeu_si512(w1 + 64 * q, Q[q]);
+      if (wo)
+        _mm512_storeu_si512(o + 64 * q, Q[q]);
+    }
+    const int q = nq - 1;
+    _mm512_mask_storeu_epi8(w0 + 64 * q, kout, Q[q]);
+    _mm512_mask_storeu_epi8(w1 + 64 * q, kout, Q[q]);
+    if (wo)
+      _mm512_mask_storeu_epi8(o + 64 * q, kout, Q[q]);
+  }
+}
+
+/* GFNI variant of tr512: the same byte interleave on the raw input (qword b of the result: byte u = stream 7-u byte
+ * b), then VGF2P8AFFINEQB with that qword as the matrix and x = bytes (0x80, 0x40, .., 0x01): result byte t, bit k =
+ * stream k bit 8b + t (MSB first). Replaces the 12 bit-exchange steps (48 instructions) by 8. */
+#define TGTG __attribute__((target("avx512f,avx512bw,avx512vl,gfni")))
+#define AIG static inline __attribute__((always_inline)) TGTG
+AIG void tr512g(__m512i r[8], __m512i Q[8])
+{
+  __m512i A0 = _mm512_unpacklo_epi8(r[7], r[6]), A1 = _mm512_unpackhi_epi8(r[7], r[6]);
+  __m512i B0 = _mm512_unpacklo_epi8(r[5], r[4]), B1 = _mm512_unpackhi_epi8(r[5], r[4]);
+  __m512i C0 = _mm512_unpacklo_epi8(r[3], r[2]), C1 = _mm512_unpackhi_epi8(r[3], r[2]);
+  __m512i D0 = _mm512_unpacklo_epi8(r[1], r[0]), D1 = _mm512_unpackhi_epi8(r[1], r[0]);
+  __m512i E0 = _mm512_unpacklo_epi16(A0, B0), E1 = _mm512_unpackhi_epi16(A0, B0);
+  __m512i E2 = _mm512_unpacklo_epi16(A1, B1), E3 = _mm512_unpackhi_epi16(A1, B1);
+  __m512i F0 = _mm512_unpacklo_epi16(C0, D0), F1 = _mm512_unpackhi_epi16(C0, D0);
+  __m512i F2 = _mm512_unpacklo_epi16(C1, D1), F3 = _mm512_unpackhi_epi16(C1, D1);
+  __m512i G[8];
+  G[0] = _mm512_unpacklo_epi32(E0, F0);
+  G[1] = _mm512_unpackhi_epi32(E0, F0);
+  G[2] = _mm512_unpacklo_epi32(E1, F1);
+  G[3] = _mm512_unpackhi_epi32(E1, F1);
+  G[4] = _mm512_unpacklo_epi32(E2, F2);
+  G[5] = _mm512_unpackhi_epi32(E2, F2);
+  G[6] = _mm512_unpacklo_epi32(E3, F3);
+  G[7] = _mm512_unpackhi_epi32(E3, F3);
+  const __m512i x = _mm512_set1_epi64(0x0102040810204080LL);
+  for (int h = 0; h < 2; h++) {
+    __m512i *g = G + 4 * h;
+    __m512i U0 = _mm512_shuffle_i64x2(g[0], g[1], 0x88), U1 = _mm512_shuffle_i64x2(g[0], g[1], 0xDD);
+    __m512i U2 = _mm512_shuffle_i64x2(g[2], g[3], 0x88), U3 = _mm512_shuffle_i64x2(g[2], g[3], 0xDD);
+    Q[0 + h] = _mm512_gf2p8affine_epi64_epi8(x, _mm512_shuffle_i64x2(U0, U2, 0x88), 0);
+    Q[2 + h] = _mm512_gf2p8affine_epi64_epi8(x, _mm512_shuffle_i64x2(U1, U3, 0x88), 0);
+    Q[4 + h] = _mm512_gf2p8affine_epi64_epi8(x, _mm512_shuffle_i64x2(U0, U2, 0xDD), 0);
+    Q[6 + h] = _mm512_gf2p8affine_epi64_epi8(x, _mm512_shuffle_i64x2(U1, U3, 0xDD), 0);
+  }
+}
+
+static TGTG void transpose_avx512g(const uint8_t *const in[8], int nblk, uint8_t *out)
+{
+  for (int i = 0; i < nblk; i++) {
+    __m512i r[8], Q[8];
+    for (int j = 0; j < 8; j++)
+      r[j] = _mm512_loadu_si512(in[j] + 64 * i);
+    tr512g(r, Q);
+    for (int q = 0; q < 8; q++)
+      _mm512_storeu_si512(out + 512 * i + 64 * q, Q[q]);
+  }
+}
+
+/* same, with the GFNI transpose */
+static TGTG void tcols_avx512g(const uint8_t *const in[8], int z, int ncols, uint8_t *work, int S, uint8_t *out, int cw)
+{
+  const int nb = z >> 3, nq = (nb + 7) >> 3, rb = nb - 8 * (nq - 1);
+  const __mmask64 kin = nb == 64 ? ~0ULL : (1ULL << nb) - 1, kout = rb == 8 ? ~0ULL : (1ULL << (8 * rb)) - 1;
+  for (int c = 0; c < ncols; c++) {
+    __m512i r[8], Q[8];
+    for (int j = 0; j < 8; j++)
+      r[j] = _mm512_maskz_loadu_epi8(kin, in[j] + c * nb);
+    tr512g(r, Q);
     uint8_t *w0 = work + c * S, *w1 = w0 + z, *o = out + (c - 2) * z;
     const int wo = c >= 2 && c < cw;
     for (int q = 0; q < nq - 1; q++) {
@@ -461,6 +536,14 @@ const nr_ldpc_tx_kern_t *nr_ldpc_tx_kern_avx512(void)
   __builtin_cpu_init();
   if (!__builtin_cpu_supports("avx512f") || !__builtin_cpu_supports("avx512bw") || !__builtin_cpu_supports("avx512vl"))
     return 0;
+  /* input transposition with GFNI when present (BG1 8 CB: -9 % of the encoder at Z 384, -28 % at Z 64) */
+  if (__builtin_cpu_supports("gfni")) {
+    const char *e = getenv("NR_LDPC_TX_NO_GFNI_TR"); /* experiment: keep the bit-exchange transpose */
+    if (!(e && *e == '1')) {
+      k_avx512.transpose = transpose_avx512g;
+      k_avx512.tcols = tcols_avx512g;
+    }
+  }
   /* output stage without VBMI/GFNI (Skylake-SP/Cascade Lake): the AVX2 kernels */
   if (!__builtin_cpu_supports("avx512vbmi") || !__builtin_cpu_supports("gfni")) {
     k_avx512.extract = nr_ldpc_tx_extract_avx2;
