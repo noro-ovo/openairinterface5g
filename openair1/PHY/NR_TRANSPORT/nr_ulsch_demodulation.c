@@ -570,24 +570,24 @@ static void symbol_unscrambling_demux(puschSymbolProc_t *rdata, int ue_idx, int 
   uint32_t bits_per_re = rel15_ul->nrOfLayers * rel15_ul->qam_mod_order;
   // scrambling sequence of this symbol, +1 or -1 per LLR
   const int first_bit = rdata->llr_offset[s] * rel15_ul->nrOfLayers;
-  const int first_word = first_bit / 32;
-  const int nb_words = (first_bit + ul_valid_re_per_slot[s] * bits_per_re + 31) / 32 - first_word;
-  int16_t s_seq_words[nb_words * 32] __attribute__((aligned(32)));
-  nr_codeword_unscrambling_expand(rdata->scrambling_gold[ue_idx] + first_word, nb_words, s_seq_words);
-  int16_t *s_seq = s_seq_words + first_bit % 32;
   uint32_t a_idx = map_uci->ack_offset[s];
   uint32_t c1_idx = map_uci->csi1_offset[s];
   uint32_t c2_idx = map_uci->csi2_offset[s];
   uint32_t u_idx = map_uci->ulsch_offset[s];
 
-  // Fast path: uncrambling only no UCI multiplexed on this symbol
+  // Fast path: uncrambling only no UCI multiplexed on this symbol, straight from the sequence bits
   bool no_uci = (map_uci->d_ack[s] == 0 && map_uci->d_csi1[s] == 0 && map_uci->d_csi2[s] == 0);
   if (no_uci) {
     const int end = ul_valid_re_per_slot[s] * bits_per_re;
     int16_t *llr = &ue_pusch_vars->ulsch_llrs[u_idx];
-    unscramble_helper(llr_in, s_seq, llr, end);
+    nr_codeword_unscrambling_bits(llr_in, rdata->scrambling_gold[ue_idx], first_bit, end, llr);
     return;
   }
+  const int first_word = first_bit / 32;
+  const int nb_words = (first_bit + ul_valid_re_per_slot[s] * bits_per_re + 31) / 32 - first_word;
+  int16_t s_seq_words[nb_words * 32] __attribute__((aligned(32)));
+  nr_codeword_unscrambling_expand(rdata->scrambling_gold[ue_idx] + first_word, nb_words, s_seq_words);
+  int16_t *s_seq = s_seq_words + first_bit % 32;
 
   // Per-symbol remaining counts: private to this task
   uint32_t rem_ack = map_uci->q_ack[s];
