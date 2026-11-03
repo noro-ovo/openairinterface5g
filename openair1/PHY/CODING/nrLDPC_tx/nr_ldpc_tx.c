@@ -232,7 +232,11 @@ encode_sliced(const nr_ldpc_tx_kern_t *kern, const plan_t *p, int kprime, int nc
   const int nsys = K - 2 * z, clim = (kprime + z - 1) / z;
   /* 1. systematic columns: bit transposition straight into the doubled work columns (+ output) when possible */
   int c0 = 0, cw = 2;
-  if (kern->tcols && (z & 7) == 0 && z >= kern->tcols_zmin && kprime >= z && (!kern->tcols_use || kern->tcols_use(z))) {
+  /* Z < 256: one transposition of the whole input (the lin path below) beats the per-column transposer, which spends
+     a 64-byte transpose per stream on z/8 bytes (standalone encoder, BG1 8 CB, cycles: Z 64 1583 -> 1168, Z 208
+     3198 -> 2901; Z 384 per column stays faster, 4286 vs 4519) */
+  if (kern->tcols && z >= 256 && (z & 7) == 0 && z >= kern->tcols_zmin && kprime >= z &&
+      (!kern->tcols_use || kern->tcols_use(z))) {
     c0 = kprime / z; /* columns without filler bits */
     cw = 2 + nout / z;
     if (cw > c0)
@@ -297,7 +301,12 @@ encode_sliced(const nr_ldpc_tx_kern_t *kern, const plan_t *p, int kprime, int nc
   const uint8_t *lam_cnt = p->lam_cnt, *ext_cnt = p->ext_cnt;
   uint16_t flo[MAXE], feo[MAXE];
   uint8_t flc[4], fec[42];
-  if (clim < kb) {
+  if (clim < kb && kb - clim <= 2) {
+    /* one or two filler columns (the usual case, F < 2Z): zero them in the work area and keep the full edge lists
+       (their few edges add 0), cheaper than rebuilding the lists on every call */
+    for (int c = clim; c < kb; c++)
+      memset(work + c * S, 0, 2 * (size_t)z);
+  } else if (clim < kb) {
     filter_edges(p->lam_off, p->lam_col, p->lam_cnt, 4, clim, kb, flo, flc);
     filter_edges(p->ext_off, p->ext_col, p->ext_cnt, p->m - 4, clim, kb, feo, fec);
     lam_off = flo;
