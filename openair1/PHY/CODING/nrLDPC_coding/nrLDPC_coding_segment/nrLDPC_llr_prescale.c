@@ -241,6 +241,63 @@ void nrLDPC_llr_copy_stats(int16_t *dst, const int16_t *src, int n, nr_ldpc_llr_
   st->n += n;
 }
 
+#if defined(__AVX512BW__)
+/* n LLRs src -> dst (int8): gain, saturation; statistics into acc / nnz. Masked last chunk. */
+static inline void pack_range_avx512(const int16_t *src, int8_t *dst, int n, int mode, const nr_ldpc_llr_prescale_t *ps,
+                                     __m512i *acc, int *nnz, int with_stats)
+{
+  const __m512i ones = _mm512_set1_epi16(1), lo = _mm512_set1_epi16(-32767), zero = _mm512_setzero_si512();
+  const __m512i m = _mm512_set1_epi16(ps ? ps->q15 : 0);
+  const int k = ps ? ps->lshift : 0;
+  const __m512i hi = _mm512_set1_epi16(32767 >> k);
+  for (int i = 0; i < n; i += 32) {
+    const __mmask32 km = n - i >= 32 ? 0xffffffffu : (1u << (n - i)) - 1;
+    const __m512i x = _mm512_maskz_loadu_epi16(km, src + i);
+    if (with_stats) {
+      *acc = _mm512_add_epi32(*acc, _mm512_madd_epi16(_mm512_abs_epi16(x), ones));
+      *nnz += __builtin_popcount(_mm512_mask_cmpneq_epi16_mask(km, x, zero));
+    }
+    __m512i y = x;
+    if (mode == NR_LDPC_LLR_PRESCALE_FRAC || mode == NR_LDPC_LLR_PRESCALE_GAIN) {
+      /* sign(x) * round(|x'| * gain) with x' = max(x, -32767), as nrLDPC_llr_pack_int8() */
+      const __m512i xc = _mm512_max_epi16(x, lo);
+      __m512i a = _mm512_abs_epi16(xc);
+      if (mode == NR_LDPC_LLR_PRESCALE_GAIN)
+        a = _mm512_sll_epi16(_mm512_min_epi16(a, hi), _mm_cvtsi32_si128(k));
+      const __m512i r = _mm512_mulhrs_epi16(a, m);
+      y = _mm512_mask_sub_epi16(r, _mm512_cmplt_epi16_mask(xc, zero), zero, r);
+    }
+    _mm256_mask_storeu_epi8(dst + i, km, _mm512_cvtsepi16_epi8(y));
+  }
+}
+#endif
+
+int nrLDPC_llr_pack_d_int8(const int16_t *d, int8_t *l, int Z, int K, int Kprime, int n_all,
+                           const nr_ldpc_llr_prescale_t *ps, nr_ldpc_llr_stats_t *st)
+{
+#if defined(__AVX512BW__)
+  const int mode = ps ? ps->mode : NR_LDPC_LLR_PRESCALE_NONE;
+  if (mode == NR_LDPC_LLR_PRESCALE_LSHIFT)
+    return -1;
+  __m512i acc = _mm512_setzero_si512();
+  int nnz = 0;
+  memset(l, 0, 2 * Z);
+  pack_range_avx512(d, l + 2 * Z, Kprime - 2 * Z, mode, ps, &acc, &nnz, st != NULL);
+  memset(l + Kprime, 127, K - Kprime);
+  pack_range_avx512(d + (K - 2 * Z), l + K, n_all - K, mode, ps, &acc, &nnz, st != NULL);
+  memset(l + n_all, 0, 64);
+  if (st) {
+    st->sabs += _mm512_reduce_add_epi32(acc);
+    st->nnz += nnz;
+    st->n += (Kprime - 2 * Z) + (n_all - K);
+  }
+  return 0;
+#else
+  (void)d, (void)l, (void)Z, (void)K, (void)Kprime, (void)n_all, (void)ps, (void)st;
+  return -1;
+#endif
+}
+
 nr_ldpc_llr_prescale_t nrLDPC_llr_agc_gain(float target, const nr_ldpc_llr_stats_t *st)
 {
   nr_ldpc_llr_prescale_t p = {.mode = NR_LDPC_LLR_PRESCALE_NONE, .q8 = 256};
