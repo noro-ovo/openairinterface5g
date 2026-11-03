@@ -194,6 +194,12 @@ static void llr_prescale_init(void)
         llr_guard ? "on" : "off");
 }
 
+/* the guard of nr_process_decode_segment(): too few non-zero channel LLRs to decode */
+static inline int llr_guard_fails(const nr_ldpc_llr_stats_t *st, int n_all, int Z, int K, int Kprime)
+{
+  return st->n == 0 || (int64_t)st->nnz * (n_all - 2 * Z - (K - Kprime)) < (int64_t)st->n * ((Kprime - 2 * Z) / 2);
+}
+
 static void nr_process_decode_segment(void *arg)
 {
   nrLDPC_decoding_parameters_t *rdata = (nrLDPC_decoding_parameters_t *)arg;
@@ -259,54 +265,55 @@ static void nr_process_decode_segment(void *arg)
   p_decoderParms->crc_type = crcType(rdata->C, A);
   p_decoderParms->Kprime = lenWithCrc(rdata->C, A);
 
-  // set first 2*Z_c bits to zeros
-
-  int16_t z[68 * 384 + 16] __attribute__((aligned(16)));
-
-
-  memset(z, 0, 2 * rdata->Z * sizeof(*z));
-  // set Filler bits
-  memset(z + Kprime, 127, rdata->F * sizeof(*z));
   // TBs already in true-LLR units (llr_true_scale, see nrLDPC_prepare_TB_decoding()) are packed without gain or AGC
   const int true_scale = rdata->llr_true_scale;
   const int nl_idx = p_decoderParms->nb_layers > 1;
   const float agc_target = !true_scale && Qm <= NR_LDPC_LLR_PRESCALE_MAX_QM ? llr_agc_rule.target[nl_idx][Qm] : 0;
   const int n_all = Kc * rdata->Z;
   nr_ldpc_llr_stats_t st = {0};
-  if (agc_target > 0 || llr_guard) {
-    // statistics of the coded LLRs [2Z, Kc*Z) without the fillers [Kprime, K), taken while moving them into z
-    nrLDPC_llr_copy_stats(z + 2 * rdata->Z, rdata->d, Kprime - 2 * rdata->Z, &st);
-    nrLDPC_llr_copy_stats(z + K, rdata->d + (K - 2 * rdata->Z), n_all - K, &st);
-  } else {
-    // Move coded bits before filler bits
-    memcpy(z + 2 * rdata->Z, rdata->d, (Kprime - 2 * rdata->Z) * sizeof(*z));
-    // skip filler bits
-    memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
-  }
-  // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
-  int8_t l[68 * 384 + 16] __attribute__((aligned(16)));
+  int8_t l[68 * 384 + 64] __attribute__((aligned(64)));
   const nr_ldpc_llr_prescale_t *ps = true_scale ? NULL : nrLDPC_llr_prescale_get(&llr_prescale_rule, Qm, p_decoderParms->nb_layers);
-  nr_ldpc_llr_prescale_t agc_ps;
-  if (agc_target > 0 || llr_guard) {
-    // Guard: fewer channel LLRs than half the number of information bits cannot be decoded. Without it, a block whose
-    // LLRs all underflowed to 0 (very weak or absent signal) decodes to the all-zero codeword and passes its CRC (and,
-    // with zero payload, the TB CRC): a wrong TB would be delivered as correct.
-    if (llr_guard && (st.n == 0 || (int64_t)st.nnz * (n_all - 2 * rdata->Z - (K - Kprime)) < (int64_t)st.n * ((Kprime - 2 * rdata->Z) / 2))) {
-      LOG_D(PHY, "LDPC segment %d: %d/%d non-zero LLRs sampled, declared failed (guard)\n", rdata->r, st.nnz, st.n);
-      memset(rdata->c, 0, K >> 3);
-      *rdata->decodeSuccess = false;
-      completed_task_ans(rdata->ans);
-      return;
+  // Without AGC the gain does not depend on the statistics: the decoder input is packed straight from the rate-matching
+  // buffer in one pass (statistics for the guard taken on the way). With AGC: copy into z with statistics, then pack.
+  const int one_pass = agc_target <= 0
+                       && nrLDPC_llr_pack_d_int8(rdata->d, l, rdata->Z, K, Kprime, n_all, ps, llr_guard ? &st : NULL) == 0;
+  if (!one_pass) {
+    // set first 2*Z_c bits to zeros
+    int16_t z[68 * 384 + 16] __attribute__((aligned(16)));
+    memset(z, 0, 2 * rdata->Z * sizeof(*z));
+    // set Filler bits
+    memset(z + Kprime, 127, rdata->F * sizeof(*z));
+    if (agc_target > 0 || llr_guard) {
+      // statistics of the coded LLRs [2Z, Kc*Z) without the fillers [Kprime, K), taken while moving them into z
+      nrLDPC_llr_copy_stats(z + 2 * rdata->Z, rdata->d, Kprime - 2 * rdata->Z, &st);
+      nrLDPC_llr_copy_stats(z + K, rdata->d + (K - 2 * rdata->Z), n_all - K, &st);
+    } else {
+      // Move coded bits before filler bits
+      memcpy(z + 2 * rdata->Z, rdata->d, (Kprime - 2 * rdata->Z) * sizeof(*z));
+      // skip filler bits
+      memcpy(z + K, rdata->d + (K - 2 * rdata->Z), (Kc * rdata->Z - K) * sizeof(*z));
     }
-    if (agc_target > 0) {
+    nr_ldpc_llr_prescale_t agc_ps;
+    if (agc_target > 0 && !(llr_guard && llr_guard_fails(&st, n_all, rdata->Z, K, Kprime))) {
       agc_ps = nrLDPC_llr_agc_gain(agc_target, &st);
       ps = &agc_ps;
       p_decoderParms->llr_prescale_q8 = agc_ps.q8;
     }
+    // Saturate coded bits before decoding into 8 bits values, after the Qm-dependent gain (x1 = legacy pack)
+    nrLDPC_llr_pack_int8(z, l, ((Kc * rdata->Z) >> 4) + 1, ps);
+    if (ps && ps->mode != NR_LDPC_LLR_PRESCALE_NONE && rdata->F > 0)
+      memset(l + Kprime, 127, rdata->F); // fillers stay "known 0" whatever the gain
   }
-  nrLDPC_llr_pack_int8(z, l, ((Kc * rdata->Z) >> 4) + 1, ps);
-  if (ps && ps->mode != NR_LDPC_LLR_PRESCALE_NONE && rdata->F > 0)
-    memset(l + Kprime, 127, rdata->F); // fillers stay "known 0" whatever the gain
+  // Guard: fewer channel LLRs than half the number of information bits cannot be decoded. Without it, a block whose
+  // LLRs all underflowed to 0 (very weak or absent signal) decodes to the all-zero codeword and passes its CRC (and,
+  // with zero payload, the TB CRC): a wrong TB would be delivered as correct.
+  if (llr_guard && llr_guard_fails(&st, n_all, rdata->Z, K, Kprime)) {
+    LOG_D(PHY, "LDPC segment %d: %d/%d non-zero LLRs sampled, declared failed (guard)\n", rdata->r, st.nnz, st.n);
+    memset(rdata->c, 0, K >> 3);
+    *rdata->decodeSuccess = false;
+    completed_task_ans(rdata->ans);
+    return;
+  }
   //////////////////////////////////////////////////////////////////////////////////////////
 
   //////////////////////////////////////////////////////////////////////////////////////////
