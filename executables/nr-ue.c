@@ -534,6 +534,8 @@ static int handle_sync_req_from_mac(PHY_VARS_NR_UE *UE, Actor_t *dl_actors, Acto
 
     /* Clearing UE harq while DL actors are active causes race condition.
         So we let the current execution to complete here.*/
+    // before the flush: the running TX can wait for the other UEs, which must not wait for this one
+    nrue_ru_write_reorder_stopped(UE, true);
     for (int i = 0; i < get_nrUE_params()->num_dl_actors; i++) {
       flush_actor(&dl_actors[i]);
     }
@@ -865,6 +867,7 @@ void *UE_thread(void *arg)
   }
 
   UE->is_synchronized = 0;
+  nrue_ru_write_reorder_stopped(UE, true);
   InitSinLUT();
 
   notifiedFIFO_t nf;
@@ -915,6 +918,7 @@ void *UE_thread(void *arg)
 
   if (get_softmodem_params()->sync_ref && UE->sl_mode == 2) {
     UE->is_synchronized = 1;
+    nrue_ru_write_reorder_stopped(UE, false);
   } else {
     //warm up the RF board
     openair0_timestamp_t tmp;
@@ -1033,6 +1037,7 @@ void *UE_thread(void *arg)
       stream_status = STREAM_STATUS_SYNCING;
       syncInFrame(UE, &sync_timestamp, duration_rx_to_tx, intialSyncOffset);
       nrue_ru_write_reorder_clear_context(UE);
+      nrue_ru_write_reorder_stopped(UE, false);
       shiftForNextFrame = -(skipped_frames)*UE->max_pos_acc
                           * get_nrUE_params()->time_sync_I; // compensate for the time drift that happened during initial sync
       LOG_I(PHY, "max_pos_acc = %d, shiftForNextFrame = %d\n", UE->max_pos_acc, shiftForNextFrame);
