@@ -511,6 +511,8 @@ static int handle_sync_req_from_mac(PHY_VARS_NR_UE *UE, Actor_t *dl_actors, Acto
   NR_DL_FRAME_PARMS *fp = &UE->frame_parms;
   // Start synchronization with a target gNB
   if (UE->synch_request.received_synch_request == 1) {
+    // before the flush: the running TX can wait for the other UEs, which must not wait for this one
+    nrue_ru_write_reorder_stopped(UE, true);
     // Finish old-cell jobs before changing their radio configuration or HARQ state.
     flush_ue_actors(UE, dl_actors, ul_actors);
 
@@ -885,6 +887,7 @@ void *UE_thread(void *arg)
   }
 
   UE->is_synchronized = 0;
+  nrue_ru_write_reorder_stopped(UE, true);
   InitSinLUT();
 
   notifiedFIFO_t nf;
@@ -936,6 +939,7 @@ void *UE_thread(void *arg)
 
   if (get_softmodem_params()->sync_ref && UE->sl_mode == 2) {
     UE->is_synchronized = 1;
+    nrue_ru_write_reorder_stopped(UE, false);
   } else {
     //warm up the RF board
     openair0_timestamp_t tmp;
@@ -1066,6 +1070,7 @@ void *UE_thread(void *arg)
       stream_status = STREAM_STATUS_SYNCING;
       syncInFrame(UE, &sync_timestamp, duration_rx_to_tx, intialSyncOffset);
       nrue_ru_write_reorder_clear_context(UE);
+      nrue_ru_write_reorder_stopped(UE, false);
       shiftForNextFrame = -(skipped_frames)*UE->max_pos_acc
                           * get_nrUE_params()->time_sync_I; // compensate for the time drift that happened during initial sync
       LOG_I(PHY, "max_pos_acc = %d, shiftForNextFrame = %d\n", UE->max_pos_acc, shiftForNextFrame);

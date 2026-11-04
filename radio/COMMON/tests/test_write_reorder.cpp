@@ -61,6 +61,10 @@ class WriteReorder : public ::testing::Test {
     openair0_write_reorder_flush_common(NULL, NULL, &dev, nb_writers, 1, until, wait_ms);
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
   }
+  void stopped(int writer, bool s, int nb_writers = 2)
+  {
+    openair0_write_reorder_writer_stopped(&dev, writer, nb_writers, s);
+  }
   int sent(int64_t from, int64_t to) // number of written samples in [from, to)
   {
     int n = 0;
@@ -189,6 +193,58 @@ TEST_F(WriteReorder, late_write)
   write(6144, 2048, TX_BURST_MIDDLE);
   EXPECT_EQ(sent(0, 8192), 8192);
   EXPECT_EQ(writes.back().ts + writes.back().n, 8192);
+}
+
+// all the writers stopped (UEs not synchronized yet): their writes complete nothing, nothing runs ahead
+TEST_F(WriteReorder, all_writers_stopped)
+{
+  stopped(0, true);
+  stopped(1, true);
+  write(0, 2048, TX_BURST_INVALID, 0, 2, 1);
+  EXPECT_EQ(dev.reOrder.nextTS, 0);
+}
+
+// the writes of a stopped writer are added but do not make a sample complete for the present writers
+TEST_F(WriteReorder, stopped_writer_not_counted)
+{
+  stopped(1, true);
+  write(0, 4096, TX_BURST_MIDDLE, 1, 2, 1);
+  EXPECT_TRUE(writes.empty());
+  write(0, 4096, TX_BURST_MIDDLE, 1, 2, 0);
+  ASSERT_EQ(sent(0, 4096), 4096);
+  EXPECT_EQ(writes[0].s[0].r, 2);
+}
+
+// a writer starting again after being stopped (UE synchronized, its timeline moved) is not waited for before its
+// first write; its own out of order writes before it are not counted twice
+TEST_F(WriteReorder, resumed_writer)
+{
+  stopped(0, true);
+  stopped(1, true);
+  write(0, 2048, TX_BURST_INVALID, 0, 2, 1);
+  stopped(0, false);
+  write(20000, 2048, TX_BURST_MIDDLE, 1, 2, 0);
+  EXPECT_LT(flush(2, 20000, 1000), 500);
+  EXPECT_GE(dev.reOrder.nextTS, 20000);
+  EXPECT_EQ(dev.reOrder.nb_absent, 1);
+
+  // writer 1 resumes too, at the next samples not sent: nothing to fill. Then writer 0 resumes after a jump
+  stopped(0, true);
+  stopped(1, false);
+  const int64_t next = dev.reOrder.nextTS;
+  write(next, 4096, TX_BURST_MIDDLE, 1, 2, 1);
+  EXPECT_EQ(dev.reOrder.nextTS, next + 4096);
+  stopped(0, false);
+  write(next + 8192, 2048, TX_BURST_MIDDLE, 1, 2, 0);
+  write(next + 6144, 2048, TX_BURST_MIDDLE, 3, 2, 0); // out of order, in the range filled at its first write
+  const int sz = dev.reOrder.sz;
+  for (int64_t ts : {next + 4096, next + 6144, next + 8191, next + 8192})
+    EXPECT_EQ(dev.reOrder.nb_writers[ts % sz] & RO_COUNT, 1) << ts;
+  writes.clear();
+  EXPECT_GE(flush(2, next + 8192, 20), 15); // writer 1 did not write [next + 4096, next + 8192)
+  ASSERT_GE(writes.size(), 1u);
+  EXPECT_EQ(writes[0].ts, next + 6144);
+  EXPECT_EQ(writes[0].s[0].r, 3);
 }
 
 // clear_context discards pending samples: nothing stale is sent after restarting at another timestamp
