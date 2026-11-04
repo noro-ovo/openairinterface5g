@@ -2960,6 +2960,48 @@ static void rrc_CU_process_ue_context_release_complete(MessageDef *msg_p)
  * rfsim, and covers the SRB1 RLC retransmissions and the scheduling delays with many UEs. */
 #define NR_RRC_SETUP_COMPLETE_GUARD_MS 5000
 
+/* User inactivity (TS 38.413 9.2.2.4, cause user-inactivity): no user data on the UE's DRBs, in either direction,
+ * during ue_inactivity_timer seconds -> the CU asks the AMF to release the UE context, the UE goes to CM-IDLE.
+ * User data is counted at PDCP (SDUs): RLC/PDCP control PDUs are no user activity. Needs the PDCP of the CU-UP in
+ * this process (no E1 split: nr_pdcp_get_statistics() does not know the UE otherwise). */
+static void rrc_gNB_check_user_inactivity(gNB_RRC_INST *rrc, uint64_t now)
+{
+  const uint64_t timer_ms = (uint64_t)rrc->configuration.ue_inactivity_timer * 1000;
+  rrc_gNB_ue_context_t *ue_context_p;
+  RB_FOREACH (ue_context_p, rrc_nr_ue_tree_s, &rrc->rrc_ue_head) {
+    gNB_RRC_UE_t *UE = &ue_context_p->ue_context;
+    if (UE->an_release || UE->ho_context != NULL || seq_arr_size(&UE->drbs) == 0)
+      continue;
+    uint64_t sdus = 0;
+    bool known = false;
+    FOR_EACH_SEQ_ARR (drb_t *, drb, &UE->drbs) {
+      nr_pdcp_statistics_t s;
+      if (!nr_pdcp_get_statistics(UE->rrc_ue_id, 0, drb->drb_id, &s))
+        continue;
+      known = true;
+      sdus += (uint64_t)s.txsdu_pkts + s.rxsdu_pkts;
+    }
+    if (!known)
+      continue;
+    if (sdus != UE->inactivity_sdus || UE->inactivity_since_ms == 0) {
+      UE->inactivity_sdus = sdus;
+      UE->inactivity_since_ms = now;
+      UE->inactivity_release = false;
+      continue;
+    }
+    if (UE->inactivity_release || now < UE->inactivity_since_ms + timer_ms)
+      continue;
+    LOG_I(NR_RRC,
+          "UE %d RNTI %04x: no user data for %u s, UE Context Release Request (user inactivity)\n",
+          UE->rrc_ue_id,
+          UE->rnti,
+          rrc->configuration.ue_inactivity_timer);
+    UE->inactivity_release = true;
+    ngap_cause_t cause = {.type = NGAP_CAUSE_RADIO_NETWORK, .value = NGAP_CAUSE_RADIO_NETWORK_USER_INACTIVITY};
+    rrc_gNB_send_NGAP_UE_CONTEXT_RELEASE_REQ(0, ue_context_p, cause);
+  }
+}
+
 static void rrc_gNB_check_setup_complete(gNB_RRC_INST *rrc)
 {
   const uint64_t now = nr_pdcp_current_time();
@@ -3912,8 +3954,16 @@ void *rrc_gnb_task(void *args_p)
 
       case TIMER_HAS_EXPIRED:
         if (TIMER_HAS_EXPIRED(msg_p).timer_id == guard_timer_id) {
-          if (RC.nrrrc[0] && (NODE_IS_CU(RC.nrrrc[0]->node_type) || NODE_IS_MONOLITHIC(RC.nrrrc[0]->node_type)))
+          if (RC.nrrrc[0] && (NODE_IS_CU(RC.nrrrc[0]->node_type) || NODE_IS_MONOLITHIC(RC.nrrrc[0]->node_type))) {
             rrc_gNB_check_setup_complete(RC.nrrrc[0]);
+            /* user inactivity once per second */
+            static uint64_t last_inactivity_check_ms;
+            const uint64_t now = nr_pdcp_current_time();
+            if (RC.nrrrc[0]->configuration.ue_inactivity_timer > 0 && now >= last_inactivity_check_ms + 1000) {
+              last_inactivity_check_ms = now;
+              rrc_gNB_check_user_inactivity(RC.nrrrc[0], now);
+            }
+          }
         } else if (!IS_SOFTMODEM_NOSTATS && TIMER_HAS_EXPIRED(msg_p).timer_id == stats_timer_id) {
           nr_rrc_sample_conn_count(RC.nrrrc[0]);
           if (!write_rrc_stats(RC.nrrrc[0]))
