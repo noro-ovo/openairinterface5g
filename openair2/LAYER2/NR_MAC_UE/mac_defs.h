@@ -646,6 +646,8 @@ typedef struct NR_UE_MAC_INST_s {
   ssb_ro_preambles_t ssb_ro_preambles;
 
   dci_pdu_rel15_t def_dci_pdu_rel15[NR_MAX_SLOTS_PER_FRAME][8];
+  // payload size configured for each DCI format in each slot
+  uint16_t def_dci_size[NR_MAX_SLOTS_PER_FRAME][8];
 
   // Defined for abstracted mode
   NR_UE_DL_HARQ_STATUS_t dl_harq_info[NR_MAX_HARQ_PROCESSES][2]; // one harq process for each codeword
