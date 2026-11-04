@@ -31,5 +31,6 @@ void nrue_ru_release(PHY_VARS_NR_UE *UE);
 int nrue_ru_write(PHY_VARS_NR_UE *UE, openair0_timestamp_t timestamp, void **buff, int nsamps, int num_antennas, int flags);
 int nrue_ru_write_reorder(PHY_VARS_NR_UE *UE, openair0_timestamp_t timestamp, void **txp, int nsamps, int nbAnt, int flags);
 void nrue_ru_write_reorder_clear_context(PHY_VARS_NR_UE *UE);
+void nrue_ru_write_reorder_stopped(PHY_VARS_NR_UE *UE, bool stopped);
 
 #endif
