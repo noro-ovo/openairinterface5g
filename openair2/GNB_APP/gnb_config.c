@@ -2647,6 +2647,9 @@ gNB_RRC_INST *RCconfig_NRRRC()
         nrrrc_config.enable_sdap = *GNBParamList.paramarray[i][GNB_ENABLE_SDAP_IDX].iptr;
         LOG_I(GNB_APP, "SDAP UL/DL headers in RRC are %s\n", nrrrc_config.enable_sdap ? "present" : "absent");
         nrrrc_config.um_on_default_drb = *(GNBParamList.paramarray[i][GNB_UMONDEFAULTDRB_IDX].uptr);
+        nrrrc_config.ue_inactivity_timer = *(GNBParamList.paramarray[i][GNB_UE_INACTIVITY_TIMER_IDX].uptr);
+        if (nrrrc_config.ue_inactivity_timer > 0)
+          LOG_I(GNB_APP, "UE release for user inactivity after %u s without user data\n", nrrrc_config.ue_inactivity_timer);
 
       }//
     }//End for (k=0; k <num_gnbs ; k++)
