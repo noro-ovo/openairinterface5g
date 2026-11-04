@@ -442,6 +442,8 @@ static uint64_t oldest_client_timestamp(const read_data_t *rd, int nb_clients)
   return min;
 }
 
+#define NRUE_RU_TX_WAIT_MS 5000
+
 int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int num_antennas)
 {
   openair0_device_t *dev = &nrue_rus.openair0_dev[UE->rf_map.card];
@@ -464,7 +466,9 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
          The UEs write TX at least rx_to_tx slots after the RX they read, so a sample range one UE did not
          write (TA change, resync, ...) would wait forever for its writer: send all TX before this read.
          The simulated time does not have to follow the wall clock: first wait for the UEs whose TX is
-         still being processed, else their slot is dropped (late write), a DTX for the gNB */
+         still being processed, whatever their delay, else their slot is dropped (late write), a DTX or a
+         decoding failure for the gNB. A UE out of synchronization is not waited for, see
+         nrue_ru_write_reorder_stopped(): this bound is for a TX thread that stopped */
       if (IS_SOFTMODEM_RFSIM && rd->last_ts)
         openair0_write_reorder_flush_common(nrue_ru_write,
                                             UE,
@@ -472,7 +476,7 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
                                             ru->nb_clients,
                                             UE->frame_parms.nb_antennas_tx,
                                             rd->last_ts + rd->grain - dev->firstTS,
-                                            100);
+                                            NRUE_RU_TX_WAIT_MS);
       openair0_timestamp_t tmp_timestamp;
       void *tmp[ru->nb_rx];
       for (int i = 0; i < ru->nb_rx; i++)
@@ -510,8 +514,19 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
     AssertFatal(!ret, "errno: %s\n", strerror(ret));
     return nsamps;
   } else {
+    /* rfsim: as above, the TX of the samples this read waits for, else the TX of an out of synchronization UE,
+       not waited for, stays in the reorder ring and the gNB waits for it */
+    if (IS_SOFTMODEM_RFSIM && rd->last_ts)
+      openair0_write_reorder_flush_common(nrue_ru_write,
+                                          UE,
+                                          dev,
+                                          ru->nb_clients,
+                                          UE->frame_parms.nb_antennas_tx,
+                                          rd->last_ts + nsamps - dev->firstTS,
+                                          NRUE_RU_TX_WAIT_MS);
     openair0_timestamp_t tmp_timestamp;
     ret = dev->trx_read_func(dev, &tmp_timestamp, buff, nsamps, num_antennas);
+    rd->last_ts = tmp_timestamp + ret;
     nrue_ru_count_time(UE->rf_map.card, ret);
     if (!dev->firstTS_initialized) {
       dev->firstTS = tmp_timestamp;
@@ -565,6 +580,14 @@ int nrue_ru_write_reorder(PHY_VARS_NR_UE *UE, openair0_timestamp_t timestamp, vo
                                        nrue_rus.cfg[UE->rf_map.card].nb_clients,
                                        nbAnt,
                                        flags);
+}
+
+void nrue_ru_write_reorder_stopped(PHY_VARS_NR_UE *UE, bool stopped)
+{
+  if (!IS_SOFTMODEM_RFSIM) // only the rfsim read waits for the writers
+    return;
+  openair0_device_t *device = &nrue_rus.openair0_dev[UE->rf_map.card];
+  openair0_write_reorder_writer_stopped(device, UE->ru_client, nrue_rus.cfg[UE->rf_map.card].nb_clients, stopped);
 }
 
 void nrue_ru_write_reorder_clear_context(PHY_VARS_NR_UE *UE)

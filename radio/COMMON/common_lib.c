@@ -156,6 +156,9 @@ void openair0_write_reorder_free(re_order_t *r)
   munmap(r->nb_writers, 2 * r->sz * sizeof(*r->nb_writers));
   free(r->writer_end);
   free(r->writer_absent);
+  free(r->writer_stopped);
+  free(r->writer_fill_start);
+  free(r->writer_fill_end);
   pthread_cond_destroy(&r->written);
   pthread_mutex_destroy(&r->mutex_store);
   *r = (re_order_t){0};
@@ -261,7 +264,8 @@ static void reorder_flush(nrue_ru_write_t nrue_ru_write,
 {
   re_order_t *ctx = &device->reOrder;
   int *wr = ctx->nb_writers + ctx->nextTS % ctx->sz;
-  int ready = reorder_count_ready(wr, ctx->sz, nb_writers);
+  // no writer to wait for (all stopped or absent): nothing is complete, only the samples before force_until go
+  int ready = nb_writers > 0 ? reorder_count_ready(wr, ctx->sz, nb_writers) : 0;
   const int forced = force_until > ctx->nextTS ? min(force_until - ctx->nextTS, ctx->sz) : 0;
   ready = max(ready, forced);
   const bool gap = force_until - ctx->nextTS > ctx->sz; // nothing was written beyond the ring end
@@ -311,6 +315,9 @@ static void reorder_init_writers(re_order_t *ctx, int nb_writers)
   ctx->max_writers = nb_writers;
   ctx->writer_end = calloc_or_fail(nb_writers, sizeof(*ctx->writer_end));
   ctx->writer_absent = calloc_or_fail(nb_writers, sizeof(*ctx->writer_absent));
+  ctx->writer_stopped = calloc_or_fail(nb_writers, sizeof(*ctx->writer_stopped));
+  ctx->writer_fill_start = calloc_or_fail(nb_writers, sizeof(*ctx->writer_fill_start));
+  ctx->writer_fill_end = calloc_or_fail(nb_writers, sizeof(*ctx->writer_fill_end));
 }
 
 // several writers (TX threads, UEs sharing one RU) may write out of order and concurrently
@@ -339,8 +346,13 @@ int openair0_write_reorder_common(nrue_ru_write_t nrue_ru_write,
     ctx->maxTS = timestamp;
     ctx->initDone = true;
   }
-  ctx->writer_end[writer] = max(ctx->writer_end[writer], timestamp + nsamps);
-  if (ctx->writer_absent[writer]) {
+  const bool stopped = ctx->writer_stopped[writer];
+  // end of the samples counted for this writer before this write (the writes of a stopped writer are not counted)
+  const openair0_timestamp_t counted_end = ctx->writer_end[writer];
+  if (!stopped)
+    ctx->writer_end[writer] = max(ctx->writer_end[writer], timestamp + nsamps);
+  const bool resumed = ctx->writer_absent[writer] && !stopped;
+  if (resumed) {
     ctx->writer_absent[writer] = false;
     ctx->nb_absent--;
   }
@@ -348,10 +360,28 @@ int openair0_write_reorder_common(nrue_ru_write_t nrue_ru_write,
   int skip = 0;
   if (timestamp < ctx->nextTS) {
     skip = min(ctx->nextTS - timestamp, nsamps);
-    LOG_W(HW, "late write at %lu: %d of %d samples already sent, dropped\n", timestamp, skip, nsamps);
+    LOG_W(HW,
+          "late write at %lu from writer %d%s: %d of %d samples already sent, dropped\n",
+          timestamp,
+          writer,
+          stopped ? " (stopped)" : "",
+          skip,
+          nsamps);
   }
   // make room: samples more than one ring before the end of this write must be sent first
   reorder_flush(nrue_ru_write, UE, device, nb_writers, nbAnt, timestamp + nsamps - ctx->sz);
+
+  if (resumed) {
+    /* the writer counts again from this write: it has nothing to send before (a UE starting TX after its
+       synchronization, its timeline moved by the resynchronization), so the samples not sent yet before this
+       write are complete for it, else the read waits for samples it will never write */
+    const openair0_timestamp_t fill = max(ctx->nextTS, counted_end);
+    int *wr = ctx->nb_writers + fill % ctx->sz;
+    for (int i = 0; fill + i < timestamp; i++)
+      wr[i]++;
+    ctx->writer_fill_start[writer] = fill;
+    ctx->writer_fill_end[writer] = max(fill, timestamp);
+  }
 
   if (skip < nsamps) {
     const openair0_timestamp_t ts = timestamp + skip;
@@ -362,9 +392,16 @@ int openair0_write_reorder_common(nrue_ru_write_t nrue_ru_write,
       c16adds(((c16_t *)txp[a]) + skip, out, out, n);
     }
     const int active = flags != TX_BURST_INVALID ? RO_ACTIVE : 0;
+    // a stopped writer is not waited for: its samples are added, but do not make a sample complete for the others
+    const int counted = !stopped;
     int *wr = ctx->nb_writers + ts % ctx->sz;
     for (int i = 0; i < n; i++)
-      wr[i] = (wr[i] + 1) | active;
+      wr[i] = (wr[i] + counted) | active;
+    // already counted when the writer resumed
+    const int64_t lo = min(max((int64_t)ctx->writer_fill_start[writer] - (int64_t)ts, 0), n);
+    const int64_t hi = min(max((int64_t)ctx->writer_fill_end[writer] - (int64_t)ts, lo), n);
+    for (int i = lo; i < hi; i++)
+      wr[i] -= counted;
     if (active && !skip && (flags == TX_BURST_START || flags == TX_BURST_START_AND_END))
       wr[0] |= RO_START;
     if (active && (flags == TX_BURST_END || flags == TX_BURST_START_AND_END || flags == TX_BURST_END_NO_TIME_SPEC))
@@ -376,6 +413,23 @@ int openair0_write_reorder_common(nrue_ru_write_t nrue_ru_write,
   pthread_cond_broadcast(&ctx->written);
   pthread_mutex_unlock(&ctx->mutex_store);
   return nsamps;
+}
+
+/* stopped: the writer does not count, whatever it still writes (a UE out of synchronization finishing its last slots):
+   nobody waits for it. It counts again from its next write after stopped is false */
+void openair0_write_reorder_writer_stopped(openair0_device_t *device, int writer, int nb_writers, bool stopped)
+{
+  re_order_t *ctx = &device->reOrder;
+  AssertFatal(writer >= 0 && writer < nb_writers, "invalid writer %d of %d\n", writer, nb_writers);
+  pthread_mutex_lock(&ctx->mutex_store);
+  reorder_init_writers(ctx, nb_writers);
+  ctx->writer_stopped[writer] = stopped;
+  if (stopped && !ctx->writer_absent[writer]) {
+    ctx->writer_absent[writer] = true;
+    ctx->nb_absent++;
+  }
+  pthread_cond_broadcast(&ctx->written);
+  pthread_mutex_unlock(&ctx->mutex_store);
 }
 
 /* true when all the writers wrote the samples before until, *checked: first sample not checked yet
@@ -422,10 +476,9 @@ void openair0_write_reorder_flush_common(nrue_ru_write_t nrue_ru_write,
     openair0_timestamp_t checked = ctx->nextTS;
     while (!reorder_all_written(ctx, nb_writers - ctx->nb_absent, force_until, &checked))
       if (pthread_cond_timedwait(&ctx->written, &ctx->mutex_store, &deadline) == ETIMEDOUT) {
-        /* a writer that does not write a sample range at all (a UE resynchronizing after a radio link failure)
-           would make every flush wait wait_ms: the writers that did not reach the missing sample are absent, not
-           waited for, until they write again. The others are still waited for: the simulated time does not run
-           ahead of their TX */
+        /* only a writer that stopped without telling, as openair0_write_reorder_writer_stopped() does: its samples
+           are lost. The writers that did not reach the missing sample are absent until they write again */
+        LOG_E(HW, "no TX from a writer at %lu after %d ms\n", checked, wait_ms);
         for (int w = 0; w < ctx->max_writers; w++)
           if (!ctx->writer_absent[w] && ctx->writer_end[w] <= checked) {
             ctx->writer_absent[w] = true;
@@ -456,6 +509,8 @@ void openair0_write_reorder_clear_context(openair0_device_t *device)
     memset(ctx->nb_writers, 0, ctx->sz * sizeof(*ctx->nb_writers));
     for (int w = 0; w < ctx->max_writers; w++) {
       ctx->writer_end[w] = 0;
+      ctx->writer_fill_start[w] = 0;
+      ctx->writer_fill_end[w] = 0;
       ctx->writer_absent[w] = false;
     }
     ctx->nb_absent = 0;
