@@ -202,11 +202,14 @@ static void config_dci_pdu(NR_UE_MAC_INST_t *mac,
                                0);
     }
 
+    // nr_dci_size() only sets the sizes of the fields present in this configuration
+    dci_pdu_rel15_t *slot_config = &mac->def_dci_pdu_rel15[dl_config->slot][dci_format[i]];
+    memset(slot_config, 0, sizeof(*slot_config));
     uint16_t dci_size = nr_dci_size(current_DL_BWP,
                                     current_UL_BWP,
                                     sc_info,
                                     mac->pdsch_HARQ_ACK_Codebook,
-                                    &mac->def_dci_pdu_rel15[dl_config->slot][dci_format[i]],
+                                    slot_config,
                                     dci_format[i],
                                     rnti_type,
                                     coreset,
@@ -216,6 +219,7 @@ static void config_dci_pdu(NR_UE_MAC_INST_t *mac,
     if (dci_size == 0)
       return;
     rel15->dci_length_options[i] = dci_size;
+    mac->def_dci_size[dl_config->slot][dci_format[i]] = dci_size;
   }
 
   // DCI 0_0 and 1_0 are same size, L1 just needs to look for 1 option
