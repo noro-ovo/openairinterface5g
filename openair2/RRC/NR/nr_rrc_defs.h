@@ -133,6 +133,8 @@ typedef struct nr_rrc_config {
   bool um_on_default_drb;
   bool enable_sdap;
   int drbs;
+  /// seconds without user data on the DRBs before the release for user inactivity, 0: never
+  uint32_t ue_inactivity_timer;
 } nr_rrc_config_t;
 
 /* Small state for delaying NG-triggered actions (setup/release) */
@@ -254,6 +256,11 @@ typedef struct gNB_RRC_UE_s {
   bool setup_complete_pending;
   uint64_t setup_sent_ms;
   bool setup_timeout_release; // released by the CU because the RRCSetupComplete did not come
+  /* user inactivity, see rrc_gNB_check_user_inactivity(): DRB PDCP SDUs (both directions) at the last
+   * activity, its time (PDCP time, ms), release already requested */
+  uint64_t inactivity_sdus;
+  uint64_t inactivity_since_ms;
+  bool inactivity_release;
 
   /* NGUEContextSetup might come with PDU sessions, but setup needs to be
    * delayed after security (and capability); PDU sessions are stored here */
