@@ -342,6 +342,11 @@ typedef struct {
   int max_writers;
   openair0_timestamp_t *writer_end;
   bool *writer_absent;
+  bool *writer_stopped; // absent until told otherwise, whatever it writes
+  /* samples counted for a writer when it wrote again after being absent: it had nothing to send before this
+     write. Its own late writes in this range (out of order) are not counted twice */
+  openair0_timestamp_t *writer_fill_start;
+  openair0_timestamp_t *writer_fill_end;
   int nb_absent;
   openair0_timestamp_t nextTS; // first sample not sent yet
   openair0_timestamp_t maxTS; // end of the most recent write
@@ -619,6 +624,7 @@ void openair0_write_reorder_init(re_order_t *r, const openair0_config_t *openair
 void openair0_write_reorder_free(re_order_t *r);
 int openair0_write_reorder(openair0_device_t *device, openair0_timestamp_t timestamp, void **txp, int nsamps, int nbAnt, int flags);
 void openair0_write_reorder_clear_context(openair0_device_t *device);
+void openair0_write_reorder_writer_stopped(openair0_device_t *device, int writer, int nb_writers, bool stopped);
 void openair0_write_reorder_flush_common(nrue_ru_write_t nrue_ru_write,
                                          PHY_VARS_NR_UE *UE,
                                          openair0_device_t *device,

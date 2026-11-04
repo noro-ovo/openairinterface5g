@@ -454,6 +454,8 @@ static uint64_t oldest_client_timestamp(const read_data_t *rd, int nb_clients)
   return min;
 }
 
+#define NRUE_RU_TX_WAIT_MS 5000
+
 static uint64_t oldest_hold(const read_data_t *rd, int nb_clients)
 {
   uint64_t min = UINT64_MAX;
@@ -484,7 +486,9 @@ static uint64_t nrue_ru_ring_wait(PHY_VARS_NR_UE *UE, int nsamps, int num_antenn
          The UEs write TX at least rx_to_tx slots after the RX they read, so a sample range one UE did not
          write (TA change, resync, ...) would wait forever for its writer: send all TX before this read.
          The simulated time does not have to follow the wall clock: first wait for the UEs whose TX is
-         still being processed, else their slot is dropped (late write), a DTX for the gNB */
+         still being processed, whatever their delay, else their slot is dropped (late write), a DTX or a
+         decoding failure for the gNB. A UE out of synchronization is not waited for, see
+         nrue_ru_write_reorder_stopped(): this bound is for a TX thread that stopped */
       if (IS_SOFTMODEM_RFSIM && rd->last_ts)
         openair0_write_reorder_flush_common(nrue_ru_write,
                                             UE,
@@ -492,7 +496,7 @@ static uint64_t nrue_ru_ring_wait(PHY_VARS_NR_UE *UE, int nsamps, int num_antenn
                                             ru->nb_clients,
                                             UE->frame_parms.nb_antennas_tx,
                                             rd->last_ts + rd->grain - dev->firstTS,
-                                            100);
+                                            NRUE_RU_TX_WAIT_MS);
       // the grain overwrites the samples one ring before: wait for the clients that still process them
       while (rd->last_ts && oldest_hold(rd, ru->nb_clients) < rd->last_ts + rd->grain - rd->sz) {
         rd->hold_waited = true;
@@ -560,8 +564,9 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
     AssertFatal(!ret, "errno: %s\n", strerror(ret));
     return nsamps;
   } else {
-    // rfsim: as above, the gNB sends the samples we read only after receiving our TX up to about the same time, and the
-    // write reorder keeps the end of a burst until it fills a grain: send our TX up to the end of this read first
+    /* rfsim: as above, the gNB sends the samples we read only after receiving our TX up to about the same time, and the
+       write reorder keeps the end of a burst until it fills a grain, and the TX of an out of synchronization UE, not
+       waited for: send our TX up to the end of this read first */
     if (IS_SOFTMODEM_RFSIM && rd->last_ts)
       openair0_write_reorder_flush_common(nrue_ru_write,
                                           UE,
@@ -569,7 +574,7 @@ int nrue_ru_read(PHY_VARS_NR_UE *UE, openair0_timestamp_t *ptimestamp, void **bu
                                           max(ru->nb_clients, 1),
                                           UE->frame_parms.nb_antennas_tx,
                                           rd->last_ts + nsamps - dev->firstTS,
-                                          100);
+                                          NRUE_RU_TX_WAIT_MS);
     openair0_timestamp_t tmp_timestamp;
     ret = dev->trx_read_func(dev, &tmp_timestamp, buff, nsamps, num_antennas);
     rd->last_ts = tmp_timestamp + ret;
@@ -671,6 +676,14 @@ int nrue_ru_write_reorder(PHY_VARS_NR_UE *UE, openair0_timestamp_t timestamp, vo
                                        max(nb_clients, 1),
                                        nbAnt,
                                        flags);
+}
+
+void nrue_ru_write_reorder_stopped(PHY_VARS_NR_UE *UE, bool stopped)
+{
+  if (!IS_SOFTMODEM_RFSIM) // only the rfsim read waits for the writers
+    return;
+  openair0_device_t *device = &nrue_rus.openair0_dev[UE->rf_map.card];
+  openair0_write_reorder_writer_stopped(device, UE->ru_client, nrue_rus.cfg[UE->rf_map.card].nb_clients, stopped);
 }
 
 void nrue_ru_write_reorder_clear_context(PHY_VARS_NR_UE *UE)
