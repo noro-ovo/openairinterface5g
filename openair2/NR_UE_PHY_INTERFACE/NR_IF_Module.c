@@ -284,7 +284,6 @@ static uint32_t nr_ue_dl_processing(NR_UE_MAC_INST_t *mac, nr_downlink_indicatio
         LOG_D(NR_MAC, "We are filtering a UL_DCI to prevent it from being treated like a DL_DCI\n");
         continue;
       }
-      dci_pdu_rel15_t *def_dci_pdu_rel15 = &mac->def_dci_pdu_rel15[dl_info->slot][dci_format];
       ret_mask |= (1 << FAPI_NR_DCI_IND);
       AssertFatal(nr_ue_if_module_inst[dl_info->module_id] != NULL, "IF module is NULL!\n");
       fapi_nr_dl_config_request_t *dl_config = get_dl_config_request(mac, dl_info->slot);
@@ -293,7 +292,6 @@ static uint32_t nr_ue_dl_processing(NR_UE_MAC_INST_t *mac, nr_downlink_indicatio
                                                     .module_id = dl_info->module_id,
                                                     .phy_data = dl_info->phy_data};
       nr_ue_if_module_inst[dl_info->module_id]->scheduled_response(&scheduled_response);
-      memset(def_dci_pdu_rel15, 0, sizeof(*def_dci_pdu_rel15));
     }
     dl_info->dci_ind = NULL;
   }
