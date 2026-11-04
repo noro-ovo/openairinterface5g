@@ -370,13 +370,11 @@ int openair0_write_reorder_common(nrue_ru_write_t nrue_ru_write,
   int skip = 0;
   if (timestamp < ctx->nextTS) {
     skip = min(ctx->nextTS - timestamp, nsamps);
-    LOG_W(HW,
-          "late write at %lu from writer %d%s: %d of %d samples already sent, dropped\n",
-          timestamp,
-          writer,
-          stopped ? " (stopped)" : "",
-          skip,
-          nsamps);
+    // nobody waits for a stopped writer (UE out of synchronization): its late writes are expected
+    if (stopped)
+      LOG_D(HW, "late write at %lu from writer %d (stopped): %d of %d samples already sent, dropped\n", timestamp, writer, skip, nsamps);
+    else
+      LOG_W(HW, "late write at %lu from writer %d: %d of %d samples already sent, dropped\n", timestamp, writer, skip, nsamps);
   }
   // make room: samples more than one ring before the end of this write must be sent first
   reorder_flush(nrue_ru_write, UE, device, nb_writers, nbAnt, timestamp + nsamps - ctx->sz);
