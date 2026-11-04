@@ -2478,9 +2478,14 @@ static bool fill_mac_sdu(NR_UE_MAC_INST_t *mac,
     return false;
   }
 
-  // Update Buffer remain and BSR bytes after transmission
-  sched_info->LCID_buffer_remain -= sdu_length;
-  LCG_bytes[sched_info->LCGID] -= sdu_length;
+  /* Update Buffer remain and BSR bytes after transmission, from the RLC: a segmentation adds the header of the
+     remaining segment (SO field), so the buffer does not decrease by sdu_length only. Otherwise the next request is
+     short by these bytes and cuts the last SDU of a grant that has room for it */
+  logical_chan_id_t ch = lcid;
+  mac_rlc_status_resp_t rlc_status;
+  nr_mac_rlc_status_ind(mac->ue_id, frame, 1, &ch, &rlc_status);
+  LCG_bytes[sched_info->LCGID] -= sched_info->LCID_buffer_remain - (int32_t)rlc_status.bytes_in_buffer;
+  sched_info->LCID_buffer_remain = rlc_status.bytes_in_buffer;
   LOG_D(NR_MAC,
         "[UE %d] Update BSR [%d.%d] LCG_bytes for LCG%ld = %d\n",
         mac->ue_id,
