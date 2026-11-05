@@ -636,19 +636,11 @@ static void config_common(nr_cell_sched_t *cell, const nr_mac_config_t *config, 
       prach_fd_occasion->prach_root_sequence_index.value = rach_ConfigCommon->prach_RootSequenceIndex.choice.l839;
     prach_fd_occasion->prach_root_sequence_index.tl.tag = NFAPI_NR_CONFIG_PRACH_ROOT_SEQUENCE_INDEX_TAG;
     cfg->num_tlv++;
+    // 38.211 5.3.2: k1 counts from N_BWP_start, the lowest RB of the initial UL BWP, in SA and non-SA alike
     prach_fd_occasion->k1.value =
         NRRIV2PRBOFFSET(scc->uplinkConfigCommon->initialUplinkBWP->genericParameters.locationAndBandwidth, MAX_BWP_SIZE)
         + rach_ConfigCommon->rach_ConfigGeneric.msg1_FrequencyStart
         + (get_N_RA_RB(cfg->prach_config.prach_sub_c_spacing.value, scs) * i);
-    if (IS_SA_MODE(get_softmodem_params())) {
-      prach_fd_occasion->k1.value =
-          NRRIV2PRBOFFSET(scc->uplinkConfigCommon->initialUplinkBWP->genericParameters.locationAndBandwidth, MAX_BWP_SIZE)
-          + rach_ConfigCommon->rach_ConfigGeneric.msg1_FrequencyStart
-          + (get_N_RA_RB(cfg->prach_config.prach_sub_c_spacing.value, scs) * i);
-    } else {
-      prach_fd_occasion->k1.value = rach_ConfigCommon->rach_ConfigGeneric.msg1_FrequencyStart
-                                    + (get_N_RA_RB(cfg->prach_config.prach_sub_c_spacing.value, scs) * i);
-    }
     prach_fd_occasion->k1.tl.tag = NFAPI_NR_CONFIG_K1_TAG;
     cfg->num_tlv++;
     prach_fd_occasion->prach_zero_corr_conf.value = rach_ConfigCommon->rach_ConfigGeneric.zeroCorrelationZoneConfig;
