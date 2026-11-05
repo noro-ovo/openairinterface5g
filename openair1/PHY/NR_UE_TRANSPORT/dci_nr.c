@@ -62,7 +62,9 @@ static void nr_pdcch_demapping_deinterleaving(uint32_t coreset_nbr_rb,
                                               uint8_t number_of_candidates,
                                               uint16_t *CCE,
                                               uint8_t *L,
-                                              int llr_stride_per_symbol)
+                                              int llr_stride_per_symbol,
+                                              const nr_pdcch_reg_dmrs_t *reg_dmrs,
+                                              nr_pdcch_reg_dmrs_t *cand_dmrs)
 {
   /*
    * This function will do demapping and deinterleaving from llr containing demodulated symbols
@@ -144,7 +146,9 @@ static void nr_pdcch_demapping_deinterleaving(uint32_t coreset_nbr_rb,
   }
 
   int rb_count = 0;
+  const int reg_stride_per_symbol = llr_stride_per_symbol / RE_PER_RB_OUT_DMRS;
   for (int c_id = 0; c_id < number_of_candidates; c_id++) {
+    cand_dmrs[c_id] = (nr_pdcch_reg_dmrs_t){0};
     for (int symbol_idx = 0; symbol_idx < coreset_time_dur; symbol_idx++) {
       for (int cce_count = 0; cce_count < L[c_id]; cce_count++) {
         for (int k = 0; k < NR_NB_REG_PER_CCE / reg_bundle_size_L; k++) { // loop over REG bundles
@@ -153,6 +157,11 @@ static void nr_pdcch_demapping_deinterleaving(uint32_t coreset_nbr_rb,
           // loop over the RBs of the bundle
           memcpy(e_rx + RE_PER_RB_OUT_DMRS * rb_count, in, B_rb * RE_PER_RB_OUT_DMRS * sizeof(*e_rx));
           rb_count += B_rb;
+          const nr_pdcch_reg_dmrs_t *reg = reg_dmrs + f * B_rb + symbol_idx * reg_stride_per_symbol;
+          for (int rb = 0; rb < B_rb; rb++) {
+            cand_dmrs[c_id].cross += reg[rb].cross;
+            cand_dmrs[c_id].energy += reg[rb].energy;
+          }
         }
       }
     }
@@ -234,6 +243,45 @@ static void nr_pdcch_extract_rbs_single(uint32_t rxdataF_sz,
   }
 }
 
+// DMRS of each REG of the CORESET in this symbol, in the RB order of nr_pdcch_extract_rbs_single()
+static void nr_pdcch_reg_dmrs(int nb_rx,
+                              uint32_t rxdataF_sz,
+                              c16_t rxdataF[][rxdataF_sz],
+                              const c16_t *pilot,
+                              int dmrs_ref,
+                              const uint8_t *coreset_freq_dom,
+                              uint32_t rb_offset,
+                              uint32_t coreset_nbr_rb,
+                              uint32_t n_BWP_start,
+                              nr_pdcch_reg_dmrs_t *reg_dmrs)
+{
+  const int start = rb_offset / 6;
+  const int size = coreset_nbr_rb / 6;
+  for (int rb_group = start; rb_group < start + size; rb_group++) {
+    if ((coreset_freq_dom[rb_group / 8] & (1 << (7 - (rb_group & 7)))) == 0)
+      continue;
+    for (int rb = 0; rb < 6; rb++) {
+      const int c_rb = rb_group * 6 + rb;
+      const c16_t *pil = pilot + (dmrs_ref + c_rb) * 3;
+      nr_pdcch_reg_dmrs_t m = {0};
+      for (int aarx = 0; aarx < nb_rx; aarx++) {
+        const c16_t *rxF = rxdataF[aarx] + RE_PER_RB * (c_rb + n_BWP_start);
+        c32_t sum = {0};
+        for (int i = 0; i < 3; i++) {
+          // DMRS on k % 12 == 1, 5, 9 (38.211 7.4.1.3.2), pilot already conjugated
+          const c16_t d = c16mulShift(pil[i], rxF[1 + 4 * i], 15);
+          sum.r += d.r;
+          sum.i += d.i;
+          m.energy += (int64_t)d.r * d.r + (int64_t)d.i * d.i;
+        }
+        m.cross += (int64_t)sum.r * sum.r + (int64_t)sum.i * sum.i;
+      }
+      m.cross -= m.energy;
+      *reg_dmrs++ = m;
+    }
+  }
+}
+
 static void nr_pdcch_channel_compensation(int arraySz,
                                           int sz2,
                                           c16_t rxdataF_ext[][sz2],
@@ -270,7 +318,8 @@ static void nr_rx_pdcch_symbol(PHY_VARS_NR_UE *ue,
                                nr_phy_data_t *phy_data,
                                int llr_size_symbol,
                                c16_t rxdataF[ue->frame_parms.nb_antennas_rx][ue->frame_parms.ofdm_symbol_size],
-                               c16_t llr[llr_size_symbol])
+                               c16_t llr[llr_size_symbol],
+                               nr_pdcch_reg_dmrs_t reg_dmrs[llr_size_symbol / RE_PER_RB_OUT_DMRS])
 {
   NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
   NR_UE_PDCCH_CONFIG *phy_pdcch_config = &phy_data->phy_pdcch_config;
@@ -289,6 +338,16 @@ static void nr_rx_pdcch_symbol(PHY_VARS_NR_UE *ue,
   // Note: pilot returned by the following function is already the complex conjugate of the transmitted DMRS
   const uint32_t *gold = nr_gold_pdcch(fp->N_RB_DL, fp->symbols_per_slot, scrambling_id, proc->nr_slot_rx, symbol);
   nr_pdcch_dmrs_ref(gold, pilot, n_rb + rb_offset + dmrs_ref);
+  nr_pdcch_reg_dmrs(fp->nb_antennas_rx,
+                    fp->ofdm_symbol_size,
+                    rxdataF,
+                    pilot,
+                    dmrs_ref,
+                    coreset->frequency_domain_resource,
+                    rb_offset,
+                    n_rb,
+                    phy_pdcch_config->pdcch_config[ss_idx].BWPStart,
+                    reg_dmrs);
   nr_pdcch_channel_estimation(fp,
                               n_rb,
                               rb_offset,
@@ -402,7 +461,8 @@ void nr_pdcch_generate_llr(PHY_VARS_NR_UE *ue,
                            int num_monitoring_occ,
                            int max_symb,
                            c16_t rxdataF[ue->frame_parms.nb_antennas_rx][ue->frame_parms.ofdm_symbol_size],
-                           c16_t pdcch_llr[phy_data->phy_pdcch_config.nb_search_space][num_monitoring_occ][max_symb * llr_size_symbol])
+                           c16_t pdcch_llr[phy_data->phy_pdcch_config.nb_search_space][num_monitoring_occ][max_symb * llr_size_symbol],
+                           nr_pdcch_reg_dmrs_t reg_dmrs[phy_data->phy_pdcch_config.nb_search_space][num_monitoring_occ][max_symb * llr_size_symbol / 9])
 {
   const NR_UE_PDCCH_CONFIG *phy_pdcch_config = &phy_data->phy_pdcch_config;
 
@@ -426,7 +486,8 @@ void nr_pdcch_generate_llr(PHY_VARS_NR_UE *ue,
                            phy_data,
                            llr_size_symbol,
                            rxdataF,
-                           &pdcch_llr[ss_idx][occ][rel_symb_monOcc * llr_size_symbol]);
+                           &pdcch_llr[ss_idx][occ][rel_symb_monOcc * llr_size_symbol],
+                           &reg_dmrs[ss_idx][occ][rel_symb_monOcc * llr_size_symbol / RE_PER_RB_OUT_DMRS]);
       }
     }
   }
@@ -451,8 +512,23 @@ static void nr_pdcch_unscrambling(c16_t *e_rx,
   }
 }
 
+/* The gNB sends the PDCCH DMRS in the REGs of the PDCCH it transmits (38.211 7.4.1.3.2), so a candidate without DMRS is
+ * empty and polar decoding it can only give a false detection. On noise only, cross / energy over the n (REG, rx antenna)
+ * of the candidate has mean 0 and standard deviation sqrt(2 / (3 n)); the DMRS is present when it is NR_PDCCH_DMRS_K
+ * standard deviations above 0. */
+#define NR_PDCCH_DMRS_K 1.5
+static bool nr_pdcch_dmrs_present(const nr_pdcch_reg_dmrs_t *m, int n)
+{
+  if (m->cross <= 0)
+    return false;
+  const double r = (double)m->cross / m->energy;
+  return r * r * n * 3 > NR_PDCCH_DMRS_K * NR_PDCCH_DMRS_K * 2;
+}
+
 static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
                                       c16_t *pdcch_e_rx,
+                                      const nr_pdcch_reg_dmrs_t *cand_dmrs,
+                                      int nb_rx,
                                       fapi_nr_dl_config_dci_dl_pdu_rel15_t *rel15,
                                       fapi_nr_dci_indication_t *dci_ind)
 {
@@ -464,6 +540,12 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
   for (int j = 0; j < rel15->number_of_candidates; j++) {
     int CCEind = rel15->CCE[j];
     int L = rel15->L[j];
+    const int cand_e_rx_idx = e_rx_cand_idx;
+    e_rx_cand_idx += RE_PER_RB_OUT_DMRS * L * NR_NB_REG_PER_CCE; // e_rx index for next candidate (L CCEs, 6 REGs per CCE and 9 REs per REG)
+    if (!nr_pdcch_dmrs_present(&cand_dmrs[j], L * NR_NB_REG_PER_CCE * nb_rx)) {
+      LOG_D(NR_PHY_DCI, "(%i.%i) no DMRS in candidate CCE %d L %d\n", proc->frame_rx, proc->nr_slot_rx, CCEind, L);
+      continue;
+    }
 
     // Loop over possible DCI lengths
     
@@ -488,13 +570,13 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
             j,
             rel15->number_of_candidates,
             CCEind,
-            e_rx_cand_idx,
+            cand_e_rx_idx,
             L,
             dci_length,
             rel15->dci_format_options[k]);
 
       int16_t tmp_e[16 * 108];
-      nr_pdcch_unscrambling(&pdcch_e_rx[e_rx_cand_idx],
+      nr_pdcch_unscrambling(&pdcch_e_rx[cand_e_rx_idx],
                             rel15->coreset.scrambling_rnti,
                             L * 108,
                             rel15->coreset.pdcch_dmrs_scrambling_id,
@@ -542,7 +624,6 @@ static void nr_dci_decoding_procedure(const UE_nr_rxtx_proc_t *proc,
               rel15->dci_format_options[k]);
       }
     }
-    e_rx_cand_idx += RE_PER_RB_OUT_DMRS * L * 6; // e_rx index for next candidate (L CCEs, 6 REGs per CCE and 9 REs per REG )
   }
 }
 
@@ -552,7 +633,8 @@ void nr_pdcch_dci_indication(const UE_nr_rxtx_proc_t *proc,
                              int max_monOcc,
                              PHY_VARS_NR_UE *ue,
                              nr_phy_data_t *phy_data,
-                             c16_t llr[phy_data->phy_pdcch_config.nb_search_space][max_monOcc][llr_size])
+                             c16_t llr[phy_data->phy_pdcch_config.nb_search_space][max_monOcc][llr_size],
+                             const nr_pdcch_reg_dmrs_t reg_dmrs[phy_data->phy_pdcch_config.nb_search_space][max_monOcc][llr_size / 9])
 {
   NR_UE_PDCCH_CONFIG *phy_pdcch_config = &phy_data->phy_pdcch_config;
 
@@ -569,6 +651,7 @@ void nr_pdcch_dci_indication(const UE_nr_rxtx_proc_t *proc,
     for (int m = 0; m < num_monitoring_occ; m++) {
       /// PDCCH/DCI e-sequence (input to rate matching).
       c16_t pdcch_e_rx[NR_MAX_PDCCH_SIZE];
+      nr_pdcch_reg_dmrs_t cand_dmrs[rel15->number_of_candidates];
 
       nr_pdcch_demapping_deinterleaving(n_rb,
                                         llr[ss_idx][m],
@@ -580,9 +663,11 @@ void nr_pdcch_dci_indication(const UE_nr_rxtx_proc_t *proc,
                                         rel15->number_of_candidates,
                                         rel15->CCE,
                                         rel15->L,
-                                        llr_stride);
+                                        llr_stride,
+                                        reg_dmrs[ss_idx][m],
+                                        cand_dmrs);
 
-      nr_dci_decoding_procedure(proc, pdcch_e_rx, rel15, &dci_ind);
+      nr_dci_decoding_procedure(proc, pdcch_e_rx, cand_dmrs, ue->frame_parms.nb_antennas_rx, rel15, &dci_ind);
     }
   }
 
