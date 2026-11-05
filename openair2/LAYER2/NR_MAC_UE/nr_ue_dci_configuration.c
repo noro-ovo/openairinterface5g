@@ -131,7 +131,9 @@ static void config_dci_pdu(NR_UE_MAC_INST_t *mac,
     rel15->coreset.ShiftIndex = 0;
   }
 
-  rel15->coreset.precoder_granularity = coreset->precoderGranularity;
+  rel15->coreset.precoder_granularity = coreset->precoderGranularity == NR_ControlResourceSet__precoderGranularity_sameAsREG_bundle
+                                            ? PRECODER_GRANULARITY_SAME_AS_REG_BUNDLE
+                                            : PRECODER_GRANULARITY_ALL_CONTIGUOUS_RBS;
 
   // Scrambling RNTI
   rel15->coreset.scrambling_rnti = 0;
