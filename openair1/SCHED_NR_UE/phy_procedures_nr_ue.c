@@ -899,6 +899,7 @@ void pdcch_processing(PHY_VARS_NR_UE *ue, const UE_nr_rxtx_proc_t *proc, nr_phy_
   int max_nb_symb_pdcch = get_max_pdcch_symb(phy_pdcch_config);
   int llr_size_symbol = get_pdcch_max_rbs(phy_pdcch_config) * 9;
   c16_t pdcch_llr[phy_pdcch_config->nb_search_space][num_monitoring_occ][max_nb_symb_pdcch * llr_size_symbol];
+  nr_pdcch_reg_dmrs_t reg_dmrs[phy_pdcch_config->nb_search_space][num_monitoring_occ][max_nb_symb_pdcch * llr_size_symbol / 9];
   int start_symb_pdcch, last_symb_pdcch;
   set_first_last_pdcch_symb(phy_pdcch_config, fp->symbols_per_slot, &start_symb_pdcch, &last_symb_pdcch);
 
@@ -915,9 +916,9 @@ void pdcch_processing(PHY_VARS_NR_UE *ue, const UE_nr_rxtx_proc_t *proc, nr_phy_
     for (int ant = 0; ant < fp->nb_antennas_rx; ant++)
       memcpy(rxdataF_symb[ant], &rxdataF[ant][symbol * fp->ofdm_symbol_size], sizeof(c16_t) * fp->ofdm_symbol_size);
 
-    nr_pdcch_generate_llr(ue, proc, symbol, phy_data, llr_size_symbol, num_monitoring_occ, max_nb_symb_pdcch, rxdataF_symb, pdcch_llr);
+    nr_pdcch_generate_llr(ue, proc, symbol, phy_data, llr_size_symbol, num_monitoring_occ, max_nb_symb_pdcch, rxdataF_symb, pdcch_llr, reg_dmrs);
     if (symbol == last_symb_pdcch) {
-      nr_pdcch_dci_indication(proc, llr_size_symbol * max_nb_symb_pdcch, num_monitoring_occ, ue, phy_data, pdcch_llr);
+      nr_pdcch_dci_indication(proc, llr_size_symbol * max_nb_symb_pdcch, num_monitoring_occ, ue, phy_data, pdcch_llr, reg_dmrs);
       UEscopeCopy(ue, pdcchLlr, pdcch_llr, sizeof(c16_t), 1, sizeof(pdcch_llr) / sizeof(c16_t), 0);
     }
   }
