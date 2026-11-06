@@ -2002,7 +2002,7 @@ static int verify_aperiodic_srs(nr_cell_sched_t *cell, int slot, int k2, NR_time
 }
 
 /* Check retx feasibility against a new TDA.
- * Refits rbSize via nr_find_nb_rb so the new TDA preserves TBS.
+ * Refits rbSize so the new TDA preserves TBS (a transform precoding size with transform precoding).
  * Returns the new rbSize needed (>0), or 0 if infeasible. */
 uint16_t check_ul_retx_feasibility(const nr_ul_candidate_t *cand,
                                    int tda,
@@ -2020,19 +2020,33 @@ uint16_t check_ul_retx_feasibility(const nr_ul_candidate_t *cand,
                                                  retInfo->nrOfLayers,
                                                  retInfo->dmrs_info.dmrs_ports,
                                                  retInfo->dmrs_info.num_dmrs_cdm_grps_no_data);
-  uint32_t new_tbs;
-  uint16_t new_rbSize;
-  bool ok = nr_find_nb_rb(retInfo->Qm,
-                          retInfo->R,
-                          current_BWP->transform_precoding,
-                          retInfo->nrOfLayers,
-                          tda_info->nrOfSymbols,
-                          dmrs_info.N_PRB_DMRS * dmrs_info.num_dmrs_symb,
-                          retInfo->tb_size,
-                          1,
-                          max_rbSize,
-                          &new_tbs,
-                          &new_rbSize);
+  const int nb_dmrs_prb = dmrs_info.N_PRB_DMRS * dmrs_info.num_dmrs_symb;
+  uint32_t new_tbs = 0;
+  uint16_t new_rbSize = 0;
+  bool ok = false;
+  if (current_BWP->transform_precoding == NR_PUSCH_Config__transformPrecoder_enabled) {
+    /* nr_find_nb_rb() does not restrict the RB count to 2^a 3^b 5^c (38.211 6.3.1.4). The TBS grows with the RB
+     * count, so the smallest such count whose TBS reaches the old one is the only one that can keep it. */
+    for (int rb = 1; rb <= max_rbSize && !ok; rb++) {
+      if (check_sc_fdma_rbsize(current_BWP->transform_precoding, rb) != rb)
+        continue;
+      new_rbSize = rb;
+      new_tbs = nr_compute_tbs(retInfo->Qm, retInfo->R, rb, tda_info->nrOfSymbols, nb_dmrs_prb, 0, 0, retInfo->nrOfLayers) >> 3;
+      ok = new_tbs >= retInfo->tb_size;
+    }
+  } else {
+    ok = nr_find_nb_rb(retInfo->Qm,
+                       retInfo->R,
+                       current_BWP->transform_precoding,
+                       retInfo->nrOfLayers,
+                       tda_info->nrOfSymbols,
+                       nb_dmrs_prb,
+                       retInfo->tb_size,
+                       1,
+                       max_rbSize,
+                       &new_tbs,
+                       &new_rbSize);
+  }
   if (!ok || new_tbs != retInfo->tb_size) {
     LOG_D(NR_MAC, "[UE %04x] retx TDA change infeasible: new TBS %d != old TBS %d\n", cand->UE->rnti, new_tbs, retInfo->tb_size);
     return 0;
