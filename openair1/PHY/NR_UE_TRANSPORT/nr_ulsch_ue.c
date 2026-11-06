@@ -225,7 +225,10 @@ static void map_current_symbol(const nr_phy_pxsch_params_t p,
     const unsigned int dmrs_per_rb = (p.dmrs_type == pusch_dmrs_type1) ? 6 : 4;
     const unsigned int data_per_rb = NR_NB_SC_PER_RB - dmrs_per_rb;
 
-    const c16_t *p_mod_dmrs = dmrs_seq + abs_start_rb * dmrs_per_rb;
+    // reference point for k (38.211 6.4.1.1.3): subcarrier 0 in CRB 0, or the first subcarrier of the allocation with
+    // transform precoding, whose low-PAPR sequence only spans the allocation
+    const unsigned int dmrs_start_rb = p.transform_precoding == transformPrecoder_enabled ? 0 : abs_start_rb;
+    const c16_t *p_mod_dmrs = dmrs_seq + dmrs_start_rb * dmrs_per_rb;
     c16_t *out_tmp = out + start_sc;
     for (unsigned int rb = 0; rb < p.nb_rb; rb++) {
       map_dmrs_ptr(p.delta, p_mod_dmrs, out_tmp);
@@ -317,7 +320,9 @@ static void map_symbols(const nr_phy_pxsch_params_t p,
     map_data_dmrs_ptr = (p.num_cdm_no_data < 3) ? map_data_dmrs_type2_rb : NULL;
   }
   // for all symbols
-  const unsigned int n_dmrs = (p.bwp_start + p.start_rb + p.nb_rb) * ((p.dmrs_type == pusch_dmrs_type1) ? 6 : 4);
+  // DMRS sequence length up to the last RB of the allocation, counted from the reference point for k
+  const unsigned int first_dmrs_rb = p.transform_precoding == transformPrecoder_enabled ? 0 : p.bwp_start + p.start_rb;
+  const unsigned int n_dmrs = (first_dmrs_rb + p.nb_rb) * ((p.dmrs_type == pusch_dmrs_type1) ? 6 : 4);
   const c16_t *cur_data = data;
   uint8_t dmrs_symb_idx = 0;
   for (int l = p.start_symbol; l < p.start_symbol + p.num_symbols; l++) {
