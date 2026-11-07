@@ -1078,6 +1078,7 @@ int main(int argc, char *argv[])
     int errors_csi2 = 0;
 
     uint64_t sum_pusch_delay = 0;
+    double sum_dmrs_evm_err = 0, sum_dmrs_evm_ref = 0;
     int min_pusch_delay = INT_MAX;
     int max_pusch_delay = INT_MIN;
     int delay_pusch_est_count = 0;
@@ -1599,6 +1600,8 @@ int main(int argc, char *argv[])
         effRate += ((double)TBS) / (double)round;
 
       sum_pusch_delay += pusch_vars->delay.est_delay;
+      sum_dmrs_evm_err += pusch_vars->dmrs_evm_err;
+      sum_dmrs_evm_ref += pusch_vars->dmrs_evm_ref;
       min_pusch_delay = min(pusch_vars->delay.est_delay, min_pusch_delay);
       max_pusch_delay = max(pusch_vars->delay.est_delay, max_pusch_delay);
       delay_pusch_est_count++;
@@ -1653,6 +1656,11 @@ int main(int argc, char *argv[])
       printf(",%e", berStats[r]);
 
     printf(") Avg round %.2f, Eff Rate %.4f bits/slot, Eff Throughput %.2f, TBS %u bits/slot\n", roundStats,effRate,effTP,TBS);
+    if (sum_dmrs_evm_ref > 0)
+      printf("SNR %f: DMRS EVM %.2f %% (%.1f dB)\n",
+             SNR,
+             100 * sqrt(sum_dmrs_evm_err / sum_dmrs_evm_ref),
+             10 * log10(sum_dmrs_evm_err / sum_dmrs_evm_ref));
 
     double av_delay = (double)sum_pusch_delay / (2 * delay_pusch_est_count);
     printf("DMRS-PUSCH delay estimation: min %i, max %i, average %2.1f\n", min_pusch_delay >> 1, max_pusch_delay >> 1, av_delay);
