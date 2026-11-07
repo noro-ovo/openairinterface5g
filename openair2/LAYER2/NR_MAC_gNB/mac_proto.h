@@ -574,6 +574,9 @@ int nr_mac_get_tpc(nr_power_control_t *pc);
 /* UL scheduler helpers (shared between default policies and custom plugins) */
 float ul_pf_weight(int mcs, int mcs_table, int nrOfLayers, float avg_throughput);
 void update_ul_ue_R_Qm(int mcs, int mcs_table, const NR_PUSCH_Config_t *pusch_Config, uint16_t *R, uint8_t *Qm);
+/// UL buffer estimate in bytes from a Long BSR or Long Truncated BSR MAC CE of ce_len bytes
+int nr_estimate_ul_buffer_long_bsr(const NR_BSR_LONG *bsr, int ce_len);
+
 uint16_t check_ul_retx_feasibility(const nr_ul_candidate_t *cand,
                                    int tda,
                                    const NR_tda_info_t *tda_info,
