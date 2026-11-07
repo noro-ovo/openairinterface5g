@@ -1108,6 +1108,43 @@ static void NFAPI_NR_DMRS_TYPE2_average_prb(const int symb_sz,
 #endif
 }
 
+/* DMRS EVM terms of one DMRS symbol of one rx antenna, single layer, DMRS type 1, walking the allocated RB blocks as
+ * NFAPI_NR_DMRS_TYPE1_linear_interp() does: pilot n of an RB is at RE delta + 2 n of the RB, the estimate dl_ch holds 12
+ * RE per allocated RB. The estimator computes ch = pil rx >> 15 with pil = s conj(x), so the received pilot rebuilt from
+ * the final estimate is ch conj(pil) 2^15 / |pil|^2. Adds sum |rx - rebuilt|^2 to *err and sum |rebuilt|^2 to *ref. */
+static void pdsch_dmrs_evm(const c16_t *rxF,
+                           int delta,
+                           const c16_t *pil,
+                           const c16_t *dl_ch,
+                           int bwp_start_subcarrier,
+                           const freq_alloc_bitmap_t *freq_alloc,
+                           int bwpsize,
+                           double *err,
+                           double *ref)
+{
+  double e = 0, r = 0;
+  int pos = freq_alloc->first_rb, block_start, block_end, j = 0;
+  while (find_next_rb_block(freq_alloc->bitmap, bwpsize, &pos, &block_start, &block_end)) {
+    for (int rb = block_start; rb <= block_end; rb++, j++) {
+      const int rel = rb - freq_alloc->first_rb; // RB index from the first allocated RB, gaps included
+      for (int n = 0; n < 6; n++) {
+        const c16_t x = pil[6 * rel + n];
+        const double pr = x.r, pi = x.i, p2 = pr * pr + pi * pi;
+        if (p2 == 0)
+          continue;
+        const c16_t h = dl_ch[12 * j + delta + 2 * n], y = rxF[bwp_start_subcarrier + 12 * rel + delta + 2 * n];
+        const double g = 32768.0 / p2;
+        const double yr = (h.r * pr + h.i * pi) * g, yi = (h.i * pr - h.r * pi) * g; // h conj(pil) 2^15 / |pil|^2
+        const double dr = y.r - yr, di = y.i - yi;
+        e += dr * dr + di * di;
+        r += yr * yr + yi * yi;
+      }
+    }
+  }
+  *err += e;
+  *ref += r;
+}
+
 void nr_pdsch_channel_estimation(PHY_VARS_NR_UE *ue,
                                  const UE_nr_rxtx_proc_t *proc,
                                  const fapi_nr_dl_config_dlsch_pdu_rel15_t *dlsch,
@@ -1119,7 +1156,9 @@ void nr_pdsch_channel_estimation(PHY_VARS_NR_UE *ue,
                                  int32_t dl_ch_estimates[][pdsch_est_size],
                                  int rxdataFsize,
                                  c16_t rxdataF[][rxdataFsize],
-                                 uint32_t *nvar)
+                                 uint32_t *nvar,
+                                 double *evm_err,
+                                 double *evm_ref)
 {
   const int symb_sz = ue->frame_parms.ofdm_symbol_size;
   const int slot = proc->nr_slot_rx;
@@ -1197,6 +1236,17 @@ void nr_pdsch_channel_estimation(PHY_VARS_NR_UE *ue,
       AssertFatal(dlsch->resource_alloc == 1, "PRB average in channel estimation not supported for type0 DLSCH\n");
       NFAPI_NR_DMRS_TYPE2_average_prb(symb_sz, rxF, delta, &pilot[4 * rb_offset], dl_ch, bwp_start_subcarrier, nb_rb_pdsch);
     }
+
+    if (evm_err && config_type == NFAPI_NR_DMRS_TYPE1)
+      pdsch_dmrs_evm(rxF,
+                     delta,
+                     &pilot[6 * rb_offset],
+                     (const c16_t *)&dl_ch_estimates[nl * frame_parms->nb_antennas_rx + aarx][ch_offset],
+                     bwp_start_subcarrier,
+                     freq_alloc,
+                     dlsch->BWPSize,
+                     evm_err,
+                     evm_ref);
 
 #ifdef DEBUG_PDSCH
     dl_ch = &dl_ch_estimates[nl * frame_parms->nb_antennas_rx + aarx][ch_offset];

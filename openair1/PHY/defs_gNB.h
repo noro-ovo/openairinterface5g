@@ -64,6 +64,11 @@ typedef struct {
   int noise_power[MAX_ANT];
   int DTX;
   int sync_pos;
+  /// PUSCH DMRS EVM since the last dump_pusch_stats(): sum of |rx - h x|^2 and of |h x|^2 over the DMRS REs (DMRS power
+  /// boost beta_DMRS included: with 2 CDM groups without data the DMRS is 3 dB above the data), slots
+  double dmrs_evm_err;
+  double dmrs_evm_ref;
+  int dmrs_evm_slots;
 } NR_gNB_SCH_STATS_t;
 
 typedef struct {
@@ -253,6 +258,10 @@ typedef struct {
   int DTX;
   /// delay estimation
   delay_t delay;
+  /// DMRS EVM of the slot: sum of |rx - h x|^2 and of |h x|^2 over the DMRS REs, h the final channel estimate and x
+  /// the pilot (single layer, DMRS type 1; 0 otherwise)
+  double dmrs_evm_err;
+  double dmrs_evm_ref;
   /// information for UCI on PUSCH
   rate_match_info_uci_t uci_info;
 } NR_gNB_PUSCH;

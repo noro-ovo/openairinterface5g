@@ -482,6 +482,11 @@ typedef struct PHY_VARS_NR_UE_s {
     uint32_t llr_buf_max;
   } *pdsch_scratch;
   int pdsch_num_actors;
+  /// PDSCH DMRS EVM since the last nrL1_UE_stats dump: sum of |rx - h x|^2 and of |h x|^2 over the DMRS REs (rounded,
+  /// added atomically by the PDSCH actors), slots measured (single layer, DMRS type 1)
+  uint64_t pdsch_dmrs_evm_err;
+  uint64_t pdsch_dmrs_evm_ref;
+  uint32_t pdsch_dmrs_evm_slots;
 } PHY_VARS_NR_UE;
 typedef struct pdsch_scratch_s pdsch_scratch_t;
 

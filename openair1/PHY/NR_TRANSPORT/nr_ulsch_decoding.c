@@ -163,6 +163,11 @@ int nr_ulsch_decoding(PHY_VARS_gNB *phy_vars_gNB,
         stats->ulsch_stats.power[aarx] = dB_fixed_x10(pusch->ulsch_power[aarx]);
         stats->ulsch_stats.noise_power[aarx] = dB_fixed_x10(pusch->ulsch_noise_power[aarx]);
       }
+      if (pusch->dmrs_evm_ref > 0) {
+        stats->ulsch_stats.dmrs_evm_err += pusch->dmrs_evm_err;
+        stats->ulsch_stats.dmrs_evm_ref += pusch->dmrs_evm_ref;
+        stats->ulsch_stats.dmrs_evm_slots++;
+      }
       if (!harq_process->harq_to_be_cleared) {
         stats->ulsch_stats.current_Qm = TB_parameters->Qm;
         stats->ulsch_stats.current_RI = TB_parameters->nb_layers;

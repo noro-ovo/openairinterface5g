@@ -1477,6 +1477,14 @@ int main(int argc, char **argv)
     for (int r = 1; r < num_rounds; r++)
       printf(",%e", berStats[r]);
     printf(") Avg round %.2f, Eff Rate %.4f bits/slot, Eff Throughput %.2f, TBS %u bits/slot\n", roundStats, effRate, effRate / (8 * pdsch_pdu_rel15->TBSize[0]) * 100, 8 * pdsch_pdu_rel15->TBSize[0]);
+    {
+      // PDSCH DMRS EVM measured by the UE over this SNR point (the counters are reset here)
+      const uint64_t err = UE->pdsch_dmrs_evm_err, ref = UE->pdsch_dmrs_evm_ref;
+      UE->pdsch_dmrs_evm_err = UE->pdsch_dmrs_evm_ref = 0;
+      UE->pdsch_dmrs_evm_slots = 0;
+      if (ref > 0)
+        printf("SNR %f: DMRS EVM %.2f %% (%.1f dB)\n", SNR, 100 * sqrt((double)err / ref), 10 * log10((double)err / ref));
+    }
     printf("*****************************************\n");
     printf("\n");
     // writing to csv file
