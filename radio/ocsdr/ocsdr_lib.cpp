@@ -769,6 +769,7 @@ static int ocsdr_start(openair0_device_t *device)
     ocsdr_wr32(s->dev, OCSDR_ST_FD_SCALE, 0x555);
     s->fd->start_ts = start;
     if (s->fd->mask_hw) { // all symbols until the mask is learnt
+      s->fd->mask_dirty.store(true, std::memory_order_release); // write the learnt mask once learning ends
       for (int i = 0; i < 10; i++)
         ocsdr_wr32(s->dev, OCSDR_ST_FD_MASK + 4 * i, 0xffffffffu);
       ocsdr_wr32(s->dev, OCSDR_ST_FD_START_SLOT, (uint32_t)(((start + s->args.fd_adv + s->args.fd_nta) / FD_SLOT) % 20));
