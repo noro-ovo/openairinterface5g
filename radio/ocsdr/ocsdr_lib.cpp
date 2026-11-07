@@ -35,6 +35,8 @@
  *                 30 kHz (4096-point FFT)
  *   fd_nta=N      OAI N_TA_offset in samples (default 1600), fd_adv=N  OAI nb_prefix_samples / ofdm_offset_divisor
  *                 (default 36 = 288 / 8)
+ *   fd_wait_us=N  when OAI asks for a symbol that is due from the FPGA within N us, wait for it instead of letting
+ *                 OAI demodulate it (default 0: never wait; the last symbols of a slot come ~30-60 us after the slot)
  *   rx_sleep_us=N when the next RX block is not there yet, sleep until N us before the samples the read still needs
  *                 are due, then poll (default 60; 0: poll all the time, one core busy)
  */
@@ -91,6 +93,7 @@ struct ocsdr_args {
   bool        fd           = false; // front end: OFDM demodulation in the FPGA (register set v11)
   unsigned    fd_nta       = 1600;  // OAI N_TA_offset in samples (FR1 25600 Tc at 122.88 MS/s)
   unsigned    fd_adv       = 36;    // OAI nb_prefix_samples / ofdm_offset_divisor (288 / 8)
+  unsigned    fd_wait_us   = 0;     // wait for a symbol due within this time instead of letting OAI demodulate it
 };
 struct fd_cache;
 
@@ -181,6 +184,8 @@ static bool parse_args(const char *s, ocsdr_args &out)
       out.fd_nta = (unsigned)v;
     else if (key == "fd_adv" && v >= 0 && v < 352)
       out.fd_adv = (unsigned)v;
+    else if (key == "fd_wait_us" && v >= 0 && v <= 500)
+      out.fd_wait_us = (unsigned)v;
     else if (key == "tx_lead_stats")
       out.tx_lead_stats = v != 0;
     else if (key == "tx_flush_us" && v >= 0 && v <= 10000)
@@ -217,7 +222,7 @@ static bool parse_args(const char *s, ocsdr_args &out)
       LOG_E(HW,
             "ocsdr: unknown or out-of-range sdr_addrs item '%s' (keys: board, host, tx_shift, ring, skip_init, frontend, "
             "rx_atten, rx1_atten, tx_atten, rx_gain, rx2_gain, tx_advance, tx_gate, tx_gate_lead, tx_gate_lag, "
-            "tx_gate_mode, tx_flush_us, tx_lead_stats, rx_only, rx_sleep_us, fd, fd_nta, fd_adv)\n",
+            "tx_gate_mode, tx_flush_us, tx_lead_stats, rx_only, rx_sleep_us, fd, fd_nta, fd_adv, fd_wait_us)\n",
             item.c_str());
       return false;
     }
@@ -251,6 +256,9 @@ static void rx_sleep(ocsdr_state *s, uint64_t end_ts)
 // One writer (the RU thread in ocsdr_read), several readers (the RU thread pool): each entry is a seqlock.
 static constexpr unsigned FD_ENTRIES = 64; // ~2.3 slots of symbols
 static constexpr unsigned FD_HALF = OCSDR_RX_FD_BINS * 2; // words per half block (2 channels)
+// window start -> both halves of the symbol in host memory: FFT output starts ~8350 samples after the window's first
+// sample (xsim, fft4096_rx), half B ends 4096 later, plus FIFO, arbiter and DMA (~600)
+static constexpr uint64_t FD_ARRIVAL_SAMPLES = 8350 + 4096 + 600;
 
 struct fd_entry {
   std::atomic<uint32_t> seq{0}; // odd while being written
@@ -262,7 +270,7 @@ struct fd_entry {
 struct fd_cache {
   fd_entry e[FD_ENTRIES];
   unsigned wr = 0;           // entry of the symbol being filled
-  std::atomic<uint64_t> hits{0}, misses{0};
+  std::atomic<uint64_t> hits{0}, misses{0}, waits{0};
   uint64_t blocks = 0, dropped = 0, overflow = 0;
 };
 
@@ -296,6 +304,8 @@ static bool fd_take(ocsdr_state *s, uint32_t dropped)
   return true;
 }
 
+static int fd_lookup(fd_cache *c, openair0_timestamp_t win_ts, int aid, uint32_t *d);
+
 // OAI's trx_get_rxdataF_func: the symbol whose FFT window starts at win_ts, antenna aid, in the layout of
 // nr_symbol_fep_ul_shifted (bins 2458..4095 then 0..1637). 0 if it was here, -1 otherwise.
 static int ocsdr_get_rxdataF(openair0_device_t *device, openair0_timestamp_t win_ts, int aid, void *dst, int nbins)
@@ -304,6 +314,34 @@ static int ocsdr_get_rxdataF(openair0_device_t *device, openair0_timestamp_t win
   fd_cache *c = s->fd;
   if (!c || nbins != (int)(2 * OCSDR_RX_FD_BINS) || aid < 0 || aid > 1)
     return -1;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    if (attempt == 1) {
+      // not here yet: wait for it when it is due within fd_wait_us (the FFT core outputs a window about 8350 samples
+      // after its first sample; half B is complete 4096 samples later, then the FIFO and DMA)
+      if (!s->args.fd_wait_us)
+        break;
+      const uint64_t due = (uint64_t)win_ts + FD_ARRIVAL_SAMPLES, now = ocsdr_stream_time(s->stream);
+      const double wait_us = due > now ? (due - now) * 1e6 / SAMPLE_RATE_HZ : 0;
+      if (wait_us > s->args.fd_wait_us)
+        break;
+      if (wait_us > 0) {
+        struct timespec t = {0, (long)(wait_us * 1e3)};
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &t, nullptr);
+      }
+      c->waits.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (fd_lookup(c, win_ts, aid, (uint32_t *)dst) == 0) {
+      c->hits.fetch_add(1, std::memory_order_relaxed);
+      return 0;
+    }
+  }
+  c->misses.fetch_add(1, std::memory_order_relaxed);
+  return -1;
+}
+
+// copies the symbol for antenna aid if the cache has it (both halves, not being overwritten): 0, else -1
+static int fd_lookup(fd_cache *c, openair0_timestamp_t win_ts, int aid, uint32_t *d)
+{
   for (unsigned i = 0; i < FD_ENTRIES; i++) {
     fd_entry *e = &c->e[i];
     if (e->ts.load(std::memory_order_relaxed) != (uint64_t)win_ts)
@@ -311,16 +349,13 @@ static int ocsdr_get_rxdataF(openair0_device_t *device, openair0_timestamp_t win
     const uint32_t s0 = e->seq.load(std::memory_order_acquire);
     if ((s0 & 1) || e->halves.load(std::memory_order_relaxed) != 3 || e->ts.load(std::memory_order_relaxed) != (uint64_t)win_ts)
       break;
-    uint32_t *d = (uint32_t *)dst;
     ocsdr_fd_extract(d, e->w[1], aid, OCSDR_RX_FD_BINS);                     // negative frequencies first
     ocsdr_fd_extract(d + OCSDR_RX_FD_BINS, e->w[0], aid, OCSDR_RX_FD_BINS);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (e->seq.load(std::memory_order_relaxed) != s0)
       break; // overwritten while copying: let OAI demodulate the samples
-    c->hits.fetch_add(1, std::memory_order_relaxed);
     return 0;
   }
-  c->misses.fetch_add(1, std::memory_order_relaxed);
   return -1;
 }
 
@@ -412,8 +447,8 @@ static int ocsdr_read(openair0_device_t *device, openair0_timestamp_t *ptimestam
         LOG_I(HW, "ocsdr: RX1 %.1f dBFS, %lu sleep(s) for %.0f ms\n", dbfs(s->rx_sq, s->rx_n), s->rx_sleeps, s->rx_slept_us / 1e3);
         if (s->fd) {
           fd_cache *c = s->fd;
-          LOG_I(HW, "ocsdr: front end: %lu FD blocks (%lu dropped by the FPGA, %lu with FFT overflow), symbols taken by OAI %lu, demodulated by OAI %lu\n",
-                c->blocks, c->dropped, c->overflow, c->hits.exchange(0), c->misses.exchange(0));
+          LOG_I(HW, "ocsdr: front end: %lu FD blocks (%lu dropped by the FPGA, %lu with FFT overflow), symbols taken by OAI %lu (%lu after a wait), demodulated by OAI %lu\n",
+                c->blocks, c->dropped, c->overflow, c->hits.exchange(0), c->waits.exchange(0), c->misses.exchange(0));
           c->blocks = c->dropped = c->overflow = 0;
         }
         s->rx_sleeps   = 0;
