@@ -249,13 +249,18 @@ static void rx_sleep(ocsdr_state *s, uint64_t end_ts)
   s->rx_slept_us += wait_us;
 }
 
-// ---- front end (FPGA register set v11, sdr_addrs fd=1): frequency-domain symbols ----
+// ---- front end (FPGA register set v11+, sdr_addrs fd=1): frequency-domain symbols ----
 // The FPGA sends two blocks per symbol (bins 0..1637 and 2458..4095, both channels interleaved) in the RX ring.
 // ocsdr_read() keeps them here, keyed by the timestamp of the FFT window; OAI's nr_fep() asks for each symbol with
-// the window it would use itself (ocsdr_get_rxdataF) and demodulates the samples when the symbol is not here.
-// One writer (the RU thread in ocsdr_read), several readers (the RU thread pool): each entry is a seqlock.
+// the window it would use itself (ocsdr_get_rxdataF) and demodulates the samples when the symbol is not here. A
+// symbol still in the ring (the last ones of a slot arrive while the RU thread waits for nr_fep) is taken from the
+// ring without dequeuing it (look-ahead). Register set v12+: the FPGA only sends the symbols OAI asks for, a mask
+// learnt from OAI's requests (one frame, 20 slots x 14 symbols).
+// Writers (ocsdr_read, the look-ahead) hold fd_mtx; readers (the RU thread pool) use each entry's seqlock.
 static constexpr unsigned FD_ENTRIES = 64; // ~2.3 slots of symbols
 static constexpr unsigned FD_HALF = OCSDR_RX_FD_BINS * 2; // words per half block (2 channels)
+static constexpr unsigned FD_LOOKAHEAD = 64;              // ring blocks the look-ahead examines
+static constexpr uint64_t FD_SLOT = 61440;                // samples per slot (30 kHz, 122.88 MS/s)
 // window start -> both halves of the symbol in host memory: FFT output starts ~8350 samples after the window's first
 // sample (xsim, fft4096_rx), half B ends 4096 later, plus FIFO, arbiter and DMA (~600)
 static constexpr uint64_t FD_ARRIVAL_SAMPLES = 8350 + 4096 + 600;
@@ -269,10 +274,61 @@ struct fd_entry {
 
 struct fd_cache {
   fd_entry e[FD_ENTRIES];
-  unsigned wr = 0;           // entry of the symbol being filled
-  std::atomic<uint64_t> hits{0}, misses{0}, waits{0};
+  unsigned wr = 0;           // entry of the latest symbol (under mtx)
+  std::mutex mtx;            // cache writers
+  std::atomic<bool> reader_active{false}; // ocsdr_read is using the ring: no look-ahead
+  std::atomic<uint64_t> hits{0}, misses{0}, waits{0}, ahead{0};
   uint64_t blocks = 0, dropped = 0, overflow = 0;
+  // symbol mask (v12+): learnt from OAI's requests, written to the FPGA by ocsdr_read
+  bool mask_hw = false;                  // the image has the mask
+  std::atomic<uint16_t> learnt[20];      // per slot of the frame: symbols OAI asked for
+  uint16_t programmed[20];               // mask in the FPGA
+  std::atomic<bool> mask_dirty{false};
+  uint64_t start_ts = 0;                 // grid start
+  fd_cache()
+  {
+    for (int i = 0; i < 20; i++) {
+      learnt[i] = 0;
+      programmed[i] = 0x3fff;
+    }
+  }
 };
+
+// slot of the frame (0..19) and symbol of an FFT window start, on OAI's grid; false if it is not a window start
+static bool fd_slot_symbol(const ocsdr_state *s, uint64_t win_ts, unsigned *slot, unsigned *sym)
+{
+  const uint64_t rel = win_ts + s->args.fd_adv + s->args.fd_nta, within = rel % FD_SLOT;
+  *slot = (unsigned)((rel / FD_SLOT) % 20);
+  if (within == 352) {
+    *sym = 0;
+    return true;
+  }
+  if (within < 4448 + 288 || (within - 4448 - 288) % 4384 != 0 || (within - 4448 - 288) / 4384 > 12)
+    return false;
+  *sym = (unsigned)((within - 4448 - 288) / 4384 + 1);
+  return true;
+}
+
+// keeps one frequency-domain block in the cache (caller holds c->mtx); a half already there is not copied again
+static void fd_store(fd_cache *c, uint64_t ts, uint16_t flags, const int16_t *iq)
+{
+  const unsigned half = (flags & OCSDR_RX_FLAG_FD_HALF_B) ? 1 : 0;
+  fd_entry *e = &c->e[c->wr];
+  if (e->ts.load(std::memory_order_relaxed) != ts) { // a new symbol: next entry
+    c->wr = (c->wr + 1) % FD_ENTRIES;
+    e = &c->e[c->wr];
+    e->seq.fetch_add(1, std::memory_order_acq_rel); // odd: readers retry or give up
+    e->halves.store(0, std::memory_order_relaxed);
+    e->ts.store(ts, std::memory_order_relaxed);
+  } else if (e->halves.load(std::memory_order_relaxed) & (1u << half)) {
+    return; // taken earlier by the look-ahead
+  } else {
+    e->seq.fetch_add(1, std::memory_order_acq_rel);
+  }
+  memcpy(e->w[half], iq, sizeof(e->w[half]));
+  e->halves.store(e->halves.load(std::memory_order_relaxed) | (1u << half), std::memory_order_relaxed);
+  e->seq.fetch_add(1, std::memory_order_release); // even again: consistent
+}
 
 // takes the held block if it is a frequency-domain one (then releases it): true, else false (time-domain samples)
 static bool fd_take(ocsdr_state *s, uint32_t dropped)
@@ -282,29 +338,58 @@ static bool fd_take(ocsdr_state *s, uint32_t dropped)
     return false;
   fd_cache *c = s->fd;
   if (c) {
+    std::lock_guard<std::mutex> lock(c->mtx);
     c->blocks++;
     c->dropped += dropped;
     c->overflow += (flags & OCSDR_RX_FLAG_FD_OVERFLOW) != 0;
-    const unsigned half = (flags & OCSDR_RX_FLAG_FD_HALF_B) ? 1 : 0;
-    fd_entry *e = &c->e[c->wr];
-    if (e->ts.load(std::memory_order_relaxed) != s->rx_block_ts) { // a new symbol: next entry
-      c->wr = (c->wr + 1) % FD_ENTRIES;
-      e = &c->e[c->wr];
-      e->seq.fetch_add(1, std::memory_order_acq_rel); // odd: readers retry or give up
-      e->halves.store(0, std::memory_order_relaxed);
-      e->ts.store(s->rx_block_ts, std::memory_order_relaxed);
-    } else {
-      e->seq.fetch_add(1, std::memory_order_acq_rel);
-    }
-    memcpy(e->w[half], s->rx_block, sizeof(e->w[half]));
-    e->halves.store(e->halves.load(std::memory_order_relaxed) | (1u << half), std::memory_order_relaxed);
-    e->seq.fetch_add(1, std::memory_order_release); // even again: consistent
+    fd_store(c, s->rx_block_ts, flags, s->rx_block);
   }
   ocsdr_stream_rx_release(s->stream);
   return true;
 }
 
-static int fd_lookup(fd_cache *c, openair0_timestamp_t win_ts, int aid, uint32_t *d);
+// copies the symbol for antenna aid if the cache has it (both halves, not being overwritten): 0, else -1. Newest
+// entries first: OAI asks for symbols soon after they arrive.
+static int fd_lookup(fd_cache *c, openair0_timestamp_t win_ts, int aid, uint32_t *d)
+{
+  const unsigned newest = c->wr; // racy read: only a starting point
+  for (unsigned n = 0; n < FD_ENTRIES; n++) {
+    fd_entry *e = &c->e[(newest + FD_ENTRIES - n) % FD_ENTRIES];
+    if (e->ts.load(std::memory_order_relaxed) != (uint64_t)win_ts)
+      continue;
+    const uint32_t s0 = e->seq.load(std::memory_order_acquire);
+    if ((s0 & 1) || e->halves.load(std::memory_order_relaxed) != 3 || e->ts.load(std::memory_order_relaxed) != (uint64_t)win_ts)
+      return -1;
+    ocsdr_fd_extract(d, e->w[1], aid, OCSDR_RX_FD_BINS);                     // negative frequencies first
+    ocsdr_fd_extract(d + OCSDR_RX_FD_BINS, e->w[0], aid, OCSDR_RX_FD_BINS);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return e->seq.load(std::memory_order_relaxed) == s0 ? 0 : -1; // overwritten while copying: OAI demodulates
+  }
+  return -1;
+}
+
+// look-ahead: frequency-domain blocks that arrived but are still in the ring go into the cache now. Only while
+// ocsdr_read is not using the ring (in OAI the RU thread waits for nr_fep, so the ring is idle then).
+static void fd_lookahead(ocsdr_state *s)
+{
+  fd_cache *c = s->fd;
+  if (c->reader_active.load(std::memory_order_acquire))
+    return;
+  std::lock_guard<std::mutex> lock(c->mtx);
+  if (c->reader_active.load(std::memory_order_acquire))
+    return;
+  for (unsigned k = 0; k < FD_LOOKAHEAD; k++) {
+    const int16_t *iq;
+    uint64_t ts;
+    uint16_t flags;
+    if (ocsdr_stream_rx_peek(s->stream, k, &iq, &ts, &flags) != 0)
+      break;
+    if (flags & OCSDR_RX_FLAG_FD) {
+      fd_store(c, ts, flags, iq);
+      c->ahead.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
 
 // OAI's trx_get_rxdataF_func: the symbol whose FFT window starts at win_ts, antenna aid, in the layout of
 // nr_symbol_fep_ul_shifted (bins 2458..4095 then 0..1637). 0 if it was here, -1 otherwise.
@@ -314,10 +399,17 @@ static int ocsdr_get_rxdataF(openair0_device_t *device, openair0_timestamp_t win
   fd_cache *c = s->fd;
   if (!c || nbins != (int)(2 * OCSDR_RX_FD_BINS) || aid < 0 || aid > 1)
     return -1;
-  for (int attempt = 0; attempt < 2; attempt++) {
+  unsigned slot, sym;
+  if (c->mask_hw && fd_slot_symbol(s, win_ts, &slot, &sym)) { // learn the symbols OAI uses
+    const uint16_t bit = 1u << sym;
+    if (!(c->learnt[slot].fetch_or(bit, std::memory_order_relaxed) & bit) && !(c->programmed[slot] & bit))
+      c->mask_dirty.store(true, std::memory_order_release);
+  }
+  for (int attempt = 0; attempt < 3; attempt++) {
     if (attempt == 1) {
-      // not here yet: wait for it when it is due within fd_wait_us (the FFT core outputs a window about 8350 samples
-      // after its first sample; half B is complete 4096 samples later, then the FIFO and DMA)
+      fd_lookahead(s); // still in the ring?
+    } else if (attempt == 2) {
+      // not arrived yet: wait for it when it is due within fd_wait_us
       if (!s->args.fd_wait_us)
         break;
       const uint64_t due = (uint64_t)win_ts + FD_ARRIVAL_SAMPLES, now = ocsdr_stream_time(s->stream);
@@ -329,6 +421,7 @@ static int ocsdr_get_rxdataF(openair0_device_t *device, openair0_timestamp_t win
         clock_nanosleep(CLOCK_MONOTONIC, 0, &t, nullptr);
       }
       c->waits.fetch_add(1, std::memory_order_relaxed);
+      fd_lookahead(s);
     }
     if (fd_lookup(c, win_ts, aid, (uint32_t *)dst) == 0) {
       c->hits.fetch_add(1, std::memory_order_relaxed);
@@ -339,30 +432,44 @@ static int ocsdr_get_rxdataF(openair0_device_t *device, openair0_timestamp_t win
   return -1;
 }
 
-// copies the symbol for antenna aid if the cache has it (both halves, not being overwritten): 0, else -1
-static int fd_lookup(fd_cache *c, openair0_timestamp_t win_ts, int aid, uint32_t *d)
+// writes the learnt symbol mask to the FPGA (from ocsdr_read, the only thread writing stream registers while running),
+// once two frames of requests were seen, and again when OAI asks for a symbol outside it
+static void fd_mask_update(ocsdr_state *s)
 {
-  for (unsigned i = 0; i < FD_ENTRIES; i++) {
-    fd_entry *e = &c->e[i];
-    if (e->ts.load(std::memory_order_relaxed) != (uint64_t)win_ts)
-      continue;
-    const uint32_t s0 = e->seq.load(std::memory_order_acquire);
-    if ((s0 & 1) || e->halves.load(std::memory_order_relaxed) != 3 || e->ts.load(std::memory_order_relaxed) != (uint64_t)win_ts)
-      break;
-    ocsdr_fd_extract(d, e->w[1], aid, OCSDR_RX_FD_BINS);                     // negative frequencies first
-    ocsdr_fd_extract(d + OCSDR_RX_FD_BINS, e->w[0], aid, OCSDR_RX_FD_BINS);
-    std::atomic_thread_fence(std::memory_order_acquire);
-    if (e->seq.load(std::memory_order_relaxed) != s0)
-      break; // overwritten while copying: let OAI demodulate the samples
-    return 0;
+  fd_cache *c = s->fd;
+  if (!c->mask_hw || !c->mask_dirty.load(std::memory_order_acquire))
+    return;
+  if (ocsdr_stream_time(s->stream) < c->start_ts + 40 * FD_SLOT)
+    return; // learning: the first two frames go out complete
+  c->mask_dirty.store(false, std::memory_order_relaxed);
+  uint32_t w[10] = {0};
+  unsigned n = 0;
+  for (int i = 0; i < 20; i++) {
+    c->programmed[i] = c->learnt[i].load(std::memory_order_relaxed);
+    for (int b = 0; b < 14; b++)
+      if (c->programmed[i] & (1u << b)) {
+        const unsigned bit = 14 * i + b;
+        w[bit / 32] |= 1u << (bit % 32);
+        n++;
+      }
   }
-  return -1;
+  for (int i = 0; i < 10; i++)
+    ocsdr_wr32(s->dev, OCSDR_ST_FD_MASK + 4 * i, w[i]);
+  ocsdr_wr32(s->dev, OCSDR_ST_FD_CTRL, 1 | 4); // keep enabled, load the mask
+  LOG_I(HW, "ocsdr: front end: the FPGA now sends the %u symbols per frame OAI asks for\n", n);
 }
 
 static int ocsdr_read(openair0_device_t *device, openair0_timestamp_t *ptimestamp, void **buff, int nsamps, int nb_ant)
 {
   ocsdr_state *s = (ocsdr_state *)device->priv;
   const unsigned hw = s->hw_ch, bs = s->bs;
+  struct reader_flag { // no look-ahead into the ring while this read uses it
+    fd_cache *c;
+    reader_flag(fd_cache *c_) : c(c_) { if (c) { std::lock_guard<std::mutex> l(c->mtx); c->reader_active.store(true, std::memory_order_release); } }
+    ~reader_flag() { if (c) c->reader_active.store(false, std::memory_order_release); }
+  } busy(s->fd);
+  if (s->fd)
+    fd_mask_update(s);
 
   auto zero = [&](unsigned from, unsigned n) {
     for (int a = 0; a < nb_ant; a++)
@@ -447,8 +554,8 @@ static int ocsdr_read(openair0_device_t *device, openair0_timestamp_t *ptimestam
         LOG_I(HW, "ocsdr: RX1 %.1f dBFS, %lu sleep(s) for %.0f ms\n", dbfs(s->rx_sq, s->rx_n), s->rx_sleeps, s->rx_slept_us / 1e3);
         if (s->fd) {
           fd_cache *c = s->fd;
-          LOG_I(HW, "ocsdr: front end: %lu FD blocks (%lu dropped by the FPGA, %lu with FFT overflow), symbols taken by OAI %lu (%lu after a wait), demodulated by OAI %lu\n",
-                c->blocks, c->dropped, c->overflow, c->hits.exchange(0), c->waits.exchange(0), c->misses.exchange(0));
+          LOG_I(HW, "ocsdr: front end: %lu FD blocks (%lu dropped by the FPGA, %lu with FFT overflow), symbols taken by OAI %lu (%lu after a wait, %lu FD blocks taken ahead from the ring), demodulated by OAI %lu\n",
+                c->blocks, c->dropped, c->overflow, c->hits.exchange(0), c->waits.exchange(0), c->ahead.exchange(0), c->misses.exchange(0));
           c->blocks = c->dropped = c->overflow = 0;
         }
         s->rx_sleeps   = 0;
@@ -660,6 +767,12 @@ static int ocsdr_start(openair0_device_t *device)
     const uint64_t slot = 61440, now = ocsdr_stream_time(s->stream);
     const uint64_t start = (now / slot + 4) * slot - s->args.fd_adv - s->args.fd_nta;
     ocsdr_wr32(s->dev, OCSDR_ST_FD_SCALE, 0x555);
+    s->fd->start_ts = start;
+    if (s->fd->mask_hw) { // all symbols until the mask is learnt
+      for (int i = 0; i < 10; i++)
+        ocsdr_wr32(s->dev, OCSDR_ST_FD_MASK + 4 * i, 0xffffffffu);
+      ocsdr_wr32(s->dev, OCSDR_ST_FD_START_SLOT, (uint32_t)(((start + s->args.fd_adv + s->args.fd_nta) / FD_SLOT) % 20));
+    }
     ocsdr_wr32(s->dev, OCSDR_ST_FD_START_LO, (uint32_t)start);
     ocsdr_wr32(s->dev, OCSDR_ST_FD_START_HI, (uint32_t)(start >> 32));
     ocsdr_wr32(s->dev, OCSDR_ST_FD_CTRL, 1);
@@ -859,7 +972,12 @@ extern "C" int device_init(openair0_device_t *device, openair0_config_t *openair
       LOG_E(HW, "ocsdr: fd=1 needs our image with the front end (register set v11+, PCIe, 2 channels; this one: v%u, %u channel(s)%s): OAI demodulates\n",
             regset, s->hw_ch, s->args.host.empty() ? "" : ", Ethernet");
     else
+    {
       s->fd = new fd_cache; // once, at start-up
+      s->fd->mask_hw = regset >= 0x0c;
+      if (!s->fd->mask_hw)
+        LOG_W(HW, "ocsdr: register set v%u: the FPGA sends every symbol (the symbol mask needs v12)\n", regset);
+    }
   }
 
   device->priv                 = s;
