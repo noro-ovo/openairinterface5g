@@ -6,6 +6,7 @@
  * \brief Top-level routines for the reception of the PUSCH TS 38.211 v 15.4.0
  */
 
+#include <math.h>
 #include <stdint.h>
 #include "PHY/NR_TRANSPORT/nr_transport_common_proto.h"
 #include "PHY/NR_TRANSPORT/nr_transport_proto.h"
@@ -260,6 +261,20 @@ void dump_pusch_stats(FILE *fd, PHY_VARS_gNB *gNB)
               stats->ulsch_stats.current_RI,
               stats->ulsch_stats.total_bytes_rx,
               stats->ulsch_stats.total_bytes_tx);
+      // DMRS EVM over the slots since the last dump (single layer, DMRS type 1)
+      NR_gNB_SCH_STATS_t *us = &stats->ulsch_stats;
+      if (us->dmrs_evm_slots > 0 && us->dmrs_evm_ref > 0) {
+        const double evm2 = us->dmrs_evm_err / us->dmrs_evm_ref;
+        fprintf(fd,
+                "                 dmrs_evm %.2f %% (%.1f dB) over %d slots\n",
+                100 * sqrt(evm2),
+                10 * log10(evm2),
+                us->dmrs_evm_slots);
+      } else {
+        fprintf(fd, "                 dmrs_evm n/a\n");
+      }
+      us->dmrs_evm_err = us->dmrs_evm_ref = 0;
+      us->dmrs_evm_slots = 0;
     }
   }
 }
