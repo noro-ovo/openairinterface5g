@@ -882,6 +882,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
         sched_pdsch.R = nr_get_code_rate_dl(sched_pdsch.mcs, dl_bwp->mcsTableIdx);
         sched_pdsch.Qm = nr_get_Qm_dl(sched_pdsch.mcs, dl_bwp->mcsTableIdx);
       }
+      nr_dl_limit_code_rate(&sched_pdsch, dl_bwp->mcsTableIdx);
       /* The UE applies the new CellGroup when it has received the whole RRCReconfiguration, and acknowledges the
          PDSCH carrying its end with the current one: switch on the ACK of the PDSCH carrying the last SRB1 bytes,
          not of a first RLC segment (the gNB and the UE would use different PUCCH resources until the end arrives) */

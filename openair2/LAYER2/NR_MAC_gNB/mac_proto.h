@@ -414,6 +414,12 @@ int get_cce_index(const nr_cell_sched_t *cell,
                   NR_sched_pdcch_t *sched_pdcch,
                   float pdcch_cl_adjust);
 
+/// true if the effective code rate of an initial DL transmission of tbs bytes is at most 0.95 (38.214 5.1.3)
+bool nr_dl_code_rate_ok(uint32_t tbs, uint16_t R, uint8_t Qm, uint8_t nrOfLayers, uint16_t nb_rb, uint16_t nb_symb_sch, uint16_t nb_dmrs_prb);
+
+/// lowers the MCS of a new DL transmission on the same RBs until nr_dl_code_rate_ok(), updating R, Qm and tb_size
+void nr_dl_limit_code_rate(NR_sched_pdsch_t *pdsch, int mcs_table);
+
 bool nr_find_nb_rb(uint16_t Qm,
                    uint16_t R,
                    long transform_precoding,
