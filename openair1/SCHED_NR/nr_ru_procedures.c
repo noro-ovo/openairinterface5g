@@ -17,6 +17,9 @@
 #include "common/utils/system.h"
 
 #include "T.h"
+#include <math.h>
+#include <pthread.h>
+#include <stdlib.h>
 
 #include "assertions.h"
 
@@ -245,6 +248,89 @@ void nr_feptx_tp(RU_t *ru, int frame_tx, int slot)
   stop_meas(&ru->ofdm_total_stats);
 }
 
+// Test only (environment OAI_FD_CHECK=N): every N-th symbol taken from the device is also demodulated by OAI and by an
+// exact double-precision DFT of the same window; the errors against the exact DFT are logged every 200 checks.
+static void fd_check_fft(double *re, double *im, int n)
+{
+  for (int i = 1, j = 0; i < n; i++) {
+    int b = n >> 1;
+    for (; j & b; b >>= 1)
+      j ^= b;
+    j ^= b;
+    if (i < j) {
+      double t = re[i]; re[i] = re[j]; re[j] = t;
+      t = im[i]; im[i] = im[j]; im[j] = t;
+    }
+  }
+  for (int len = 2; len <= n; len <<= 1) {
+    const double a = -2 * M_PI / len;
+    for (int i = 0; i < n; i += len)
+      for (int k = 0; k < len / 2; k++) {
+        const double wr = cos(a * k), wi = sin(a * k);
+        const int p = i + k, q = p + len / 2;
+        const double xr = re[q] * wr - im[q] * wi, xi = re[q] * wi + im[q] * wr;
+        re[q] = re[p] - xr; im[q] = im[p] - xi;
+        re[p] += xr; im[p] += xi;
+      }
+  }
+}
+
+static void fd_check_symbol(const NR_DL_FRAME_PARMS *fp, const c16_t *rxdata, const c16_t *dev_bins, int l, int slot, int sample_offset)
+{
+  static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+  static double e_dev, e_oai, e_do, p_ref, worst_dev = -1000;
+  static int checks, dev_sat;
+  const int N = fp->ofdm_symbol_size, nbins = fp->N_RB_UL * NR_NB_SC_PER_RB;
+  if (N != 4096)
+    return;
+  c16_t oai[4096] __attribute__((aligned(32)));
+  nr_symbol_fep_ul_shifted(fp, rxdata, oai, l, slot, sample_offset);
+  // the window nr_symbol_fep_ul_shifted uses
+  const int prefix = get_samples_symbol_duration(fp, slot, l, 1) - N;
+  int64_t off = get_samples_slot_timestamp(fp, slot) + get_samples_symbol_timestamp(fp, slot, l) + prefix
+                - fp->nb_prefix_samples / fp->ofdm_offset_divisor - sample_offset;
+  if (off < 0)
+    off += fp->samples_per_frame;
+  double *re = malloc(2 * N * sizeof(double)), *im = re + N; // test only
+  for (int n = 0; n < N; n++) {
+    const c16_t x = rxdata[(off + n) % fp->samples_per_frame];
+    re[n] = x.r;
+    im[n] = x.i;
+  }
+  fd_check_fft(re, im, N);
+  double ed = 0, eo = 0, edo = 0, pr = 0;
+  int sat = 0;
+  for (int j = 0; j < nbins; j++) {
+    const int k = (N - nbins / 2 + j) % N;
+    const double rr = re[k] / 64, ri = im[k] / 64;
+    const double dr = dev_bins[j].r - rr, di = dev_bins[j].i - ri, orr = oai[j].r - rr, oi = oai[j].i - ri;
+    ed += dr * dr + di * di;
+    eo += orr * orr + oi * oi;
+    edo += (dev_bins[j].r - oai[j].r) * (dev_bins[j].r - oai[j].r) + (dev_bins[j].i - oai[j].i) * (dev_bins[j].i - oai[j].i);
+    pr += rr * rr + ri * ri;
+    sat += abs(dev_bins[j].r) >= 32767 || abs(dev_bins[j].i) >= 32767;
+  }
+  free(re);
+  pthread_mutex_lock(&mtx);
+  e_dev += ed;
+  e_oai += eo;
+  e_do += edo;
+  p_ref += pr;
+  dev_sat += sat;
+  if (pr > 0 && 10 * log10(ed / pr) > worst_dev)
+    worst_dev = 10 * log10(ed / pr);
+  if (++checks == 200) {
+    LOG_I(PHY,
+          "fd check: %d symbols, bin rms %.1f, vs exact DFT/64: device %.1f dB (worst symbol %.1f), OAI %.1f dB; device vs OAI %.1f dB; saturated device bins %d\n",
+          checks, sqrt(p_ref / (checks * (double)nbins)), 10 * log10(e_dev / p_ref), worst_dev, 10 * log10(e_oai / p_ref),
+          10 * log10(e_do / p_ref), dev_sat);
+    e_dev = e_oai = e_do = p_ref = 0;
+    worst_dev = -1000;
+    checks = dev_sat = 0;
+  }
+  pthread_mutex_unlock(&mtx);
+}
+
 // core RX FEP routine, called by threads in RU thread-pool
 void nr_fep(void *arg)
 {
@@ -264,8 +350,16 @@ void nr_fep(void *arg)
       const openair0_timestamp_t win_ts = feprx_cmd->slot_ts + get_samples_symbol_timestamp(fp, slot, l) + prefix
                                           - fp->nb_prefix_samples / fp->ofdm_offset_divisor - feprx_cmd->sample_offet;
       if (fd_dev->trx_get_rxdataF_func(fd_dev, win_ts, feprx_cmd->aid, &feprx_cmd->rxdataF[l * fp->ofdm_symbol_size], nbins)
-          == 0)
+          == 0) {
+        static int check_every = -1, check_n;
+        if (check_every < 0) {
+          const char *e = getenv("OAI_FD_CHECK");
+          check_every = e ? atoi(e) : 0;
+        }
+        if (check_every > 0 && __atomic_add_fetch(&check_n, 1, __ATOMIC_RELAXED) % check_every == 0)
+          fd_check_symbol(fp, feprx_cmd->rxdata, &feprx_cmd->rxdataF[l * fp->ofdm_symbol_size], l, slot, feprx_cmd->sample_offet);
         continue;
+      }
     }
     // OFDM Demod + FFT-shift
     nr_symbol_fep_ul_shifted(fp,
