@@ -706,6 +706,34 @@ bool update_rb_mcs_tbs(NR_sched_pdsch_t *pdsch, uint32_t num_total_bytes, uint16
   return true;
 }
 
+/* 38.214 5.1.3: the effective channel code rate of an initial transmission, the information bits with the TB CRC and
+ * the code block CRCs (38.212 7.2.1, 5.2.2) over the bits of the data REs, at most 0.95 */
+bool nr_dl_code_rate_ok(uint32_t tbs, uint16_t R, uint8_t Qm, uint8_t nrOfLayers, uint16_t nb_rb, uint16_t nb_symb_sch, uint16_t nb_dmrs_prb)
+{
+  const uint32_t A = tbs * 8;
+  const uint32_t B = A + (A > NR_MAX_PDSCH_TBS ? 24 : 16);
+  const uint32_t Kcb = get_BG(A, R) == 1 ? 8448 : 3840;
+  const uint32_t C = B <= Kcb ? 1 : (B + Kcb - 24 - 1) / (Kcb - 24);
+  const uint64_t info_bits = B + (C > 1 ? 24 * C : 0);
+  const uint64_t phy_bits = (uint64_t)nb_rb * (NR_NB_SC_PER_RB * nb_symb_sch - nb_dmrs_prb) * Qm * nrOfLayers;
+  return phy_bits > 0 && 20 * info_bits <= 19 * phy_bits;
+}
+
+/* the UE may skip an initial transmission above an effective code rate of 0.95 (38.214 5.1.3): lowers the MCS of a new
+ * DL transmission on the same RBs until the rate is met, and sets R, Qm and tb_size for it */
+void nr_dl_limit_code_rate(NR_sched_pdsch_t *pdsch, int mcs_table)
+{
+  const int nb_symb = pdsch->tda_info.nrOfSymbols;
+  const int nb_dmrs_prb = pdsch->dmrs_parms.N_PRB_DMRS * pdsch->dmrs_parms.N_DMRS_SLOT;
+  while (pdsch->mcs > 0
+         && !nr_dl_code_rate_ok(pdsch->tb_size, pdsch->R, pdsch->Qm, pdsch->nrOfLayers, pdsch->rbSize, nb_symb, nb_dmrs_prb)) {
+    pdsch->mcs--;
+    pdsch->R = nr_get_code_rate_dl(pdsch->mcs, mcs_table);
+    pdsch->Qm = nr_get_Qm_dl(pdsch->mcs, mcs_table);
+    pdsch->tb_size = nr_compute_tbs(pdsch->Qm, pdsch->R, pdsch->rbSize, nb_symb, nb_dmrs_prb, 0, 0, pdsch->nrOfLayers) >> 3;
+  }
+}
+
 bool nr_find_nb_rb(uint16_t Qm,
                    uint16_t R,
                    long transform_precoding,
