@@ -879,6 +879,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
         sched_pdsch.R = nr_get_code_rate_dl(sched_pdsch.mcs, dl_bwp->mcsTableIdx);
         sched_pdsch.Qm = nr_get_Qm_dl(sched_pdsch.mcs, dl_bwp->mcsTableIdx);
       }
+      nr_dl_limit_code_rate(&sched_pdsch, dl_bwp->mcsTableIdx);
       // Map antenna ports for this UE
       const nr_pdsch_AntennaPorts_t *p = &cell->radio_config.pdsch_AntennaPorts;
       const uint16_t num_log_ports = p->XP * p->N1 * p->N2;
