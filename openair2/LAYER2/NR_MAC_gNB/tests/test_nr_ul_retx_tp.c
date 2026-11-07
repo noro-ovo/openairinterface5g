@@ -2,9 +2,10 @@
  * SPDX-License-Identifier: LicenseRef-CSSL-1.0
  */
 
-/* With transform precoding, a PUSCH spans 2^a 3^b 5^c RBs (38.211 6.3.1.4). A retransmission moved to another TDA
- * keeps its TBS with a refitted RB count (check_ul_retx_feasibility()): that count must also be a valid transform
- * precoding size, or the gNB and the UE have no low-PAPR DMRS sequence for it. */
+/* A retransmission keeps the TBS of the first transmission (38.214 6.1.4.2). When the scheduler moves it to another
+ * TDA, check_ul_retx_feasibility() refits the RB count; with transform precoding a PUSCH spans 2^a 3^b 5^c RBs
+ * (38.211 6.3.1.4), so apply_ul_retransmission() rounds that count down to such a size and computes the TBS again. The
+ * TBS sent must still be the TBS of the first transmission. */
 
 #include <signal.h>
 #include <stdio.h>
@@ -20,7 +21,7 @@ void prepare_scc(NR_ServingCellConfigCommon_t *scc);
 void fill_scc_sim(NR_ServingCellConfigCommon_t *scc, uint64_t *ssb_bitmap, int N_RB_DL, int N_RB_UL, int mu_dl, int mu_ul);
 void fix_scc(NR_ServingCellConfigCommon_t *scc, uint64_t ssbmap);
 
-// number of refitted RB counts that are not a transform precoding size; *feasible: retx accepted on the new TDA
+// number of retransmissions accepted on another TDA that would be sent with another TBS; *feasible: accepted ones
 int test_ul_retx_tp(int *feasible)
 {
   NR_ServingCellConfigCommon_t *scc = calloc_or_fail(1, sizeof(*scc));
@@ -31,7 +32,8 @@ int test_ul_retx_tp(int *feasible)
 
   NR_UE_info_t *UE = calloc_or_fail(1, sizeof(*UE));
   UE->rnti = 0x1234;
-  UE->current_UL_BWP.transform_precoding = NR_PUSCH_Config__transformPrecoder_enabled;
+  const long tp = NR_PUSCH_Config__transformPrecoder_enabled;
+  UE->current_UL_BWP.transform_precoding = tp;
   const int bwp_size = 106, mcs_table = 3, pid = 0; // mcs_table 3: transform precoding 64QAM (38.214 6.1.4.1-1)
   NR_sched_pusch_t *ret = &UE->UE_sched_ctrl.ul_harq_processes[pid].sched_pusch;
   const nr_ul_candidate_t cand = {.UE = UE, .rnti = UE->rnti, .is_retx = true, .retx_harq_pid = pid};
@@ -44,9 +46,10 @@ int test_ul_retx_tp(int *feasible)
         continue;
       const NR_tda_info_t old_tda = {.mapping_type = typeB, .startSymbolIndex = 14 - old_sym, .nrOfSymbols = old_sym, .valid_tda = true};
       const NR_tda_info_t new_tda = {.mapping_type = typeB, .startSymbolIndex = 14 - new_sym, .nrOfSymbols = new_sym, .valid_tda = true};
+      const NR_pusch_dmrs_t new_dmrs = get_ul_dmrs_params(scc, &UE->current_UL_BWP, &new_tda, 1, 0, 0);
       for (int mcs = 0; mcs <= 27; mcs++) {
         for (int rb = 1; rb <= bwp_size; rb++) {
-          if (check_sc_fdma_rbsize(NR_PUSCH_Config__transformPrecoder_enabled, rb) != rb)
+          if (check_sc_fdma_rbsize(tp, rb) != rb)
             continue; // the first transmission has a transform precoding size
           *ret = (NR_sched_pusch_t){.rbSize = rb, .mcs = mcs, .Qm = nr_get_Qm_ul(mcs, mcs_table), .R = nr_get_code_rate_ul(mcs, mcs_table),
                                     .nrOfLayers = 1, .time_domain_allocation = 0, .tda_info = old_tda};
@@ -57,16 +60,21 @@ int test_ul_retx_tp(int *feasible)
           if (new_rb == 0)
             continue;
           (*feasible)++;
-          if (check_sc_fdma_rbsize(NR_PUSCH_Config__transformPrecoder_enabled, new_rb) != new_rb) {
+          // RB count and TBS as apply_ul_retransmission() sends them
+          const uint16_t sent_rb = check_sc_fdma_rbsize(tp, new_rb);
+          const uint32_t sent_tbs =
+              nr_compute_tbs(ret->Qm, ret->R, sent_rb, new_sym, new_dmrs.N_PRB_DMRS * new_dmrs.num_dmrs_symb, 0, 0, 1) >> 3;
+          if (sent_tbs != ret->tb_size) {
             if (bad < 5)
-              printf("retx mcs %d %d RBs %d symbols -> %d symbols: %d RBs, not a transform precoding size\n", mcs, rb, old_sym, new_sym, new_rb);
+              printf("retx mcs %d %d RBs %d -> %d symbols: refit %d RBs, sent %d RBs with TBS %u instead of %u\n",
+                     mcs, rb, old_sym, new_sym, new_rb, sent_rb, sent_tbs, ret->tb_size);
             bad++;
           }
         }
       }
     }
   }
-  printf("%d retransmissions accepted on another TDA, %d with an RB count that is not a transform precoding size\n", *feasible, bad);
+  printf("%d retransmissions accepted on another TDA, %d sent with another TBS\n", *feasible, bad);
   free(UE);
   return bad;
 }

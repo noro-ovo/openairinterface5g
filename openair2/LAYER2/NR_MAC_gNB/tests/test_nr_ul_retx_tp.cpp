@@ -4,10 +4,10 @@
 
 #include "gtest/gtest.h"
 
-// returns the number of refitted RB counts that are not a transform precoding size
+// returns the number of retransmissions on another TDA that would be sent with another TBS
 extern "C" int test_ul_retx_tp(int *feasible);
 
-TEST(UlRetxTransformPrecoding, RefittedRbSizeIsValid)
+TEST(UlRetxTransformPrecoding, RetxKeepsTbs)
 {
   int feasible = 0;
   EXPECT_EQ(test_ul_retx_tp(&feasible), 0);
