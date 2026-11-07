@@ -489,6 +489,9 @@ static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
 
   NR_DL_FRAME_PARMS *frame_parms = &ue->frame_parms;
   uint32_t nvar = 0;
+  // DMRS EVM, single layer only (several layers share the DMRS REs of a CDM group)
+  double evm_err = 0, evm_ref = 0;
+  const bool evm_on = dlsch->cw_info.Nl == 1;
 
   start_meas_nr_ue_phy(ue, DLSCH_CHANNEL_ESTIMATION_STATS);
   for (int m = dlschCfg->start_symbol; m < (dlschCfg->start_symbol + dlschCfg->number_symbols); m++) {
@@ -507,12 +510,19 @@ static int nr_ue_pdsch_procedures(PHY_VARS_NR_UE *ue,
                                     pdsch_dl_ch_estimates,
                                     frame_parms->samples_per_slot_wCP,
                                     rxdataF,
-                                    &nvar_tmp);
+                                    &nvar_tmp,
+                                    evm_on ? &evm_err : NULL,
+                                    evm_on ? &evm_ref : NULL);
         nvar += nvar_tmp;
       }
     }
   }
   stop_meas_nr_ue_phy(ue, DLSCH_CHANNEL_ESTIMATION_STATS);
+  if (evm_ref > 0) {
+    __atomic_add_fetch(&ue->pdsch_dmrs_evm_err, (uint64_t)llround(evm_err), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&ue->pdsch_dmrs_evm_ref, (uint64_t)llround(evm_ref), __ATOMIC_RELAXED);
+    __atomic_add_fetch(&ue->pdsch_dmrs_evm_slots, 1, __ATOMIC_RELAXED);
+  }
   nvar /= (count_bits(&dmrs_symb_bitmap, 1) * dlsch->cw_info.Nl * frame_parms->nb_antennas_rx);
   int first_dmrs_symbol = get_first_bit_index_mask(&dmrs_symb_bitmap, 1, 0, NR_SYMBOLS_PER_SLOT);
   // estimates of the first DMRS symbol
