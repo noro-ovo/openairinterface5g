@@ -254,7 +254,19 @@ void nr_fep(void *arg)
   int endSymbol = feprx_cmd->endSymbol;
 
   const NR_DL_FRAME_PARMS *fp = feprx_cmd->fp;
+  openair0_device_t *fd_dev = feprx_cmd->fd_dev;
+  const int nbins = fp->N_RB_UL * NR_NB_SC_PER_RB;
   for (int l = startSymbol; l <= endSymbol; l++) {
+    if (fd_dev) {
+      // the device demodulated the symbol: same FFT window as nr_symbol_fep_ul_shifted (end of the cyclic prefix,
+      // advanced by nb_prefix_samples / ofdm_offset_divisor and by the timing advance offset)
+      const int prefix = get_samples_symbol_duration(fp, slot, l, 1) - fp->ofdm_symbol_size;
+      const openair0_timestamp_t win_ts = feprx_cmd->slot_ts + get_samples_symbol_timestamp(fp, slot, l) + prefix
+                                          - fp->nb_prefix_samples / fp->ofdm_offset_divisor - feprx_cmd->sample_offet;
+      if (fd_dev->trx_get_rxdataF_func(fd_dev, win_ts, feprx_cmd->aid, &feprx_cmd->rxdataF[l * fp->ofdm_symbol_size], nbins)
+          == 0)
+        continue;
+    }
     // OFDM Demod + FFT-shift
     nr_symbol_fep_ul_shifted(fp,
                              feprx_cmd->rxdata,
@@ -300,6 +312,9 @@ void nr_fep_tp(RU_t *ru, int slot)
       feprx_cmd->rxdata = (const c16_t *)ru->common.rxdata[aid];
       feprx_cmd->rxdataF = (c16_t *)&ru->common.rxdataF[aid][rxdataF_offset];
       feprx_cmd->sample_offet = ru->N_TA_offset;
+      feprx_cmd->aid = aid;
+      feprx_cmd->fd_dev = ru->rfdevice.trx_get_rxdataF_func ? &ru->rfdevice : NULL;
+      feprx_cmd->slot_ts = ru->ts_offset + ru->proc.timestamp_rx;
 
       task_t t = {.func = nr_fep, .args = feprx_cmd};
       pushTpool(ru->threadPool, t);

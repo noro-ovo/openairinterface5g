@@ -58,6 +58,20 @@ int main()
               }
             }
           }
+  // front end: one channel out of interleaved frequency-domain words
+  for (unsigned ch = 0; ch < 2; ch++)
+    for (unsigned n = 0; n <= 70; n++)
+      for (unsigned mis = 0; mis < 4; mis++) {
+        std::vector<uint32_t> w(2 * n + 8), a(n + 8, 3), b(n + 8, 3);
+        for (auto &v : w) v = (uint32_t)rnd();
+        ocsdr_fd_extract_ref(a.data() + mis, w.data() + mis, ch, n);
+        ocsdr_fd_extract(b.data() + mis, w.data() + mis, ch, n);
+        cases++;
+        if (a != b) {
+          bad++;
+          if (bad < 5) printf("FD extract mismatch ch %u n %u mis %u\n", ch, n, mis);
+        }
+      }
   // the scalar reference against the expression the driver used before (clamp of x << sh to +-INT16_MAX)
   for (int x = -32768; x <= 32767; x++)
     for (unsigned sh = 0; sh <= 15; sh++) {
