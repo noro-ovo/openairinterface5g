@@ -55,7 +55,31 @@ typedef struct puschAntennaProc_s {
   scopeData_t *scope;
   c16_t *pusch_ch_est_dmrs_pos_slot_mem;
   int dmrs_symbol_start_idx;
+  double *evm_err; // DMRS EVM sums of this job: |rx - h x|^2 and |h x|^2
+  double *evm_ref;
 } puschAntennaProc_t;
+
+/* DMRS EVM terms of one DMRS symbol of one rx antenna, single layer, DMRS type 1: pilot n is at RE 2 n + delta of the
+ * allocation, rx = h x + noise. The estimator computes ch = pil rx >> 15 with pil = s conj(x) (the conjugated, scaled
+ * pilot), so the received pilot rebuilt from the final channel estimate is ch conj(pil) 2^15 / |pil|^2, whatever the
+ * frequency interpolation and the DMRS scaling. Adds sum |rx - rebuilt|^2 to *err and sum |rebuilt|^2 to *ref. */
+static void pusch_dmrs_evm(const c16_t *rx, const c16_t *pil, const c16_t *ch, int npil, int delta, double *err, double *ref)
+{
+  double e = 0, r = 0;
+  for (int n = 0; n < npil; n++) {
+    const double pr = pil[n].r, pi = pil[n].i, p2 = pr * pr + pi * pi;
+    if (p2 == 0)
+      continue;
+    const c16_t h = ch[2 * n + delta], y = rx[2 * n + delta];
+    const double g = 32768.0 / p2;
+    const double yr = (h.r * pr + h.i * pi) * g, yi = (h.i * pr - h.r * pi) * g; // h conj(pil) 2^15 / |pil|^2
+    const double dr = y.r - yr, di = y.i - yi;
+    e += dr * dr + di * di;
+    r += yr * yr + yi * yi;
+  }
+  *err += e;
+  *ref += r;
+}
 
 __attribute__((always_inline)) inline c16_t c32x16cumulVectVectWithSteps(c16_t *in1,
                                                                          int *offset1,
@@ -1106,6 +1130,14 @@ static void nr_pusch_antenna_processing(void *arg)
       printf("%d\n", idxP);
     }
 #endif
+    if (rdata->evm_err && pusch_pdu->dmrs_config_type == pusch_dmrs_type1 && pusch_pdu->nrOfLayers == 1)
+      pusch_dmrs_evm(&rxdataF[k0],
+                     pilot,
+                     ul_ch_estimates[nl * num_sp_streams + antenna] + rdata->ch_row_offset,
+                     6 * nb_rb_pusch,
+                     delta,
+                     rdata->evm_err,
+                     rdata->evm_ref);
     // update the values inside the arrays
     *(rdata->noise_amp2) = noise_amp2;
     *(rdata->nest_count) = nest_count;
@@ -1215,8 +1247,10 @@ int nr_pusch_channel_estimation(PHY_VARS_gNB *gNB,
   uint64_t noise_amp2_arr[nb_antennas_rx];
   int max_ch_arr[nb_antennas_rx];
   int nest_count_arr[nb_antennas_rx];
+  double evm_err_arr[nb_antennas_rx], evm_ref_arr[nb_antennas_rx];
 
   for (int i = 0; i < nb_antennas_rx; ++i) {
+    evm_err_arr[i] = evm_ref_arr[i] = 0;
     max_ch_arr[i] = *max_ch;
     nest_count_arr[i] = nest_count;
     noise_amp2_arr[i] = noise_amp2;
@@ -1261,6 +1295,8 @@ int nr_pusch_channel_estimation(PHY_VARS_gNB *gNB,
     rdata->ans = &ans;
     rdata->pusch_ch_est_dmrs_pos_slot_mem = pusch_ch_est_dmrs_pos_slot_mem;
     rdata->dmrs_symbol_start_idx = dmrs_symbol_start_idx;
+    rdata->evm_err = &evm_err_arr[rdata->aarx];
+    rdata->evm_ref = &evm_ref_arr[rdata->aarx];
     // Call the nr_pusch_antenna_processing function
     if (job_id == num_jobs - 1) {
       // Run the last job inline
@@ -1277,6 +1313,8 @@ int nr_pusch_channel_estimation(PHY_VARS_gNB *gNB,
     *max_ch = max(*max_ch, max_ch_arr[aarx]);
     noise_amp2 += noise_amp2_arr[aarx];
     nest_count += nest_count_arr[aarx];
+    pusch_vars->dmrs_evm_err += evm_err_arr[aarx];
+    pusch_vars->dmrs_evm_ref += evm_ref_arr[aarx];
   }
   // get the maximum delay
   for (int aarx = 0; aarx < nb_antennas_rx; aarx++) {

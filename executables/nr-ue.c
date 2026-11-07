@@ -109,6 +109,21 @@ static size_t dump_L1_UE_meas_stats(PHY_VARS_NR_UE *ue, char *output, size_t max
                              output,
                              end - output);
   }
+  // PDSCH DMRS EVM over the last period (single layer, DMRS type 1)
+  const uint64_t err = __atomic_exchange_n(&ue->pdsch_dmrs_evm_err, 0, __ATOMIC_RELAXED);
+  const uint64_t ref = __atomic_exchange_n(&ue->pdsch_dmrs_evm_ref, 0, __ATOMIC_RELAXED);
+  const uint32_t slots = __atomic_exchange_n(&ue->pdsch_dmrs_evm_slots, 0, __ATOMIC_RELAXED);
+  if (ref > 0 && end > output) {
+    const double evm2 = (double)err / (double)ref;
+    output += snprintf(output,
+                       end - output,
+                       "PDSCH DMRS EVM %.2f %% (%.1f dB) over %u slots\n",
+                       100 * sqrt(evm2),
+                       10 * log10(evm2),
+                       slots);
+  } else if (end > output) {
+    output += snprintf(output, end - output, "PDSCH DMRS EVM n/a\n");
+  }
   return output - begin;
 }
 

@@ -1077,6 +1077,7 @@ int nr_rx_pusch_group_tp(PHY_VARS_gNB *gNB,
   start_meas(&gNB->ulsch_channel_estimation_stats);
   int max_ch = 0;
   uint32_t nvar = 0;
+  joint_pv->dmrs_evm_err = joint_pv->dmrs_evm_ref = 0;
   int end_symbol = rel15_ul_ref->start_symbol_index + rel15_ul_ref->nr_of_symbols;
   uint8_t dmrs_symb_idx = 0;
   for (uint8_t symbol = rel15_ul_ref->start_symbol_index; symbol < end_symbol; symbol++) {
@@ -1468,6 +1469,9 @@ int nr_rx_pusch_group_tp(PHY_VARS_gNB *gNB,
       pv->ulsch_power_tot += pv->ulsch_power[aarx];
       pv->ulsch_noise_power_tot += pv->ulsch_noise_power[aarx];
     }
+    // DMRS EVM: only measured for a single UE with a single layer
+    pv->dmrs_evm_err = group_size == 1 ? joint_pv->dmrs_evm_err : 0;
+    pv->dmrs_evm_ref = group_size == 1 ? joint_pv->dmrs_evm_ref : 0;
   }
   stop_meas(&gNB->rx_pusch_symbol_processing_stats);
 
