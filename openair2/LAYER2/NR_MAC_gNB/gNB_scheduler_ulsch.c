@@ -216,7 +216,7 @@ static int estimate_ul_buffer_short_bsr(const NR_BSR_SHORT *bsr)
   return estim_size;
 }
 
-static int estimate_ul_buffer_long_bsr(const NR_BSR_LONG *bsr)
+int nr_estimate_ul_buffer_long_bsr(const NR_BSR_LONG *bsr)
 {
   LOG_D(NR_MAC,
         "LONG BSR, LCG ID(7-0) %d/%d/%d/%d/%d/%d/%d/%d\n",
@@ -231,7 +231,8 @@ static int estimate_ul_buffer_long_bsr(const NR_BSR_LONG *bsr)
   bool bsr_active[8] = {bsr->LcgID0 != 0, bsr->LcgID1 != 0, bsr->LcgID2 != 0, bsr->LcgID3 != 0, bsr->LcgID4 != 0, bsr->LcgID5 != 0, bsr->LcgID6 != 0, bsr->LcgID7 != 0};
 
   int estim_size = 0;
-  int max = NR_LONG_BSR_TABLE_SIZE - 1;
+  /* index 254 (BS > 81338368) is the last index of 38.321 Table 6.1.3.1-2, index 255 is reserved */
+  int max = NR_LONG_BSR_TABLE_SIZE - 2;
   uint8_t *payload = ((uint8_t*) bsr) + 1;
   int m = 0;
   const int total_lcgids = 8; /* see 38.321 6.1.3.1 */
@@ -606,7 +607,7 @@ static int nr_process_mac_pdu(gNB_MAC_INST *nrmac,
       case UL_SCH_LCID_L_BSR:
         /* Extract long BSR value */
         ce_ptr = &pduP[mac_subheader_len];
-        sched_ctrl->estimated_ul_buffer = estimate_ul_buffer_long_bsr((NR_BSR_LONG *)ce_ptr);
+        sched_ctrl->estimated_ul_buffer = nr_estimate_ul_buffer_long_bsr((NR_BSR_LONG *)ce_ptr);
         sched_ctrl->sched_ul_bytes = 0;
         LOG_D(NR_MAC, "LONG BSR at %4d.%2d, estim buf %d\n", frameP, slot, sched_ctrl->estimated_ul_buffer);
         break;
