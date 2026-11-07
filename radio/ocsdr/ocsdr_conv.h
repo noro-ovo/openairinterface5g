@@ -108,4 +108,27 @@ static inline void ocsdr_rx_unpack(uint32_t *const *out, unsigned nout, const ui
   ocsdr_rx_unpack_ref(out, nout, w, hw, n);
 }
 
+/* Front end: n bins of channel ch (0 or 1) from frequency-domain block words w (2 channels interleaved per bin). */
+static inline void ocsdr_fd_extract_ref(uint32_t *dst, const uint32_t *w, unsigned ch, unsigned n)
+{
+  for (unsigned k = 0; k < n; k++)
+    dst[k] = w[2 * k + ch];
+}
+
+static inline void ocsdr_fd_extract(uint32_t *dst, const uint32_t *w, unsigned ch, unsigned n)
+{
+#if defined(__AVX2__)
+  const __m256i idx = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+  unsigned k = 0;
+  for (; k + 8 <= n; k += 8) {
+    __m256i p0 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(w + 2 * k)), idx);     // 4 bins: c0 | c1
+    __m256i p1 = _mm256_permutevar8x32_epi32(_mm256_loadu_si256((const __m256i *)(w + 2 * k + 8)), idx); // next 4 bins
+    _mm256_storeu_si256((__m256i *)(dst + k), ch ? _mm256_permute2x128_si256(p0, p1, 0x31) : _mm256_permute2x128_si256(p0, p1, 0x20));
+  }
+  ocsdr_fd_extract_ref(dst + k, w + 2 * k, ch, n - k);
+#else
+  ocsdr_fd_extract_ref(dst, w, ch, n);
+#endif
+}
+
 #endif
