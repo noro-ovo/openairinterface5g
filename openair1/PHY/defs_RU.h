@@ -144,6 +144,9 @@ typedef struct {
  const NR_DL_FRAME_PARMS *fp;
  int32_t sample_offet;
  task_ans_t *ans;
+ int aid;
+ openair0_device_t *fd_dev;          // device delivering frequency-domain symbols, NULL: demodulate here
+ openair0_timestamp_t slot_ts;       // device timestamp of the slot start (for fd_dev)
 } feprx_cmd_t;
 
 typedef struct {
