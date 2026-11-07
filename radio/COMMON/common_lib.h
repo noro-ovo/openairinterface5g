@@ -566,6 +566,19 @@ struct openair0_device {
   /* \brief timing statistics for TX fronthaul (ethernet)
    */
   re_order_t reOrder;
+  /*! \brief Frequency-domain RX symbol computed by the device (OFDM demodulation in the radio, e.g. the OC1 FPGA)
+   *
+   * Copies the OFDM symbol whose FFT window starts at device sample time win_ts, antenna aid, into dst in the layout
+   * of nr_symbol_fep_ul_shifted(): nbins complex int16 bins, the negative frequencies first. Optional (NULL: the
+   * device has no such feature).
+   * \param device the hardware to use
+   * \param win_ts device timestamp of the first sample of the FFT window
+   * \param aid receive antenna
+   * \param dst destination, nbins c16_t
+   * \param nbins bins to copy (N_RB_UL * 12)
+   * \return 0 when the device had that symbol, -1 otherwise (the caller then demodulates the samples itself)
+   */
+  int (*trx_get_rxdataF_func)(openair0_device_t *device, openair0_timestamp_t win_ts, int aid, void *dst, int nbins);
 };
 
 typedef struct {
