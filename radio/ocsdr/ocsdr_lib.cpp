@@ -35,6 +35,9 @@
  *                 30 kHz (4096-point FFT)
  *   fd_nta=N      OAI N_TA_offset in samples (default 1600), fd_adv=N  OAI nb_prefix_samples / ofdm_offset_divisor
  *                 (default 36 = 288 / 8)
+ *   fd_tx=1       front end TX: OFDM modulation in the FPGA (register set v13). OAI hands the frequency-domain slot
+ *                 (trx_write_fd_func) instead of samples; fd_tx_scale=N inverse FFT schedule (default 0x055 = 1/16,
+ *                 OAI's idft scaling followed by tx_shift 2)
  *   fd_wait_us=N  when OAI asks for a symbol that is due from the FPGA within N us, wait for it instead of letting
  *                 OAI demodulate it (default 0: never wait; the last symbols of a slot come ~30-60 us after the slot)
  *   rx_sleep_us=N when the next RX block is not there yet, sleep until N us before the samples the read still needs
@@ -94,6 +97,8 @@ struct ocsdr_args {
   unsigned    fd_nta       = 1600;  // OAI N_TA_offset in samples (FR1 25600 Tc at 122.88 MS/s)
   unsigned    fd_adv       = 36;    // OAI nb_prefix_samples / ofdm_offset_divisor (288 / 8)
   unsigned    fd_wait_us   = 0;     // wait for a symbol due within this time instead of letting OAI demodulate it
+  bool        fd_tx        = false; // front end TX: OFDM modulation in the FPGA (register set v13)
+  unsigned    fd_tx_scale  = 0x055; // inverse FFT scaling schedule (1/16: OAI's idft 1/64 then << 2)
 };
 struct fd_cache;
 
@@ -114,6 +119,8 @@ struct ocsdr_state {
   uint64_t       rx_sleeps   = 0;
   double         rx_slept_us = 0;
   fd_cache      *fd = nullptr;  // front end symbols (fd=1)
+  bool           fdtx = false;  // front end TX on (fd_tx=1 on a v13+ image)
+  uint32_t       fdtx_late = 0, fdtx_err = 0;
 
   // transmit
   int16_t *tx_block     = nullptr;
@@ -186,6 +193,10 @@ static bool parse_args(const char *s, ocsdr_args &out)
       out.fd_adv = (unsigned)v;
     else if (key == "fd_wait_us" && v >= 0 && v <= 500)
       out.fd_wait_us = (unsigned)v;
+    else if (key == "fd_tx")
+      out.fd_tx = v != 0;
+    else if (key == "fd_tx_scale" && v >= 0 && v <= 0xfff)
+      out.fd_tx_scale = (unsigned)v;
     else if (key == "tx_lead_stats")
       out.tx_lead_stats = v != 0;
     else if (key == "tx_flush_us" && v >= 0 && v <= 10000)
@@ -222,7 +233,7 @@ static bool parse_args(const char *s, ocsdr_args &out)
       LOG_E(HW,
             "ocsdr: unknown or out-of-range sdr_addrs item '%s' (keys: board, host, tx_shift, ring, skip_init, frontend, "
             "rx_atten, rx1_atten, tx_atten, rx_gain, rx2_gain, tx_advance, tx_gate, tx_gate_lead, tx_gate_lag, "
-            "tx_gate_mode, tx_flush_us, tx_lead_stats, rx_only, rx_sleep_us, fd, fd_nta, fd_adv, fd_wait_us)\n",
+            "tx_gate_mode, tx_flush_us, tx_lead_stats, rx_only, rx_sleep_us, fd, fd_nta, fd_adv, fd_wait_us, fd_tx, fd_tx_scale)\n",
             item.c_str());
       return false;
     }
@@ -712,6 +723,47 @@ static int ocsdr_write(openair0_device_t *device, openair0_timestamp_t timestamp
   return nsamps;
 }
 
+// front end TX: the symbols of a slot from OAI's txdataF, two blocks per symbol (bins 0..1637 = txdataF[1638..3275],
+// bins 2458..4095 = txdataF[0..1637]), both antennas interleaved, header = start of the symbol's cyclic prefix
+static int ocsdr_write_fd(openair0_device_t *device, openair0_timestamp_t timestamp, void **txdataF, int first_symbol,
+                          int num_symbols, int nb_ant, int flags)
+{
+  ocsdr_state *s = (ocsdr_state *)device->priv;
+  if (!s->running.load(std::memory_order_relaxed) || s->args.rx_only)
+    return num_symbols;
+  const uint64_t slot_ts = timestamp - device->openair0_cfg->command_line_sample_advance - device->openair0_cfg->tx_sample_advance;
+  const unsigned nch = std::min((unsigned)nb_ant, s->hw_ch);
+  std::lock_guard<std::mutex> lock(s->tx_mtx);
+  for (int l = first_symbol; l < first_symbol + num_symbols; l++) {
+    // numerology 1 at 122.88 MS/s: symbol 0 4448 samples (CP 352), the others 4384 (CP 288)
+    const uint64_t ts = slot_ts + (l == 0 ? 0 : 4448 + (uint64_t)(l - 1) * 4384);
+    const int16_t *sym = nullptr;
+    for (int half = 0; half < 2; half++) {
+      int16_t *blk;
+      if (ocsdr_stream_tx_acquire(s->stream, &blk, RING_TIMEOUT_US) != 0) {
+        LOG_W(HW, "ocsdr: TX ring full for %d ms, front end symbols dropped\n", RING_TIMEOUT_US / 1000);
+        return num_symbols;
+      }
+      const int16_t *in[MAX_CHANNELS] = {};
+      for (unsigned c = 0; c < nch; c++) {
+        sym = (const int16_t *)txdataF[c] + 2 * 4096 * (l - first_symbol);
+        in[c] = sym + 2 * (half == 0 ? OCSDR_RX_FD_BINS : 0);
+      }
+      ocsdr_tx_pack(blk, in, nch, s->hw_ch, OCSDR_RX_FD_BINS, 0);
+      ocsdr_stream_tx_commit(s->stream, ts, OCSDR_TX_FD | (half ? OCSDR_TX_FD_HALF_B : 0) | OCSDR_TX_FD_SYMBOL(l));
+    }
+  }
+  (void)flags;
+  if ((++s->tx_since_chk & 255) == 0) {
+    const uint32_t late = ocsdr_rd32(s->dev, OCSDR_ST_FDTX_LATE), err = ocsdr_rd32(s->dev, OCSDR_ST_FDTX_ERR);
+    if (late != s->fdtx_late || err != s->fdtx_err)
+      LOG_W(HW, "ocsdr: front end TX: %u symbol(s) late, %u half mismatch(es)\n", late - s->fdtx_late, err - s->fdtx_err);
+    s->fdtx_late = late;
+    s->fdtx_err  = err;
+  }
+  return num_symbols;
+}
+
 // ---- control ----
 
 static int set_gains(ocsdr_state *s, unsigned nch)
@@ -780,6 +832,13 @@ static int ocsdr_start(openair0_device_t *device)
     LOG_I(HW, "ocsdr: front end on: FPGA OFDM demodulation from sample %lu (advance %u, N_TA_offset %u)\n", start,
           s->args.fd_adv, s->args.fd_nta);
   }
+  if (s->fdtx) {
+    ocsdr_wr32(s->dev, OCSDR_ST_FDTX_SCALE, s->args.fd_tx_scale);
+    ocsdr_wr32(s->dev, OCSDR_ST_FDTX_CTRL, 1);
+    s->fdtx_late = ocsdr_rd32(s->dev, OCSDR_ST_FDTX_LATE);
+    s->fdtx_err  = ocsdr_rd32(s->dev, OCSDR_ST_FDTX_ERR);
+    LOG_I(HW, "ocsdr: front end TX on: FPGA OFDM modulation, schedule 0x%03x\n", s->args.fd_tx_scale);
+  }
   if (s->args.tx_flush_us) {
     s->tx_sent_until = 0;
     s->tx_flusher = std::thread(tx_flusher_loop, s);
@@ -799,6 +858,11 @@ static int ocsdr_stop(openair0_device_t *device)
   tx_flush(s, true);
   if (s->fd)
     ocsdr_wr32(s->dev, OCSDR_ST_FD_CTRL, 0);
+  if (s->fdtx) {
+    LOG_I(HW, "ocsdr: front end TX: %u symbols played, %u late, %u inverse FFT overflow(s)\n",
+          ocsdr_rd32(s->dev, OCSDR_ST_FDTX_PLAYED), ocsdr_rd32(s->dev, OCSDR_ST_FDTX_LATE), ocsdr_rd32(s->dev, OCSDR_ST_FDTX_OVF));
+    ocsdr_wr32(s->dev, OCSDR_ST_FDTX_CTRL, 0);
+  }
   ocsdr_stream_tx_stop(s->stream);
   ocsdr_stream_rx_stop(s->stream);
   tx_check_counters(s);
@@ -967,6 +1031,13 @@ extern "C" int device_init(openair0_device_t *device, openair0_config_t *openair
   openair0_cfg[0].rx_bw             = 100e6;
   LOG_I(HW, "ocsdr: %uT%uR on a %u-channel image, %u samples per block, TX advance %d samples, TX << %u\n",
         nch, nch, s->hw_ch, s->bs, s->args.tx_advance, s->args.tx_shift);
+  if (s->args.fd_tx) {
+    const uint32_t regset = ocsdr_rd32(s->dev, 0x3000) & 0xff;
+    if (!s->args.host.empty() || s->hw_ch != 2 || regset < 0x0d)
+      LOG_E(HW, "ocsdr: fd_tx=1 needs our image with the front end TX (register set v13+, PCIe, 2 channels; this one: v%u): OAI modulates\n", regset);
+    else
+      s->fdtx = true;
+  }
   if (s->args.fd) {
     const uint32_t regset = ocsdr_rd32(s->dev, 0x3000) & 0xff; // OCSDR_OWN_ID: 0x0C1F00vv
     if (!s->args.host.empty() || s->hw_ch != 2 || regset < 0x0b)
@@ -995,5 +1066,6 @@ extern "C" int device_init(openair0_device_t *device, openair0_config_t *openair
   device->trx_set_freq_func    = ocsdr_set_freq;
   device->trx_set_gains_func   = ocsdr_set_gains;
   device->trx_get_rxdataF_func = s->fd ? ocsdr_get_rxdataF : nullptr;
+  device->trx_write_fd_func    = s->fdtx ? ocsdr_write_fd : nullptr;
   return 0;
 }
