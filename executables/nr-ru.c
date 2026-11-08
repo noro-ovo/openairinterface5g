@@ -318,6 +318,14 @@ int tx_rf_symbols(RU_t *ru, int frame, int slot, uint64_t timestamp, int start_s
 
   int nt = ru->nb_tx;
   void *txp[nt];
+  if (ru->rfdevice.trx_write_fd_func) {
+    // the device does the OFDM modulation: it takes the gNB frequency-domain data of the slot
+    void *txF[nt];
+    for (int i = 0; i < nt; i++)
+      txF[i] = &ru->gNB_list[0]->common_vars.txdataF[i][start_symbol * fp->ofdm_symbol_size];
+    ru->rfdevice.trx_write_fd_func(&ru->rfdevice, timestamp + ru->ts_offset, txF, start_symbol, transmitted_symbols, nt, flags);
+    return transmitted_symbols;
+  }
   uint32_t time_offset = get_samples_slot_timestamp(fp, slot) + get_samples_symbol_timestamp(fp, slot, start_symbol);
   for (int i = 0; i < nt; i++)
     txp[i] = (void *)&ru->common.txdata[i][time_offset] - sf_extension * sizeof(int32_t);
