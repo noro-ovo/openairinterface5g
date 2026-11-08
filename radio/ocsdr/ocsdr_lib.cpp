@@ -723,8 +723,9 @@ static int ocsdr_write(openair0_device_t *device, openair0_timestamp_t timestamp
   return nsamps;
 }
 
-// front end TX: the symbols of a slot from OAI's txdataF, two blocks per symbol (bins 0..1637 = txdataF[1638..3275],
-// bins 2458..4095 = txdataF[0..1637]), both antennas interleaved, header = start of the symbol's cyclic prefix
+// front end TX: the symbols of a slot from OAI's txdataF, two blocks per symbol (bins 0..1637 = txdataF[1638..3275] at
+// the start of the payload, bins 2458..4095 = txdataF[0..1637] at its end), both antennas interleaved, header = start of
+// the symbol's cyclic prefix
 static int ocsdr_write_fd(openair0_device_t *device, openair0_timestamp_t timestamp, void **txdataF, int first_symbol,
                           int num_symbols, int nb_ant, int flags)
 {
@@ -749,7 +750,9 @@ static int ocsdr_write_fd(openair0_device_t *device, openair0_timestamp_t timest
         sym = (const int16_t *)txdataF[c] + 2 * 4096 * (l - first_symbol);
         in[c] = sym + 2 * (half == 0 ? OCSDR_RX_FD_BINS : 0);
       }
-      ocsdr_tx_pack(blk, in, nch, s->hw_ch, OCSDR_RX_FD_BINS, 0);
+      // half A: bins from the start of the payload; half B: its bins end the block (the FPGA skips the unused start
+      // while it feeds the guard bins), 1023 - 819 = 204 beats of 4 words in
+      ocsdr_tx_pack(blk + (half ? 2 * 4 * 204 : 0), in, nch, s->hw_ch, OCSDR_RX_FD_BINS, 0);
       ocsdr_stream_tx_commit(s->stream, ts, OCSDR_TX_FD | (half ? OCSDR_TX_FD_HALF_B : 0) | OCSDR_TX_FD_SYMBOL(l));
     }
   }
