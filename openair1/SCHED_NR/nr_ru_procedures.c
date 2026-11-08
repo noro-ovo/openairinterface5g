@@ -207,6 +207,8 @@ void nr_feptx_tp(RU_t *ru, int frame_tx, int slot)
 
   if (nr_slot_select(cfg, frame_tx, slot) == NR_UPLINK_SLOT)
     return;
+  if (ru->rfdevice.trx_write_fd_func)
+    return; // the device does the OFDM modulation (tx_rf_symbols hands it the frequency-domain data)
   start_meas(&ru->ofdm_total_stats);
 
   int nt = fp->nb_antennas_tx;
