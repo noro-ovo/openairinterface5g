@@ -579,6 +579,27 @@ struct openair0_device {
    * \return 0 when the device had that symbol, -1 otherwise (the caller then demodulates the samples itself)
    */
   int (*trx_get_rxdataF_func)(openair0_device_t *device, openair0_timestamp_t win_ts, int aid, void *dst, int nbins);
+  /*! \brief Frequency-domain TX: the device does the OFDM modulation (e.g. the OC1 FPGA front end)
+   *
+   * Takes num_symbols OFDM symbols from first_symbol of a slot, per antenna in the layout of the gNB txdataF
+   * (symbols ofdm_symbol_size apart, N_RB_DL * 12 bins each, the negative frequencies first). Optional (NULL: the
+   * device takes time-domain samples from trx_write_func, which is then not called for those slots).
+   * \param device the hardware to use
+   * \param timestamp timestamp of the slot start, as trx_write_func would get it for symbol 0
+   * \param txdataF per antenna, symbol first_symbol
+   * \param first_symbol first symbol of the slot
+   * \param num_symbols symbols to send
+   * \param nb_ant number of antennas
+   * \param flags as for trx_write_func (radio_tx_burst_flag_t)
+   * \return number of symbols taken
+   */
+  int (*trx_write_fd_func)(openair0_device_t *device,
+                           openair0_timestamp_t timestamp,
+                           void **txdataF,
+                           int first_symbol,
+                           int num_symbols,
+                           int nb_ant,
+                           int flags);
 };
 
 typedef struct {
