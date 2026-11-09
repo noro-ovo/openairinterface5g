@@ -11,6 +11,8 @@ add_executable(test_nr_mac_gnb
   test_nr_dl_code_rate.cpp
   test_nr_ul_long_bsr.c
   test_nr_ul_long_bsr.cpp
+  test_nr_measgap.c
+  test_nr_measgap.cpp
 )
 target_link_libraries(test_nr_mac_gnb PRIVATE L2_NR MAC_NR_COMMON SCHED_NR_LIB CONFIG_LIB UTIL ITTI physim_common time_management_core softmodem_common ${T_LIB} asn1_nr_rrc_hdrs asn1_lte_rrc_hdrs GTest::gtest)
 add_dependencies(tests test_nr_mac_gnb)

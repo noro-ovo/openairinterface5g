@@ -179,8 +179,9 @@ void gNB_dlsch_ulsch_scheduler(module_id_t module_idP, const int cell_id, frame_
     }
   }
 
-  nr_measgap_scheduling(gNB, cell, frame, slot);
   nr_mac_update_timers(gNB, cell);
+  // after the timer update, so that a measurement gap interruption started in this slot lasts its full length
+  nr_measgap_scheduling(gNB, cell, frame, slot);
 
   if (wait_prach_completed || get_softmodem_params()->phy_test) {
     // This schedules MIB
