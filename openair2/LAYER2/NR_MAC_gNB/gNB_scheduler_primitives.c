@@ -3539,8 +3539,9 @@ void nr_measgap_scheduling(gNB_MAC_INST *nr_mac, const nr_cell_sched_t *cell, fr
     const frame_t f = (frame + (slot + mgc->n_slots_advance) / slots_frame) % MAX_FRAME_NUMBER;
     const slot_t s = (slot + mgc->n_slots_advance) % slots_frame;
 
-    // TS 38 331 - Section 5.5.2.9 Measurement gap configuration
-    if (!(((f % (mgc->mgrp_ms / 10)) == (mgc->gapOffset / 10)) && (s == mgc->gapOffset % 10)))
+    // TS 38 331 - Section 5.5.2.9 Measurement gap configuration: the gap starts at subframe gapOffset mod 10
+    const int slots_subframe = slots_frame / 10;
+    if (!(((f % (mgc->mgrp_ms / 10)) == (mgc->gapOffset / 10)) && (s == (mgc->gapOffset % 10) * slots_subframe)))
       continue;
 
     NR_timer_t *t = &UE->UE_sched_ctrl.transm_interrupt;
