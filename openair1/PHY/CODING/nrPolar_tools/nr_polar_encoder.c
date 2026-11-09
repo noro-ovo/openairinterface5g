@@ -295,14 +295,25 @@ __attribute__((always_inline)) static inline void polar_rate_matching(const t_nr
       out8[i >> 3] |= ((in8[pi >> 3] >> (pi & 7)) & 1) << (i & 7);
     }
   }
-  // These are based on LUTs for byte and short word groups
-  else if (polarParams->groupsize == 8)
-    for (int i = 0; i < polarParams->encoderLength >> 3; i++)
-      ((uint8_t *)out)[i] = ((uint8_t *)in)[polarParams->rm_tab[i]];
-  else // groupsize==16
-    for (int i = 0; i < polarParams->encoderLength >> 4; i++) {
-      ((uint16_t *)out)[i] = ((uint16_t *)in)[polarParams->rm_tab[i]];
+  // These are based on LUTs for byte and short word groups, the last encoderLength % groupsize bits bit by bit
+  else {
+    const uint8_t *in8 = (const uint8_t *)in;
+    uint8_t *out8 = (uint8_t *)out;
+    int done;
+    if (polarParams->groupsize == 8) {
+      done = polarParams->encoderLength & ~7;
+      for (int i = 0; i < polarParams->encoderLength >> 3; i++)
+        out8[i] = in8[polarParams->rm_tab[i]];
+    } else { // groupsize==16
+      done = polarParams->encoderLength & ~15;
+      for (int i = 0; i < polarParams->encoderLength >> 4; i++)
+        ((uint16_t *)out)[i] = ((const uint16_t *)in)[polarParams->rm_tab[i]];
     }
+    for (int i = done; i < polarParams->encoderLength; i++) {
+      const int pi = polarParams->rate_matching_pattern[i];
+      out8[i >> 3] |= ((in8[pi >> 3] >> (pi & 7)) & 1) << (i & 7);
+    }
+  }
 
   if (polarParams->i_bil == 1) {
     nr_polar_rm_interleaving_cb(out, out, polarParams->encoderLength);
@@ -310,6 +321,20 @@ __attribute__((always_inline)) static inline void polar_rate_matching(const t_nr
 }
 
 static void build_encoder_tables(t_nrPolar_params *pp);
+
+// true if every whole group of g output bits comes from g consecutive input bits starting at a multiple of g
+static bool polar_rm_groups_valid(const t_nrPolar_params *polarParams, int g)
+{
+  const uint16_t *rmp = polarParams->rate_matching_pattern;
+  for (int o = 0; o + g <= polarParams->encoderLength; o += g) {
+    if (rmp[o] % g)
+      return false;
+    for (int j = 1; j < g; j++)
+      if (rmp[o + j] != rmp[o] + j)
+        return false;
+  }
+  return true;
+}
 
 void build_polar_tables(t_nrPolar_params *polarParams)
 {
@@ -348,90 +373,20 @@ void build_polar_tables(t_nrPolar_params *polarParams)
               "N = %d, not done yet\n",
               polarParams->N);
 
-  // rate matching table
-  int iplast = polarParams->rate_matching_pattern[0];
-  int ccnt = 0;
-#ifdef DEBUG_POLAR_ENCODER
-  int groupcnt = 0;
-  int firstingroup_out = 0;
-  int firstingroup_in = iplast;
-#endif
-  int mingroupsize = 1024;
-
-  // compute minimum group size of rate-matching pattern
-  for (int outpos = 1; outpos < polarParams->encoderLength; outpos++) {
-    int ip = polarParams->rate_matching_pattern[outpos];
-#ifdef DEBUG_POLAR_ENCODER
-    printf("rm: outpos %d, inpos %d\n", outpos, ip);
-#endif
-    if ((ip - iplast) == 1)
-      ccnt++;
-    else {
-#ifdef DEBUG_POLAR_ENCODER
-      groupcnt++;
-      printf("group %d (size %d): (%d:%d) => (%d:%d)\n",
-             groupcnt,
-             ccnt + 1,
-             firstingroup_in,
-             firstingroup_in + ccnt,
-             firstingroup_out,
-             firstingroup_out + ccnt);
-#endif
-
-      if ((ccnt + 1) < mingroupsize)
-        mingroupsize = ccnt + 1;
-
-      ccnt = 0;
-#ifdef DEBUG_POLAR_ENCODER
-      firstingroup_out = outpos;
-      firstingroup_in = ip;
-#endif
-    }
-
-    iplast = ip;
+  // whole groups of 16 or 8 bits when all of them are consecutive and aligned in the input (the shortest run
+  // is not enough: the runs can start anywhere), else bit by bit. The last encoderLength % g bits go bit by bit
+  polarParams->groupsize = 1;
+  polarParams->rm_tab = NULL;
+  for (int g = 16; g >= 8; g >>= 1) {
+    if (!polar_rm_groups_valid(polarParams, g))
+      continue;
+    polarParams->groupsize = g;
+    const int ngroups = polarParams->encoderLength / g;
+    polarParams->rm_tab = malloc_or_fail(sizeof(*polarParams->rm_tab) * max(ngroups, 1));
+    for (int i = 0; i < ngroups; i++)
+      polarParams->rm_tab[i] = polarParams->rate_matching_pattern[i * g] / g;
+    break;
   }
-#ifdef DEBUG_POLAR_ENCODER
-  groupcnt++;
-#endif
-  if ((ccnt + 1) < mingroupsize)
-    mingroupsize = ccnt + 1;
-#ifdef DEBUG_POLAR_ENCODER
-  printf("group %d (size %d): (%d:%d) => (%d:%d)\n",
-         groupcnt,
-         ccnt + 1,
-         firstingroup_in,
-         firstingroup_in + ccnt,
-         firstingroup_out,
-         firstingroup_out + ccnt);
-#endif
-
-  polarParams->groupsize = mingroupsize;
-
-  int shift = 0;
-  switch (mingroupsize) {
-    case 2:
-      shift = 1;
-      break;
-    case 4:
-      shift = 2;
-      break;
-    case 8:
-      shift = 3;
-      break;
-    case 16:
-      shift = 4;
-      break;
-    default:
-      AssertFatal(false, "mingroupsize = %i is not supported\n", mingroupsize);
-      break;
-  }
-
-  // one entry per group started in [0, E): the last group may be partial when E is not a multiple of the group size
-  polarParams->rm_tab = malloc(sizeof(*polarParams->rm_tab) * ((polarParams->encoderLength + mingroupsize - 1) >> shift));
-
-  // rerun again to create groups
-  for (int outpos = 0, tcnt = 0; outpos < polarParams->encoderLength; outpos += mingroupsize, tcnt++)
-    polarParams->rm_tab[tcnt] = polarParams->rate_matching_pattern[outpos] >> shift;
 
   build_encoder_tables(polarParams);
   nr_polar_build_sc_decoder(polarParams);
@@ -481,7 +436,7 @@ static void build_encoder_tables(t_nrPolar_params *pp)
   pp->enc_bdep = (getauxval(AT_HWCAP2) & HWCAP2_SVEBITPERM) != 0;
   /* byte / halfword group copy of polar_rate_matching() as TBL indices into the (at most 64) bytes of d: bytes
    * [0, E/8) as polar_rate_matching() writes them (halfword groups: the last byte stays 0 when E/8 is odd) */
-  if (!pp->i_bil && pp->groupsize >= 8 && N <= 512) {
+  if (!pp->i_bil && pp->groupsize >= 8 && N <= 512 && (E % pp->groupsize) == 0) {
     const int nb = E >> 3;
     pp->enc_rm_byte = malloc((nb + 15) & ~15);
     AssertFatal(pp->enc_rm_byte, "malloc\n");
@@ -503,8 +458,7 @@ static void build_encoder_tables(t_nrPolar_params *pp)
     uint16_t *rm = malloc(sizeof(uint16_t) * E), *src = calloc((E + 7) & ~7, sizeof(uint16_t));
     AssertFatal(rm && src, "malloc\n");
     for (int i = 0; i < E; i++) // rate matching output bit i <- bit rm[i] of d, as polar_rate_matching()
-      rm[i] = pp->groupsize < 8 ? pp->rate_matching_pattern[i]
-              : pp->groupsize == 8 ? 8 * pp->rm_tab[i >> 3] + (i & 7) : 16 * pp->rm_tab[i >> 4] + (i & 15);
+      rm[i] = pp->rate_matching_pattern[i];
     if (pp->i_bil) { // nr_polar_rm_interleaving_cb(): written column by column from the triangle filled row by row
       int T = ceil((sqrt(8 * E + 1) - 1) / 2);
       int ko = 0;
@@ -897,7 +851,7 @@ void polar_encoder_fast(uint64_t *A,
     }
 #endif
   } else {
-    memset((void *)out, 0, polarParams->encoderLength >> 3);
+    memset((void *)out, 0, (polarParams->encoderLength + 7) >> 3);
     polar_rate_matching(polarParams, (void *)D, out);
   }
 
