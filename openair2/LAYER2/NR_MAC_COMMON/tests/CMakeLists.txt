@@ -25,3 +25,12 @@ target_link_libraries(test_pdcch_candidates PRIVATE
     minimal_lib m)
 add_dependencies(tests test_pdcch_candidates)
 add_test(NAME test_pdcch_candidates COMMAND test_pdcch_candidates)
+
+add_executable(test_compute_tbs test_compute_tbs.c)
+target_link_libraries(test_compute_tbs PRIVATE
+    MAC_NR_COMMON
+    nr_common
+    asn1_nr_rrc_hdrs
+    minimal_lib m)
+add_dependencies(tests test_compute_tbs)
+add_test(NAME test_compute_tbs COMMAND test_compute_tbs)

@@ -79,6 +79,7 @@ static void fill_ssb_vrb_map(NR_COMMON_channels_t *cc,
 
   uint16_t *vrb_map = cc[CC_id].vrb_map[beam];
   const int extra_prb = ssb_subcarrier_offset > 0;
+  /* add to the map: a slot may have two SSBs on the same RBs */
   for (int rb = 0; rb < 20 + extra_prb; rb++)
     vrb_map[rbStart + rb] |= SL_to_bitmap(symStart % NR_SYMBOLS_PER_SLOT, 4);
 }
@@ -351,13 +352,28 @@ static void nr_fill_nfapi_dl_SIB_pdu( nr_cell_sched_t *cell,
         pdcch_pdu_rel15->numDlDci);
 }
 
+/* a TDA with an UL symbol of this slot cannot carry a DL PDSCH (38.213 11.1) */
+static bool sib1_tda_on_ul(const nr_cell_sched_t *cell, int slot, const NR_tda_info_t *tda_info)
+{
+  const frame_structure_t *fs = &cell->frame_structure;
+  if (fs->frame_type != TDD)
+    return false;
+  const tdd_bitmap_t *bm = &fs->period_cfg.tdd_slot_bitmap[get_slot_idx_in_period(slot, fs)];
+  if (bm->slot_type == TDD_NR_UPLINK_SLOT)
+    return true;
+  if (bm->slot_type == TDD_NR_DOWNLINK_SLOT)
+    return false;
+  return tda_info->startSymbolIndex + tda_info->nrOfSymbols > NR_SYMBOLS_PER_SLOT - bm->num_ul_symbols;
+}
+
 static bool check_sib1_tda(nr_cell_sched_t *cell,
                            NR_sched_pdcch_t *sched_pdcch,
                            NR_beam_alloc_t *beam,
                            int aggregation_level,
                            int cce_index,
                            int tda,
-                           int ssb_index)
+                           int ssb_index,
+                           int slot)
 {
   NR_COMMON_channels_t *cc = &cell->common_channels;
   NR_ServingCellConfigCommon_t *scc = cc->ServingCellConfigCommon;
@@ -376,6 +392,8 @@ static bool check_sib1_tda(nr_cell_sched_t *cell,
   if (!tda_info.valid_tda || tda_info.startSymbolIndex + tda_info.nrOfSymbols == 14)
     return false;
   if (tda_info.startSymbolIndex < type0_PDCCH_CSS_config->first_symbol_index + type0_PDCCH_CSS_config->num_symbols)
+    return false;
+  if (cell->sib1_check_slot && sib1_tda_on_ul(cell, slot, &tda_info))
     return false;
 
   cell->sib1_pdsch[ssb_index] = allocate_sib1(cell,
@@ -447,9 +465,12 @@ void schedule_nr_sib1(nr_cell_sched_t *cell,
                                            0);
 
       bool res = false;
+      /* 3gpp scheduler: the TDA is chosen for the slot of each occasion, not once per SSB */
+      if (cell->sib1_check_slot)
+        cell->sib1_pdsch[i].time_domain_allocation = -1;
       if (cell->sib1_pdsch[i].time_domain_allocation < 0) {
         for (int t = 0; t < 16; t++) {
-          if (check_sib1_tda(cell, &sched_pdcch, &beam, aggregation_level, cce_index, t, i)) {
+          if (check_sib1_tda(cell, &sched_pdcch, &beam, aggregation_level, cce_index, t, i, slotP)) {
             res = true;
             break;
           }
@@ -463,7 +484,8 @@ void schedule_nr_sib1(nr_cell_sched_t *cell,
                              aggregation_level,
                              cce_index,
                              cell->sib1_pdsch[i].time_domain_allocation,
-                             i);
+                             i,
+                             slotP);
       int tb_size = cell->sib1_pdsch[i].tb_size;
       AssertFatal(res && tb_size > 0, "Couldn't allocate TB for SIB1 for an already allocated TDA\n");
       nfapi_nr_dl_tti_request_body_t *dl_req = &DL_req->dl_tti_request_body;
