@@ -327,9 +327,6 @@ error:
 
 static security_state_t nas_security_rx_process(nr_ue_nas_t *nas, byte_array_t buffer)
 {
-  if (nas->security_container == NULL)
-    return NAS_SECURITY_NO_SECURITY_CONTEXT;
-
   if (buffer.len < sizeof(fgmm_msg_header_t)) {
     LOG_E(NAS, "Invalid buffer length = %ld: must hold at least a plain 5GMM header\n", buffer.len);
     return NAS_SECURITY_BAD_INPUT;
@@ -337,17 +334,23 @@ static security_state_t nas_security_rx_process(nr_ue_nas_t *nas, byte_array_t b
   int security_type = buffer.buf[1];
   LOG_D(NAS, "Security type is: %s\n", print_info(security_type, security_header_type_s, sizeofArray(security_header_type_s)));
 
+  /* security header type 3 is only used for the SECURITY MODE COMMAND (24.501 9.3.1). Its MAC is checked with the
+   * new context it carries, in handle_security_mode_command(), and the current context is kept until that check
+   * passes (24.501 5.4.2.5) */
+  if (security_type == INTEGRITY_PROTECTED_WITH_NEW_SECU_CTX)
+    return get_msg_type(buffer.buf, buffer.len) == FGS_SECURITY_MODE_COMMAND ? NAS_SECURITY_NO_SECURITY_CONTEXT
+                                                                             : NAS_SECURITY_BAD_INPUT;
+
+  /* without a security context, a protected message cannot be verified nor deciphered: only plain messages */
+  if (nas->security_container == NULL)
+    return security_type == PLAIN_5GS_MSG ? NAS_SECURITY_NO_SECURITY_CONTEXT : NAS_SECURITY_BAD_INPUT;
+
   switch (security_type) {
     case PLAIN_5GS_MSG: {
       fgs_nas_msg_t msg_type = get_msg_type(buffer.buf, buffer.len);
       return unprotected_allowed(buffer, msg_type) ? NAS_SECURITY_UNPROTECTED : NAS_SECURITY_BAD_INPUT;
       break;
     }
-    case INTEGRITY_PROTECTED_WITH_NEW_SECU_CTX:
-      /* a Security Mode Command: handle_security_mode_command() checks it with the new context and replaces the
-         current one only if it passes (24.501 5.4.2.5: a rejected command leaves the current context in use) */
-      return NAS_SECURITY_NO_SECURITY_CONTEXT;
-      break;
     case INTEGRITY_PROTECTED:
     case INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_SECU_CTX:
       /* only accept "integrity protected and ciphered" messages */
@@ -1449,11 +1452,13 @@ static void generateSecurityModeReject(nr_ue_nas_t *nas, as_nas_info_t *initialN
   if (has_security_context) {
     fgmm_nas_msg_security_protected_t sp = {0};
     sp.header.protocol_discriminator = FGS_MOBILITY_MANAGEMENT_MESSAGE;
-    sp.header.security_header_type = INTEGRITY_PROTECTED;
+    /* the payload is ciphered below, as every protected UL message of the UE */
+    sp.header.security_header_type = INTEGRITY_PROTECTED_AND_CIPHERED;
     sp.header.sequence_number = nas->security.nas_count_ul & 0xff;
     size += sizeof(sp.header);
     sp.plain.header = plain_header;
     sp.plain.mm_msg.fgs_security_mode_reject = msg;
+    initialNasMsg->nas_data = malloc_or_fail(size);
     // Security protected header encoding
     int security_header_len = nas_protected_security_header_encode(initialNasMsg->nas_data, &sp.header, size);
     initialNasMsg->length =
@@ -1533,31 +1538,18 @@ static void handle_security_mode_command(nr_ue_nas_t *nas, as_nas_info_t *initia
   int ciphering_algorithm = (pdu[10] >> 4) & 0x0f;
   int integrity_algorithm = pdu[10] & 0x0f;
 
-  uint8_t *kamf = nas->security.kamf;
-  uint8_t knas_enc[sizeof(nas->security.knas_enc)];
-  uint8_t knas_int[sizeof(nas->security.knas_int)];
-
-  /* derive keys */
-  derive_knas(0x01, ciphering_algorithm, kamf, knas_enc);
-  derive_knas(0x02, integrity_algorithm, kamf, knas_int);
-
-  printf("knas_int: ");
-  for (int i = 0; i < 16; i++) {
-    printf("%x ", knas_int[i]);
-  }
-  printf("\n");
-
-  printf("knas_enc: ");
-  for (int i = 0; i < 16; i++) {
-    printf("%x ", knas_enc[i]);
-  }
-  printf("\n");
-
   if (integrity_algorithm == EIA0_ALG_ID) {
     LOG_E(NAS, "Rejecting Invalid NULL integrity %d for 5G!\n", integrity_algorithm);
     generateSecurityModeReject(nas, initialNasMsg, Security_mode_rejected_unspecified);
     return;
   }
+
+  /* derive keys */
+  uint8_t knas_enc[sizeof(nas->security.knas_enc)];
+  uint8_t knas_int[sizeof(nas->security.knas_int)];
+  derive_knas(0x01, ciphering_algorithm, nas->security.kamf, knas_enc);
+  derive_knas(0x02, integrity_algorithm, nas->security.kamf, knas_int);
+
   stream_security_container_t *new_ctx =
       stream_security_container_init(ciphering_algorithm, integrity_algorithm, knas_enc, knas_int);
   if (new_ctx == NULL) {
@@ -1566,10 +1558,11 @@ static void handle_security_mode_command(nr_ue_nas_t *nas, as_nas_info_t *initia
     return;
   }
 
-  /* check the MAC with the new context: the command starts a new NAS COUNT (overflow 0), its sequence number gives
-     the DL count. A command retransmitted by the network (T3560) carries the same or a next sequence number */
-  stream_security_container_t *current_ctx = nas->security_container;
-  const uint32_t current_count_dl = nas->security.nas_count_dl;
+  /* The SMC is protected with the new context, at the DL NAS COUNT given by its sequence number (overflow 0 in a new
+   * context, 24.501 4.4.3.1): a retransmission (T3560 expiry, 24.501 5.4.2.7) carries the next sequence number.
+   * The current context is only replaced once the MAC is verified, and kept otherwise (24.501 5.4.2.5) */
+  stream_security_container_t *cur_ctx = nas->security_container;
+  const uint32_t cur_count_dl = nas->security.nas_count_dl;
   nas->security_container = new_ctx;
   nas->security.nas_count_dl = pdu[6];
   uint8_t computed_mac[NAS_INTEGRITY_SIZE];
@@ -1580,18 +1573,20 @@ static void handle_security_mode_command(nr_ue_nas_t *nas, as_nas_info_t *initia
     LOG_W(NAS, "MAC does not match\n");
     LOG_W(NAS, "Expected: %x %x %x %x\n", computed_mac[0], computed_mac[1], computed_mac[2], computed_mac[3]);
     LOG_W(NAS, "Received: %x %x %x %x\n", recv_mac[0], recv_mac[1], recv_mac[2], recv_mac[3]);
-    /* not taken into use: the current context stays (24.501 5.4.2.5) */
     stream_security_container_delete(new_ctx);
-    nas->security_container = current_ctx;
-    nas->security.nas_count_dl = current_count_dl;
+    nas->security_container = cur_ctx;
+    nas->security.nas_count_dl = cur_count_dl;
+
+    /* Signal rejection */
     generateSecurityModeReject(nas, initialNasMsg, Security_mode_rejected_unspecified);
     return;
   }
 
-  if (current_ctx)
-    stream_security_container_delete(current_ctx);
+  if (cur_ctx)
+    stream_security_container_delete(cur_ctx);
   memcpy(nas->security.knas_enc, knas_enc, sizeof(knas_enc));
   memcpy(nas->security.knas_int, knas_int, sizeof(knas_int));
+  nas->security.nas_count_dl++;
 
   nas_itti_kgnb_refresh_req(nas->UE_id, nas->security.kgnb);
   generateSecurityModeComplete(nas, initialNasMsg);
