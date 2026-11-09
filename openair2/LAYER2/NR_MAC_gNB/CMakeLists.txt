@@ -2,4 +2,5 @@
 
 if(ENABLE_TESTS)
   add_subdirectory(tests)
+  add_subdirectory(sched/tests)
 endif()

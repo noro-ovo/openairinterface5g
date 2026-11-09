@@ -5,6 +5,7 @@
 #include "assertions.h"
 
 #include "mac_proto.h"
+#include "sched/sched_check_oai.h"
 #ifdef E3_AGENT
 #include "openair2/E3AP/ran_func_spectrum_extern.h"
 #endif /* E3_AGENT */
@@ -222,6 +223,7 @@ void gNB_dlsch_ulsch_scheduler(module_id_t module_idP, const int cell_id, frame_
   nr_sr_reporting(gNB, cell, frame, slot);
   stop_meas(&cell->schedule_periodic);
 
+  cell->ul_dci_req_slot = &sched_info->UL_dci_req;
   // This schedule RA procedure if not in phy_test mode
   // Otherwise consider 5G already connected
   if (get_softmodem_params()->phy_test == 0) {
@@ -251,6 +253,8 @@ void gNB_dlsch_ulsch_scheduler(module_id_t module_idP, const int cell_id, frame_
   copy_ul_tti_req(&sched_info->UL_tti_req, &cell->UL_tti_req_ahead[current_index]);
 
   nr_fill_pusch_fapi_groups(&sched_info->UL_tti_req);
+
+  nr_sched_check_slot(cell, sched_info);
 
   stop_meas(&cell->gNB_scheduler);
   NR_SCHED_UNLOCK(&gNB->sched_lock);

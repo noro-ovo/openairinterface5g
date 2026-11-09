@@ -184,6 +184,14 @@ nfapi_nr_dl_dci_pdu_t *prepare_dci_pdu(nfapi_nr_dl_tti_pdcch_pdu_rel15_t *pdcch_
                                        int rnti);
 
 void nr_schedule_pucch(gNB_MAC_INST *mac, nr_cell_sched_t *cell, frame_t frameP, slot_t slotP);
+/// calls cb with the PUCCH PDU each UE would get in frame.slot if it were written now (PUCCHs pending in
+/// sched_pucch, through the same nr_configure_pucch call as nr_schedule_pucch); returns the number of PDUs
+int nr_pending_pucch_pdus(gNB_MAC_INST *mac,
+                          nr_cell_sched_t *cell,
+                          frame_t frame,
+                          slot_t slot,
+                          void (*cb)(const nfapi_nr_pucch_pdu_t *pdu, void *arg),
+                          void *arg);
 
 void nr_srs_ri_computation(const nfapi_nr_srs_normalized_channel_iq_matrix_t *nr_srs_normalized_channel_iq_matrix,
                            const NR_UE_UL_BWP_t *current_BWP,
@@ -205,6 +213,56 @@ int nr_acknack_scheduling(nr_cell_sched_t *cell,
                           int beam_index,
                           int r_pucch,
                           int is_common);
+/// as nr_acknack_scheduling, with the PUCCH starting at or after earliest_symbol (from symbol 0 of frameP.slotP), -1 for no limit
+int nr_acknack_scheduling_from(nr_cell_sched_t *cell,
+                               NR_UE_info_t *UE,
+                               frame_t frameP,
+                               slot_t slotP,
+                               int beam_index,
+                               int r_pucch,
+                               int is_common,
+                               int earliest_symbol);
+/// necessary condition of nr_acknack_scheduling_from() for a PDSCH in frameP.slotP, without changing any state
+bool nr_acknack_possible(nr_cell_sched_t *cell, NR_UE_info_t *UE, frame_t frameP, slot_t slotP, int is_common);
+/// the action applying a pending CellGroup when the PDSCH carrying the RRCReconfiguration is acknowledged
+feedback_action_t nr_dl_reconfig_action(void);
+/// UL candidates for a PUSCH in sched_frame.sched_slot (retransmissions, BSR, SR, long inactivity)
+int nr_ul_collect_candidates(gNB_MAC_INST *mac,
+                             nr_cell_sched_t *cell,
+                             NR_UEs_t *UEs,
+                             nr_ul_candidate_t *candidates,
+                             int max_candidates,
+                             frame_t frame,
+                             slot_t slot,
+                             int k2,
+                             int sched_frame,
+                             int sched_slot);
+/// emit a PUSCH retransmission or new transmission placed in cand->sched_pusch (TBS, DMRS, FAPI, HARQ); returns the RBs used
+int nr_ul_apply_retransmission(gNB_MAC_INST *nrmac,
+                               nr_cell_sched_t *cell,
+                               post_process_pusch_t *pp_pusch,
+                               const nr_ul_candidate_t *cand,
+                               const NR_ServingCellConfigCommon_t *scc,
+                               int tda,
+                               const NR_tda_info_t *tda_info,
+                               uint16_t *rballoc_mask,
+                               bwp_info_t bi,
+                               int sched_frame,
+                               int sched_slot);
+int nr_ul_apply_new_transmission(gNB_MAC_INST *nrmac,
+                                 nr_cell_sched_t *cell,
+                                 post_process_pusch_t *pp_pusch,
+                                 const nr_ul_candidate_t *cand,
+                                 const NR_ServingCellConfigCommon_t *scc,
+                                 int tda,
+                                 const NR_tda_info_t *tda_info,
+                                 uint16_t *rballoc_mask,
+                                 uint16_t slbitmap,
+                                 bwp_info_t bi,
+                                 int sched_frame,
+                                 int sched_slot);
+/// DL candidates of the slot: retransmissions, and new transmissions with RLC data (reads the RLC status)
+int nr_dl_collect_candidates(nr_cell_sched_t *cell, NR_UEs_t *UEs, nr_dl_candidate_t *candidates, int max_candidates, frame_t frame, slot_t slot);
 
 int nr_get_pucch_resource(NR_ControlResourceSet_t *coreset,
                           NR_PUCCH_Config_t *pucch_Config,
