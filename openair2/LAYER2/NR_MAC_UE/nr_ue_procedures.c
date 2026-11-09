@@ -1771,6 +1771,23 @@ initial_pucch_resource_t get_initial_pucch_resource(const int idx)
   return initial_pucch_resource[idx];
 }
 
+/* 38.213 9.2.5.2: if HARQ-ACK, SR and CSI do not fit in the PUCCH resource, the UE drops the CSI report
+ * and sends HARQ-ACK and SR only (one CSI report per PUCCH is multiplexed here) */
+static void drop_csi_if_no_room(PUCCH_sched_t *pucch, bool fits, frame_t frame, int slot, uint16_t rnti)
+{
+  if (fits || pucch->n_harq == 0 || pucch->csi_payload.p1_bits == 0)
+    return;
+  LOG_W(NR_MAC,
+        "%d.%d rnti %04x PUCCH: harq %d sr %d csi %d bits exceed the resource, CSI dropped (38.213 9.2.5.2)\n",
+        frame,
+        slot,
+        rnti,
+        pucch->n_harq,
+        pucch->n_sr,
+        pucch->csi_payload.p1_bits);
+  pucch->csi_payload = (nfapi_nr_ue_csi_payload_t){0};
+}
+
 int nr_ue_configure_pucch(NR_UE_MAC_INST_t *mac,
                            int slot,
                            frame_t frame,
@@ -1896,6 +1913,17 @@ int nr_ue_configure_pucch(NR_UE_MAC_INST_t *mac,
         break;
       case NR_PUCCH_Resource__format_PR_format2 :
         pucch_pdu->format_type = 2;
+        drop_csi_if_no_room(pucch,
+                            pucch_uci_fits(pucchres->format.choice.format2->nrofPRBs,
+                                           n_uci,
+                                           pucch_Config->format2->choice.setup->maxCodeRate,
+                                           2,
+                                           pucchres->format.choice.format2->nrofSymbols,
+                                           8),
+                            frame,
+                            slot,
+                            rnti);
+        n_uci = pucch->n_sr + pucch->n_harq + pucch->csi_payload.p1_bits;
         pucch_pdu->n_bit = n_uci;
         pucch_pdu->nr_of_symbols = pucchres->format.choice.format2->nrofSymbols;
         pucch_pdu->start_symbol_index = pucchres->format.choice.format2->startingSymbolIndex;
@@ -1914,7 +1942,6 @@ int nr_ue_configure_pucch(NR_UE_MAC_INST_t *mac,
         break;
       case NR_PUCCH_Resource__format_PR_format3 :
         pucch_pdu->format_type = 3;
-        pucch_pdu->n_bit = n_uci;
         pucch_pdu->nr_of_symbols = pucchres->format.choice.format3->nrofSymbols;
         pucch_pdu->start_symbol_index = pucchres->format.choice.format3->startingSymbolIndex;
         pucch_pdu->data_scrambling_id = pusch_id != NULL ? *pusch_id : mac->physCellId;
@@ -1936,6 +1963,18 @@ int nr_ue_configure_pucch(NR_UE_MAC_INST_t *mac,
           else
             f3_dmrs_symbols = 2<<pucch_pdu->add_dmrs_flag;
         }
+        drop_csi_if_no_room(pucch,
+                            pucch_uci_fits(pucchres->format.choice.format3->nrofPRBs,
+                                           n_uci,
+                                           pucch_Config->format3->choice.setup->maxCodeRate,
+                                           2 - pucch_pdu->pi_2bpsk,
+                                           pucchres->format.choice.format3->nrofSymbols - f3_dmrs_symbols,
+                                           12),
+                            frame,
+                            slot,
+                            rnti);
+        n_uci = pucch->n_sr + pucch->n_harq + pucch->csi_payload.p1_bits;
+        pucch_pdu->n_bit = n_uci;
         pucch_pdu->prb_size = compute_pucch_prb_size(pucchres->format.choice.format3->nrofPRBs,
                                                      pucch->csi_payload.p1_bits,
                                                      pucch->n_harq,
