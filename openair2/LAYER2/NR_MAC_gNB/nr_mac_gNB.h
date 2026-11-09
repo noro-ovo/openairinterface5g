@@ -1406,6 +1406,12 @@ typedef struct nr_cell_sched_s {
   NR_Type0_PDCCH_CSS_config_t type0_PDCCH_CSS_config[MAX_NUM_OF_SSB];
   bool first_MIB;
   NR_sched_pdsch_t sib1_pdsch[MAX_NUM_OF_SSB];
+  /// 3gpp scheduler: choose the SIB1 TDA for the slot of each occasion, without UL symbols
+  bool sib1_check_slot;
+  /// 3gpp scheduler: the Msg4/MsgB HARQ-ACK PUCCH starts no earlier than 38.213 8.4 allows (symbols, not slots)
+  bool sched3gpp_ra_rules;
+  /// UL DCI request of the slot being scheduled, for the 3gpp scheduler to read the PDCCHs already placed
+  const nfapi_nr_ul_dci_request_t *ul_dci_req_slot;
   periodic_ue_sched_t periodic_srs_config;
 
   /// Dedicated UL TDA list, built from frame_structure at config time

@@ -51,10 +51,12 @@ uint32_t nr_compute_tbs(uint16_t Qm,
   // Rx1024 is tabulated as 10 times the actual code rate
   const uint32_t R_5 = R / 5; // R can be fractional so we can't divide by 10
   // So we ned to right shift by 11 (10 for x1024 and 1 additional as above)
-  const uint32_t Ninfo = ((nb_re * R_5 * Qm * Nl) >> 11) >> tb_scaling;
+  const uint64_t Ninfo_x2048 = (uint64_t)nb_re * R_5 * Qm * Nl;
+  const uint32_t Ninfo = (Ninfo_x2048 >> 11) >> tb_scaling;
   uint32_t nr_tbs = 0;
   uint32_t Np_info, C, n;
-  if (Ninfo <= NR_MAX_PDSCH_TBS) {
+  // 38.214 5.1.3.2: the test is on the exact N_info, e.g. 3824.6 takes step 4
+  if (Ninfo_x2048 <= ((uint64_t)NR_MAX_PDSCH_TBS << (11 + tb_scaling))) {
     int val = floor_log2_u32(Ninfo);
     n = max(3, val - 6);
     Np_info = max(24, (Ninfo >> n) << n);

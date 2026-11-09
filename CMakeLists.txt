@@ -1232,6 +1232,14 @@ set (MAC_NR_SRC
   ${NR_GNB_MAC_DIR}/gNB_scheduler_dlsch_default_policies.c
   ${NR_GNB_MAC_DIR}/gNB_scheduler_ulsch.c
   ${NR_GNB_MAC_DIR}/gNB_scheduler_ulsch_default_policies.c
+  ${NR_GNB_MAC_DIR}/sched/sched_check.c
+  ${NR_GNB_MAC_DIR}/sched/sched_check_oai.c
+  ${NR_GNB_MAC_DIR}/sched/sched_rules.c
+  ${NR_GNB_MAC_DIR}/sched/sched_grid.c
+  ${NR_GNB_MAC_DIR}/sched/sched_seed.c
+  ${NR_GNB_MAC_DIR}/sched/sched_seed_oai.c
+  ${NR_GNB_MAC_DIR}/sched/sched_dl.c
+  ${NR_GNB_MAC_DIR}/sched/sched_ul.c
   ${NR_GNB_MAC_DIR}/gNB_scheduler_primitives.c
   ${NR_GNB_MAC_DIR}/nr_mac_cell.c
   ${NR_GNB_MAC_DIR}/gNB_scheduler_phytest.c

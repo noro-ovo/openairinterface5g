@@ -270,6 +270,23 @@ static void nr_configure_pucch(nfapi_nr_pucch_pdu_t *pucch_pdu,
     pucch_pdu->param_v4.spatialStreamIndices[i] = ssi[ant_port_start + i];
 }
 
+static void configure_pucch_pdu(nr_cell_sched_t *cell, const NR_sched_pucch_t *pucch, NR_UE_info_t *UE, nfapi_nr_pucch_pdu_t *pucch_pdu)
+{
+  const uint16_t ant_ports_to_use = pucch->beam_idx * cell->radio_config.pusch_AntennaPorts;
+  nr_configure_pucch(pucch_pdu,
+                     cell->common_channels.ServingCellConfigCommon,
+                     UE,
+                     pucch->resource_id,
+                     pucch->csi_bits,
+                     pucch->dai_c,
+                     pucch->sr_flag,
+                     pucch->r_pucch,
+                     &cell->beam_info,
+                     ant_ports_to_use,
+                     cell->radio_config.spatial_stream_index,
+                     cell->radio_config.pusch_AntennaPorts);
+}
+
 static void nr_fill_nfapi_pucch(nr_cell_sched_t *cell, frame_t frame, slot_t slot, const NR_sched_pucch_t *pucch, NR_UE_info_t* UE)
 {
 
@@ -313,9 +330,6 @@ static void nr_fill_nfapi_pucch(nr_cell_sched_t *cell, frame_t frame, slot_t slo
         pucch->dai_c,
         pucch->csi_bits,
         pucch->resource_indicator);
-  NR_COMMON_channels_t *common_ch = &cell->common_channels;
-  NR_ServingCellConfigCommon_t *scc = common_ch->ServingCellConfigCommon;
-
   LOG_D(NR_MAC,
         "%4d.%2d Calling nr_configure_pucch (pucch_Config %p,r_pucch %d) pucch to be scheduled in %4d.%2d\n",
         frame,
@@ -325,19 +339,7 @@ static void nr_fill_nfapi_pucch(nr_cell_sched_t *cell, frame_t frame, slot_t slo
         pucch->frame,
         pucch->ul_slot);
 
-  const uint16_t ant_ports_to_use = pucch->beam_idx * cell->radio_config.pusch_AntennaPorts;
-  nr_configure_pucch(pucch_pdu,
-                     scc,
-                     UE,
-                     pucch->resource_id,
-                     pucch->csi_bits,
-                     pucch->dai_c,
-                     pucch->sr_flag,
-                     pucch->r_pucch,
-                     &cell->beam_info,
-                     ant_ports_to_use,
-                     cell->radio_config.spatial_stream_index,
-                     cell->radio_config.pusch_AntennaPorts);
+  configure_pucch_pdu(cell, pucch, UE, pucch_pdu);
 }
 
 //Differential RSRP values Table 10.1.6.1-2 from 38.133
@@ -423,6 +425,63 @@ static void schedule_pucch_core(nr_cell_sched_t *cell, gNB_MAC_INST *nrmac, NR_U
         O_csi);
   nr_fill_nfapi_pucch(cell, frame, slot, curr_pucch, UE);
   memset(curr_pucch, 0, sizeof(*curr_pucch));
+}
+
+/* the PDU that nr_schedule_pucch will write for the PUCCH of UE pending in frame.slot, as it stands now */
+static int pending_pucch_pdu(nr_cell_sched_t *cell,
+                             NR_UE_info_t *UE,
+                             frame_t frame,
+                             slot_t slot,
+                             void (*cb)(const nfapi_nr_pucch_pdu_t *pdu, void *arg),
+                             void *arg)
+{
+  const NR_UE_sched_ctrl_t *sched_ctrl = &UE->UE_sched_ctrl;
+  if (sched_ctrl->sched_pucch == NULL)
+    return 0;
+  const NR_sched_pucch_t *p = &sched_ctrl->sched_pucch[get_pucch_index(frame, slot, &cell->frame_structure, sched_ctrl->sched_pucch_size)];
+  if (!p->active || p->frame != frame || p->ul_slot != slot)
+    return 0;
+  nfapi_nr_pucch_pdu_t pdu;
+  memset(&pdu, 0, sizeof(pdu));
+  configure_pucch_pdu(cell, p, UE, &pdu);
+  /* format 2/3: until its slot, the payload can still grow (HARQ-ACK bits of later PDSCHs), and with it the PRBs
+   * of the PDU, up to nrofPRBs of the resource (38.213 9.2.5.2): the whole resource is booked, as the legacy map */
+  const NR_PUCCH_Config_t *pucch_Config = UE->current_UL_BWP.pucch_Config;
+  if ((pdu.format_type == 2 || pdu.format_type == 3) && pucch_Config && pucch_Config->resourceToAddModList) {
+    for (int i = 0; i < pucch_Config->resourceToAddModList->list.count; i++) {
+      const NR_PUCCH_Resource_t *res = pucch_Config->resourceToAddModList->list.array[i];
+      if (res->pucch_ResourceId != p->resource_id)
+        continue;
+      if (res->format.present == NR_PUCCH_Resource__format_PR_format2)
+        pdu.prb_size = res->format.choice.format2->nrofPRBs;
+      else if (res->format.present == NR_PUCCH_Resource__format_PR_format3)
+        pdu.prb_size = res->format.choice.format3->nrofPRBs;
+      break;
+    }
+  }
+  cb(&pdu, arg);
+  return 1;
+}
+
+int nr_pending_pucch_pdus(gNB_MAC_INST *nrmac,
+                          nr_cell_sched_t *cell,
+                          frame_t frame,
+                          slot_t slot,
+                          void (*cb)(const nfapi_nr_pucch_pdu_t *pdu, void *arg),
+                          void *arg)
+{
+  if (!is_ul_slot(slot, &cell->frame_structure))
+    return 0;
+  int n = 0;
+  FOR_EACH_RA_UE(&nrmac->UE_info, init_UE) {
+    if (init_UE->pcell == cell)
+      n += pending_pucch_pdu(cell, init_UE, frame, slot, cb, arg);
+  }
+  FOR_EACH_CONNECTED_UE(&nrmac->UE_info, UE) {
+    if (UE->pcell == cell)
+      n += pending_pucch_pdu(cell, UE, frame, slot, cb, arg);
+  }
+  return n;
 }
 
 void nr_schedule_pucch(gNB_MAC_INST *nrmac, nr_cell_sched_t *cell, frame_t frame, slot_t slot)
@@ -1487,6 +1546,13 @@ static bool find_pucch_allocation(const NR_UE_UL_BWP_t *ul_bwp,
   }
 }
 
+/* first symbol of a PUCCH, counted from symbol 0 of frame.slot */
+static int pucch_first_symbol(frame_t frame, slot_t slot, fsn_t pucch_slot, int start_symb, int n_slots_frame)
+{
+  const int slots = ((pucch_slot.f - frame + 1024) % 1024) * n_slots_frame + pucch_slot.s - slot;
+  return slots * NR_SYMBOLS_PER_SLOT + start_symb;
+}
+
 static void set_pucch0_vrb_occupation(const NR_sched_pucch_t *pucch, uint16_t *vrb_map_UL, const int bwp_start)
 {
   for (int l = 0; l < pucch->nr_of_symb; l++) {
@@ -1600,6 +1666,59 @@ int nr_acknack_scheduling(nr_cell_sched_t *cell,
                           int r_pucch,
                           int is_common)
 {
+  return nr_acknack_scheduling_from(cell, UE, frame, slot, ue_beam, r_pucch, is_common, -1);
+}
+
+/* earliest_symbol >= 0: the PUCCH must start at or after this symbol, counted from symbol 0 of
+ * frame.slot (the 3gpp scheduler passes the end of the PDSCH plus Tproc,1 and T_TA) */
+/* necessary condition of nr_acknack_scheduling_from() for a PDSCH in frame.slot, without changing any state: in one of
+ * the PDSCH-to-HARQ feedback slots, the UE has a PUCCH that may take one more bit, or a free resource of its PUCCH
+ * resource set 0 (find_pucch_allocation() tries all of them). False: the HARQ-ACK cannot be scheduled */
+bool nr_acknack_possible(nr_cell_sched_t *cell, NR_UE_info_t *UE, frame_t frame, slot_t slot, int is_common)
+{
+  const NR_UE_UL_BWP_t *ul_bwp = &UE->current_UL_BWP;
+  NR_PUCCH_Config_t *pucch_Config = ul_bwp->pucch_Config;
+  if (!pucch_Config || !pucch_Config->resourceSetToAddModList || cell->beam_info.beam_allocation)
+    return true; // common PUCCH or beams: no cheap test
+  const NR_ServingCellConfigCommon_t *scc = cell->common_channels.ServingCellConfigCommon;
+  const int NTN_gNB_Koffset = get_NTN_Koffset(scc);
+  const int minfbtime = cell->radio_config.minRXTXTIME + NTN_gNB_Koffset;
+  const frame_structure_t *fs = &cell->frame_structure;
+  const int n_slots_frame = fs->numb_slots_frame;
+  const NR_UE_sched_ctrl_t *sched_ctrl = &UE->UE_sched_ctrl;
+  const nr_dci_format_t dci_format = is_common ? NR_DL_DCI_FORMAT_1_0 : UE->current_DL_BWP.dci_format;
+  uint8_t pdsch_to_harq_feedback[8];
+  const int fb_size = get_pdsch_to_harq_feedback(pucch_Config, dci_format, pdsch_to_harq_feedback);
+  const NR_PUCCH_ResourceSet_t *set0 = pucch_Config->resourceSetToAddModList->list.array[0];
+  for (int f = 0; f < fb_size; f++) {
+    if (pdsch_to_harq_feedback[f] + NTN_gNB_Koffset < minfbtime)
+      continue;
+    const fsn_t fb = get_fb_frame_slot(frame, slot, pdsch_to_harq_feedback[f], n_slots_frame, NTN_gNB_Koffset);
+    if (fs->frame_type == TDD && !is_ul_slot(get_slot_idx_in_period(fb.s, fs), fs))
+      continue;
+    const NR_sched_pucch_t *p = &sched_ctrl->sched_pucch[get_pucch_index(fb.f, fb.s, fs, sched_ctrl->sched_pucch_size)];
+    if (p->active && p->frame == fb.f && p->ul_slot == fb.s)
+      return true;
+    const int index = ul_buffer_index(fb.f, fb.s, n_slots_frame, cell->vrb_map_UL_size);
+    const uint16_t *vrb_map_UL = &cell->common_channels.vrb_map_UL[0][index * MAX_BWP_SIZE];
+    for (int i = 0; i < set0->resourceList.list.count; i++) {
+      const NR_PUCCH_Resource_t *res = get_pucch_resource(pucch_Config, set0->resourceList.list.array[i]);
+      if (res && test_pucch0_vrb_occupation(res, (uint16_t *)vrb_map_UL, ul_bwp->BWPStart, ul_bwp->BWPSize))
+        return true;
+    }
+  }
+  return false;
+}
+
+int nr_acknack_scheduling_from(nr_cell_sched_t *cell,
+                               NR_UE_info_t *UE,
+                               frame_t frame,
+                               slot_t slot,
+                               int ue_beam,
+                               int r_pucch,
+                               int is_common,
+                               int earliest_symbol)
+{
   /* we assume that this function is mutex-protected from outside. Since it is
    * called often, don't try to lock every time */
   const NR_ServingCellConfigCommon_t *scc = cell->common_channels.ServingCellConfigCommon;
@@ -1648,6 +1767,8 @@ int nr_acknack_scheduling(nr_cell_sched_t *cell,
             curr_pucch->sr_flag,
             curr_pucch->dai_c,
             curr_pucch->csi_bits);
+      if (earliest_symbol >= 0 && pucch_first_symbol(frame, slot, frame_slot, curr_pucch->start_symb, n_slots_frame) < earliest_symbol)
+        continue;
 
       // in common PUCCH we can transmit at most 2 bits
       if (curr_pucch->dai_c == 2 && curr_pucch->csi_bits == 0 && !pucch_Config)
@@ -1767,6 +1888,11 @@ int nr_acknack_scheduling(nr_cell_sched_t *cell,
               frame_slot.f,
               frame_slot.s);
         reset_beam_status(&cell->beam_info, frame_slot.f, frame_slot.s, ue_beam, n_slots_frame, beam.new_beam);
+        continue;
+      }
+      if (earliest_symbol >= 0 && pucch_first_symbol(frame, slot, frame_slot, curr_pucch->start_symb, n_slots_frame) < earliest_symbol) {
+        reset_beam_status(&cell->beam_info, frame_slot.f, frame_slot.s, ue_beam, n_slots_frame, beam.new_beam);
+        memset(curr_pucch, 0, sizeof(*curr_pucch));
         continue;
       }
       // allocating a new PUCCH structure for this occasion

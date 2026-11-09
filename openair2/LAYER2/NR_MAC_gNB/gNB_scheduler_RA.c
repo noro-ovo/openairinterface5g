@@ -23,6 +23,8 @@
 #include "openair2/LAYER2/nr_rlc/nr_rlc_oai_api.h"
 
 #include <executables/softmodem-common.h>
+#include "sched/sched_check_oai.h"
+#include "sched/sched_dl.h"
 
 typedef struct {
   bool checked; // Validator covers this RA case.
@@ -776,6 +778,7 @@ void nr_initiate_ra_proc(module_id_t module_idP,
   gNB_MAC_INST *nr_mac = RC.nrmac[module_idP];
   nr_cell_sched_t* cell = nr_mac_get_cell_by_phy_id(nr_mac, phy_id);
   NR_SCHED_LOCK(&nr_mac->sched_lock);
+  nr_sched_check_preamble(frame, slot, preamble_index, symbol, freq_index);
   /* check if preamble exists (NSA, HO cases) */
   NR_UE_info_t *UE = get_existing_ra(nr_mac, cell, preamble_index);
   if ((get_softmodem_params()->nsa || get_softmodem_params()->do_ra) && !UE) {
@@ -1207,7 +1210,10 @@ static bool get_feasible_msg3_tda(const NR_ServingCellConfigCommon_t *scc,
 // - sending only 1 RAR subPDU
 // - UL Grant: hardcoded CSI, TPC, time alloc
 // - padding
-static void nr_fill_rar(NR_UE_info_t *UE, uint8_t *dlsch_buffer, nfapi_nr_pusch_pdu_t *pusch_pdu)
+/* writes the MAC subPDU of the RAR of UE at subpdu, preceded by the BI subPDU when first: 2 + 7 bytes when first,
+ * 1 + 7 otherwise (38.321 6.1.5). Its E bit says it is the last subPDU with a RAPID: the caller sets it when it adds
+ * another one */
+static void nr_fill_rar(NR_UE_info_t *UE, uint8_t *subpdu, bool first, nfapi_nr_pusch_pdu_t *pusch_pdu)
 {
   NR_RA_t *ra = UE->ra;
   LOG_D(NR_MAC,
@@ -1216,23 +1222,25 @@ static void nr_fill_rar(NR_UE_info_t *UE, uint8_t *dlsch_buffer, nfapi_nr_pusch_
         ra->Msg2_slot,
         ra->preamble_index,
         ra->timing_offset);
-  NR_RA_HEADER_BI *rarbi = (NR_RA_HEADER_BI *) dlsch_buffer;
-  NR_RA_HEADER_RAPID *rarh = (NR_RA_HEADER_RAPID *) (dlsch_buffer + 1);
-  NR_MAC_RAR *rar = (NR_MAC_RAR *) (dlsch_buffer + 2);
+  if (first) {
+    /// E/T/R/R/BI subheader ///
+    // E = 1, MAC PDU includes another MAC sub-PDU (RAPID)
+    // T = 0, Back-off indicator subheader
+    // R = 2, Reserved
+    // BI = 5, 60 ms (we have about 2 occasions per frame of 10ms)
+    NR_RA_HEADER_BI *rarbi = (NR_RA_HEADER_BI *)subpdu;
+    rarbi->E = 1;
+    rarbi->T = 0;
+    rarbi->R = 0;
+    rarbi->BI = 5;
+    subpdu++;
+  }
+  NR_RA_HEADER_RAPID *rarh = (NR_RA_HEADER_RAPID *)subpdu;
+  NR_MAC_RAR *rar = (NR_MAC_RAR *)(subpdu + 1);
   unsigned char csi_req = 0;
 
-  /// E/T/R/R/BI subheader ///
-  // E = 1, MAC PDU includes another MAC sub-PDU (RAPID)
-  // T = 0, Back-off indicator subheader
-  // R = 2, Reserved
-  // BI = 5, 60 ms (we have about 2 occasions per frame of 10ms)
-  rarbi->E = 1;
-  rarbi->T = 0;
-  rarbi->R = 0;
-  rarbi->BI = 5;
-
   /// E/T/RAPID subheader ///
-  // E = 0, one only RAR, first and last
+  // E = 0, last RAR of the PDU until the caller adds another
   // T = 1, RAPID
   rarh->E = 0;
   rarh->T = 1;
@@ -1356,7 +1364,7 @@ static bool nr_get_Msg3alloc(nr_cell_sched_t *cell, int current_slot, frame_t cu
 }
 
 static void
-nr_add_msg3(nr_cell_sched_t *cell, frame_t frameP, slot_t slotP, NR_UE_info_t *UE, uint8_t *RAR_pdu, int beam_number)
+nr_add_msg3(nr_cell_sched_t *cell, frame_t frameP, slot_t slotP, NR_UE_info_t *UE, uint8_t *RAR_subpdu, bool first, int beam_number)
 {
   NR_COMMON_channels_t *cc = &cell->common_channels;
   NR_ServingCellConfigCommon_t *scc = cc->ServingCellConfigCommon;
@@ -1453,7 +1461,7 @@ nr_add_msg3(nr_cell_sched_t *cell, frame_t frameP, slot_t slotP, NR_UE_info_t *U
   future_ul_tti_req->n_pdus += 1;
 
   // calling function to fill rar message
-  nr_fill_rar(UE, RAR_pdu, pusch_pdu);
+  nr_fill_rar(UE, RAR_subpdu, first, pusch_pdu);
 }
 
 static bool check_msg2_monitoring(const NR_SearchSpace_t *ss, int slots_per_frame, int current_frame, int current_slot)
@@ -1665,6 +1673,26 @@ static void prepare_dl_pdus(nr_cell_sched_t *cell,
   LOG_D(NR_MAC, "numDlDci: %i\n", pdcch_pdu_rel15->numDlDci);
 }
 
+/* Msg3 granted in a RAR: start the contention resolution timer in the Msg3 slot (38.321 5.1.5) */
+static void start_msg3_contention_resolution(const NR_ServingCellConfigCommon_t *scc, NR_UE_info_t *UE, frame_t frame, slot_t slot)
+{
+  NR_RA_t *ra = UE->ra;
+  if (ra->cfra)
+    return;
+  const NR_UE_UL_BWP_t *ul_bwp = &UE->current_UL_BWP;
+  LOG_D(NR_MAC, "UE %04x: %d.%d: Setting RA-Msg3 reception for SFN.Slot %d.%d\n", UE->rnti, frame, slot, ra->Msg3_frame, ra->Msg3_slot);
+  start_ra_contention_resolution_timer(
+      ra,
+      scc->uplinkConfigCommon->initialUplinkBWP->rach_ConfigCommon->choice.setup->ra_ContentionResolutionTimer,
+      *ul_bwp->tdaList_Common->list.array[ra->Msg3_tda_id]->k2 + get_NTN_Koffset(scc),
+      ul_bwp->scs);
+}
+
+/* RARs in one Msg2: the first and those of other preambles of the same RA-RNTI, as many as fit in the PDSCH at
+ * MCS NR_MSG2_MAX_MCS at most (QPSK, code rate about 0.3 in the 64QAM and 256QAM tables) */
+#define NR_MAX_RAR_PER_MSG2 8
+#define NR_MSG2_MAX_MCS 4
+
 // returns true if the UE must be released by the caller
 static bool nr_generate_Msg2(gNB_MAC_INST *nr_mac,
                              nr_cell_sched_t *cell,
@@ -1752,6 +1780,8 @@ static bool nr_generate_Msg2(gNB_MAC_INST *nr_mac,
   const uint16_t msg2_mask = SL_to_bitmap(tda_info.startSymbolIndex, tda_info.nrOfSymbols);
   bwp_info_t bwp_info = get_pdsch_bwp_start_size(cell, UE);
   uint16_t *vrb_map = cc->vrb_map[beam.idx];
+  /* the same PRBs whatever the number of RARs: they share the initial BWP with the other Msg2 and the Msg4, and 8 PRBs
+   * hold NR_MAX_RAR_PER_MSG2 RARs at NR_MSG2_MAX_MCS */
   if (!get_rb_alloc(msg2_nb_rb, msg2_nb_rb, bwp_info.bwpStart, bwp_info.bwpSize, vrb_map, msg2_mask, &rbStart, &rbSize)) {
     LOG_W(NR_MAC, "Cannot find free vrb_map for RA RNTI %04x!\n", ra->RA_rnti);
     reset_beam_status(&cell->beam_info, ra->Msg3_frame, ra->Msg3_slot, UE->UE_beam_index, n_slots_frame, ra->Msg3_beam.new_beam);
@@ -1807,18 +1837,90 @@ static bool nr_generate_Msg2(gNB_MAC_INST *nr_mac,
         ra->timing_offset,
         distance_in_meters);
 
+  // DL TX request
+  nfapi_nr_pdu_t *tx_req = &TX_req->pdu_list[TX_req->Number_of_PDUs];
+  uint8_t *rar_pdu = (uint8_t *)&tx_req->TLVs[0].value.direct[0];
+
+  // If CFRA: 38.321 §5.1.4 does not clearly say (to me) if UL grant should be
+  // dropped or not, and COTS UE would often send Msg3 if we configured CFRA
+  // but required Msg3. Also, "if RAR includes a MAC subPDU with RAPID: [...]
+  // indicate the reception of an acknowledgement for SI request to upper
+  // layers." which is not the case here.
+  nr_add_msg3(cell, frameP, slotP, UE, rar_pdu, true, beam.idx);
+  start_msg3_contention_resolution(scc, UE, frameP, slotP);
+  NR_RA_HEADER_RAPID *last_rapid = (NR_RA_HEADER_RAPID *)(rar_pdu + 1);
+  uint32_t rar_len = 2 + 7;
+
+  /* the other preambles of this occasion share the RA-RNTI: their UEs read this PDSCH and look for their RAPID in it
+   * (38.321 5.1.4, a MAC subPDU per RAPID, 6.1.5). Each gets its subPDU when its Msg3 fits, as for the first one */
+  int num_rar = 1;
+  NR_pdsch_dmrs_t dmrs_parms = get_dl_dmrs_params(scc, dl_bwp, &tda_info, 1);
+  const uint8_t mcsTableIdx = dl_bwp->mcsTableIdx;
+  const uint32_t max_bytes = nr_compute_tbs(nr_get_Qm_dl(NR_MSG2_MAX_MCS, mcsTableIdx),
+                                            nr_get_code_rate_dl(NR_MSG2_MAX_MCS, mcsTableIdx),
+                                            rbSize,
+                                            tda_info.nrOfSymbols,
+                                            dmrs_parms.N_PRB_DMRS * dmrs_parms.N_DMRS_SLOT,
+                                            0,
+                                            0,
+                                            1)
+                             >> 3;
+  /* BI subPDU 1 byte, then 1 + 7 bytes per RAR */
+  const int max_rar = min(NR_MAX_RAR_PER_MSG2, max(1, ((int)max_bytes - 1) / 8));
+  LOG_D(NR_MAC, "UE %04x: %d.%d Msg2 PDSCH RB %d+%d, up to %d RARs\n", UE->rnti, frameP, slotP, rbStart, rbSize, max_rar);
+  FOR_EACH_RA_UE(&nr_mac->UE_info, other) {
+    if (num_rar >= max_rar)
+      break;
+    NR_RA_t *ora = other->ra;
+    if (other == UE || other->pcell != cell || ora->ra_state != nrRA_Msg2 || ora->RA_rnti != ra->RA_rnti
+        || other->UE_beam_index != UE->UE_beam_index)
+      continue;
+    const int abs_rach = n_slots_frame * ora->preamble_frame + ora->preamble_slot;
+    const int abs_now = n_slots_frame * frameP + slotP;
+    if ((n_slots_frame * 1024 + abs_now - abs_rach) % (n_slots_frame * 1024) > get_response_window(rrc_ra_ResponseWindow))
+      continue; // out of its window: released by the RA loop
+    if (!get_feasible_msg3_tda(scc,
+                               get_delta_for_k2(other->current_UL_BWP.scs),
+                               other->current_UL_BWP.tdaList_Common,
+                               frameP,
+                               slotP,
+                               ora,
+                               &cell->beam_info,
+                               other->UE_beam_index,
+                               &cell->frame_structure)
+        || ora->Msg3_tda_id > 15)
+      continue;
+    if (!nr_get_Msg3alloc(cell, slotP, frameP, other)) {
+      reset_beam_status(&cell->beam_info, ora->Msg3_frame, ora->Msg3_slot, other->UE_beam_index, n_slots_frame, ora->Msg3_beam.new_beam);
+      continue;
+    }
+    last_rapid->E = 1;
+    last_rapid = (NR_RA_HEADER_RAPID *)(rar_pdu + rar_len);
+    nr_add_msg3(cell, frameP, slotP, other, rar_pdu + rar_len, false, beam.idx);
+    start_msg3_contention_resolution(scc, other, frameP, slotP);
+    rar_len += 1 + 7;
+    ora->ra_state = nrRA_WAIT_Msg3;
+    num_rar++;
+    LOG_A(NR_MAC,
+          "UE %04x: %d.%d RAR for RAPID %d in the Msg2 of RA-RNTI 0x%x (%d RARs)\n",
+          other->rnti,
+          frameP,
+          slotP,
+          ora->preamble_index,
+          ra->RA_rnti,
+          num_rar);
+  }
+
   // SCF222: PDU index incremented for each PDSCH PDU sent in TX control message. This is used to associate control
   // information to data and is reset every slot.
   const int pduindex = cell->pdu_index++;
-  uint8_t mcsTableIdx = dl_bwp->mcsTableIdx;
 
-  NR_pdsch_dmrs_t dmrs_parms = get_dl_dmrs_params(scc, dl_bwp, &tda_info, 1);
 
   int mcsIndex = -1; // initialization value
   uint8_t tb_scaling = 0;
   int R, Qm;
   uint32_t TBS = 0;
-  while (TBS < 9) { // min TBS for RAR is 9 bytes
+  while (TBS < rar_len) { // the BI subPDU and the RAR subPDUs
     mcsIndex++;
     R = nr_get_code_rate_dl(mcsIndex, mcsTableIdx);
     Qm = nr_get_Qm_dl(mcsIndex, mcsTableIdx);
@@ -1867,34 +1969,6 @@ static bool nr_generate_Msg2(gNB_MAC_INST *nr_mac,
                   tb_scaling,
                   pduindex);
 
-  // DL TX request
-  nfapi_nr_pdu_t *tx_req = &TX_req->pdu_list[TX_req->Number_of_PDUs];
-
-  // If CFRA: 38.321 §5.1.4 does not clearly say (to me) if UL grant should be
-  // dropped or not, and COTS UE would often send Msg3 if we configured CFRA
-  // but required Msg3. Also, "if RAR includes a MAC subPDU with RAPID: [...]
-  // indicate the reception of an acknowledgement for SI request to upper
-  // layers." which is not the case here.
-  nr_add_msg3(cell, frameP, slotP, UE, (uint8_t *)&tx_req->TLVs[0].value.direct[0], beam.idx);
-
-  if (!ra->cfra) {
-    LOG_D(NR_MAC,
-          "UE %04x: %d.%d: Setting RA-Msg3 reception for SFN.Slot %d.%d\n",
-          UE->rnti,
-          frameP,
-          slotP,
-          ra->Msg3_frame,
-          ra->Msg3_slot);
-
-    // Start RA contention resolution timer in Msg3 transmission slot (current slot + K2)
-    // 3GPP TS 38.321 Section 5.1.5 Contention Resolution
-    start_ra_contention_resolution_timer(
-        ra,
-        scc->uplinkConfigCommon->initialUplinkBWP->rach_ConfigCommon->choice.setup->ra_ContentionResolutionTimer,
-        *ul_bwp->tdaList_Common->list.array[ra->Msg3_tda_id]->k2 + get_NTN_Koffset(scc),
-        ul_bwp->scs);
-
-  }
 
   tx_req->PDU_index = pduindex;
   tx_req->num_TLV = 1;
@@ -2065,7 +2139,11 @@ static void nr_generate_Msg4_MsgB(gNB_MAC_INST *nr_mac,
 
     int r_pucch = nr_get_pucch_resource(coreset, UE->current_UL_BWP.pucch_Config, CCEIndex);
     LOG_D(NR_MAC, "Msg4 r_pucch %d CCEIndex %d\n", r_pucch, CCEIndex);
-    int alloc = nr_acknack_scheduling(cell, UE, frameP, slotP, UE->UE_beam_index, r_pucch, 1);
+    /* 3gpp scheduler: 38.213 8.4 in symbols; legacy: minRXTXTIME slots */
+    const int earliest = cell->sched3gpp_ra_rules
+                             ? sched3gpp_msg4_earliest_pucch_symbol(cell, UE, frameP, slotP, msg4_tda.startSymbolIndex, msg4_tda.nrOfSymbols)
+                             : -1;
+    int alloc = nr_acknack_scheduling_from(cell, UE, frameP, slotP, UE->UE_beam_index, r_pucch, 1, earliest);
     if (alloc < 0) {
       LOG_D(NR_MAC,"Couldn't find a pucch allocation for ack nack (msg4) in frame %d slot %d\n", frameP, slotP);
       reset_beam_status(&cell->beam_info, frameP, slotP, UE->UE_beam_index, n_slots_frame, beam.new_beam);
