@@ -284,6 +284,9 @@ static nr_pucch_radio_res_t get_nb_periodic_pucch_per_slot(const frame_structure
   int nb_cycles = periodicity / fs->numb_slots_period;
   int available_report_occasions = nb_cycles * ul_slots_period;
   res.nb_periodic_res = (max_csi_reports + available_report_occasions - 1) / available_report_occasions;
+  // each report of a UE uses its own block of ceil(MAX_MOBILES_PER_GNB / nb_periodic_res) occasions (set_csi_meas_periodicity)
+  while (reports_per_ue * ((MAX_MOBILES_PER_GNB + res.nb_periodic_res - 1) / res.nb_periodic_res) > available_report_occasions)
+    res.nb_periodic_res++;
   res.periodicity = periodicity;
   return res;
 }
@@ -1964,7 +1967,7 @@ static nr_pucch_radio_res_t size_pucch_radio_resources(const frame_structure_t *
       diff_prb = bwp_size - required_prbs;
       int nb_cycles = res.periodicity / fs->numb_slots_period;
       int available_report_occasions = nb_cycles * get_ul_slots_per_period(fs);
-      res.max_served_ues = (res.nb_periodic_res * available_report_occasions) / reports_per_ue;
+      res.max_served_ues = res.nb_periodic_res * (available_report_occasions / reports_per_ue);
       if (diff_prb >= 0)
         return res;
     }
@@ -2247,8 +2250,11 @@ static void set_csi_meas_periodicity(const frame_structure_t *fs,
                                      int uid,
                                      bool is_rsrp)
 {
-  int rep_idx = is_rsrp ? uid : MAX_MOBILES_PER_GNB + uid;
-  int idx = rep_idx / pucch_res->nb_periodic_res;
+  // the SR and the first report of UE uid use occasion uid / nb_periodic_res of periodic resource uid % nb_periodic_res;
+  // the second report uses the next block of occasions, so two UEs never share a periodic resource occasion
+  const int nb_res = pucch_res->nb_periodic_res;
+  const int occasions_per_report = (pucch_res->max_served_ues + nb_res - 1) / nb_res;
+  int idx = (is_rsrp ? 0 : occasions_per_report) + uid / nb_res;
   int offset = get_ul_slot_offset(fs, idx, true);
   LOG_D(NR_MAC, "set_csi_meas_periodicity: uid = %d, offset = %d, ideal_period = %d\n", uid, offset, pucch_res->periodicity);
   // checked for validity in verify_radio_configuration
