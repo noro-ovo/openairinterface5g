@@ -4386,6 +4386,13 @@ int get_f3_dmrs_symbols(NR_PUCCH_Resource_t *pucchres, NR_PUCCH_Config_t *pucch_
   return f3_dmrs_symbols;
 }
 
+/* true if O_uci UCI bits and their CRC fit in nr_prbs PRBs of a PUCCH format 2/3 resource (38.213 9.2.5.2) */
+bool pucch_uci_fits(uint8_t nr_prbs, int O_uci, NR_PUCCH_MaxCodeRate_t *maxCodeRate, uint8_t Qm, uint8_t n_symb, uint8_t n_re_ctrl)
+{
+  int O_tot = O_uci + compute_pucch_crc_size(O_uci);
+  return O_tot <= nr_prbs * n_re_ctrl * n_symb * Qm * get_max_code_rate(maxCodeRate);
+}
+
 uint16_t compute_pucch_prb_size(uint8_t nr_prbs,
                                 uint16_t O_csi,
                                 uint16_t O_ack,
@@ -4407,7 +4414,7 @@ uint16_t compute_pucch_prb_size(uint8_t nr_prbs,
 
   float r = get_max_code_rate(maxCodeRate);
 
-  AssertFatal(O_tot <= (nr_prbs * n_re_ctrl * n_symb * Qm * r),
+  AssertFatal(pucch_uci_fits(nr_prbs, O_uci, maxCodeRate, Qm, n_symb, n_re_ctrl),
               "MaxCodeRate %.2f can't support %d UCI bits and %d CRC bits with %d PRBs",
               r,
               O_uci,
