@@ -416,6 +416,11 @@ static void ack_reconfig(nr_cell_sched_t *cell, NR_UE_info_t *UE)
   configure_UE_BWP(cell, scc, UE, false, NR_SearchSpace__searchSpaceType_PR_common, -1, -1);
 }
 
+feedback_action_t nr_dl_reconfig_action(void)
+{
+  return ack_reconfig;
+}
+
 static bool dlsch_to_schedule(const NR_UE_sched_ctrl_t *sched_ctrl)
 {
   /* Check DL buffer, TA to be sent and  beam switch needed*/
@@ -429,12 +434,12 @@ static bool dlsch_to_schedule(const NR_UE_sched_ctrl_t *sched_ctrl)
   return false;
 }
 
-static int collect_dl_candidates(nr_cell_sched_t *cell,
-                                 NR_UEs_t *UEs,
-                                 nr_dl_candidate_t *candidates,
-                                 int max_candidates,
-                                 frame_t frame,
-                                 slot_t slot)
+int nr_dl_collect_candidates(nr_cell_sched_t *cell,
+                             NR_UEs_t *UEs,
+                             nr_dl_candidate_t *candidates,
+                             int max_candidates,
+                             frame_t frame,
+                             slot_t slot)
 {
   int n = 0;
   const frame_structure_t *fs = &cell->frame_structure;
@@ -736,7 +741,7 @@ static void nr_dl_schedule(gNB_MAC_INST *mac,
 
   /* Step 1: Collect candidates */
   nr_dl_candidate_t candidates[MAX_MOBILES_PER_GNB] = {0};
-  int n = collect_dl_candidates(cell, UEs, candidates, MAX_MOBILES_PER_GNB, frame, slot);
+  int n = nr_dl_collect_candidates(cell, UEs, candidates, MAX_MOBILES_PER_GNB, frame, slot);
   if (n == 0)
     return;
 

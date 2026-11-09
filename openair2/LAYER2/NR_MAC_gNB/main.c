@@ -15,6 +15,8 @@
 #include "NR_DRB-ToAddMod.h"
 #include "NR_DRB-ToAddModList.h"
 #include "mac_proto.h"
+#include "sched/sched_dl.h"
+#include "sched/sched_ul.h"
 #include "mac_rrc_ul.h"
 #include "nr_mac_gNB.h"
 #include "common/utils/utils.h"
@@ -311,6 +313,12 @@ gNB_MAC_INST *mac_top_init_gNB(ngran_node_t node_type, const nr_rlc_configuratio
   } else {
     nrmac->pre_processor_dl = nr_dlsch_preprocessor;
     nrmac->pre_processor_ul = nr_ulsch_preprocessor;
+    /* the 3gpp scheduler: OAI_SCHED=3gpp for DL and UL, 3gpp-dl for DL only */
+    const char *sched = getenv("OAI_SCHED");
+    if (sched && (strcmp(sched, "3gpp") == 0 || strcmp(sched, "3gpp-dl") == 0))
+      nrmac->pre_processor_dl = sched3gpp_dl_preprocessor;
+    if (sched && strcmp(sched, "3gpp") == 0)
+      nrmac->pre_processor_ul = sched3gpp_ul_preprocessor;
     nrmac->dl_ri_pmi_select = nr_dl_ri_pmi_select_default;
     nrmac->dl_mcs_select = nr_dl_mcs_select_default;
     nrmac->dl_beam_select = nr_dl_beam_select_default;

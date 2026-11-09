@@ -2067,7 +2067,7 @@ uint16_t check_ul_retx_feasibility(const nr_ul_candidate_t *cand,
  * Retx feasibility was validated by ul_tda_select (retx_rbSize set on cand).
  * RBs + CCE were validated by the policy via commit_ul_alloc.
  * Returns rbSize used. */
-static int apply_ul_retransmission(gNB_MAC_INST *nrmac,
+int nr_ul_apply_retransmission(gNB_MAC_INST *nrmac,
                                    nr_cell_sched_t *cell,
                                    post_process_pusch_t *pp_pusch,
                                    const nr_ul_candidate_t *cand,
@@ -2144,7 +2144,7 @@ static int apply_ul_retransmission(gNB_MAC_INST *nrmac,
  * tb_size, dmrs_info, bwp_info), calls post_process_ulsch, marks VRB map.
  * CCE and PDCCH VRB map are already handled by commit_ul_alloc.
  * Returns rbSize used. */
-static int apply_ul_new_transmission(gNB_MAC_INST *nrmac,
+int nr_ul_apply_new_transmission(gNB_MAC_INST *nrmac,
                                      nr_cell_sched_t *cell,
                                      post_process_pusch_t *pp_pusch,
                                      const nr_ul_candidate_t *cand,
@@ -2355,7 +2355,7 @@ static int nr_ul_schedule(gNB_MAC_INST *nrmac,
     /* Use per-candidate TDA — each candidate carries its own sched_pusch.time_domain_allocation/tda_info */
     int rbSize_used;
     if (cand->is_retx) {
-      rbSize_used = apply_ul_retransmission(nrmac,
+      rbSize_used = nr_ul_apply_retransmission(nrmac,
                                             cell,
                                             pp_pusch,
                                             cand,
@@ -2368,7 +2368,7 @@ static int nr_ul_schedule(gNB_MAC_INST *nrmac,
                                             sched_slot);
     } else {
       uint16_t cand_slbitmap = SL_to_bitmap(cand->sched_pusch.tda_info.startSymbolIndex, cand->sched_pusch.tda_info.nrOfSymbols);
-      rbSize_used = apply_ul_new_transmission(nrmac,
+      rbSize_used = nr_ul_apply_new_transmission(nrmac,
                                               cell,
                                               pp_pusch,
                                               cand,
@@ -2802,7 +2802,7 @@ static int nr_ue_max_ul_inactivity_slots(const frame_structure_t *fs, int ulsch_
   return ulsch_max_frame_inactivity > 0 ? ulsch_max_frame_inactivity * fs->numb_slots_frame : fs->numb_slots_period;
 }
 
-static int collect_ul_candidates(gNB_MAC_INST *mac,
+int nr_ul_collect_candidates(gNB_MAC_INST *mac,
                                  nr_cell_sched_t *cell,
                                  NR_UEs_t *UEs,
                                  nr_ul_candidate_t *candidates,
@@ -3023,7 +3023,7 @@ void nr_ulsch_preprocessor(gNB_MAC_INST *nr_mac, nr_cell_sched_t *cell, post_pro
      * HARQ processes, bumps sched_ul_bytes) so a stale snapshot would cause
      * double-grants and retx on already-dispatched HARQ PIDs. */
     nr_ul_candidate_t candidates[MAX_MOBILES_PER_GNB] = {0};
-    int n_cand = collect_ul_candidates(nr_mac,
+    int n_cand = nr_ul_collect_candidates(nr_mac,
                                        cell,
                                        &nr_mac->UE_info,
                                        candidates,
