@@ -933,6 +933,9 @@ void generateRegistrationRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas,
 
   // 5GMM Registration Type
   rr->fgsregistrationtype = set_fgs_registration_type(nas);
+  /* TS 24.501 5.5.1.2.2: the UE enters 5GMM-REGISTERED-INITIATED when it sends an initial REGISTRATION REQUEST */
+  if (rr->fgsregistrationtype == INITIAL_REGISTRATION)
+    nas->fiveGMM_state = FGS_REGISTERED_INITIATED;
   size += 1;
   if (rr->fgsregistrationtype == REG_TYPE_RESERVED) {
     // currently only REG_TYPE_RESERVED is supported
@@ -1659,6 +1662,12 @@ static void generateRegistrationComplete(nr_ue_nas_t *nas,
   }
   /* Set NAS 5GMM state */
   nas->fiveGMM_state = FGS_REGISTERED;
+  /* TS 24.501 5.5.1.2.4: REGISTRATION ACCEPT resets the registration attempt counter */
+  nas->registration_attempts = 0;
+  if (nas->registration_retry_timer) {
+    timer_remove(nas->registration_retry_timer);
+    nas->registration_retry_timer = 0;
+  }
 }
 
 /** @brief Configuration Update Complete (24.501 8.2.20): plain 5GMM header only, integrity protected and ciphered */
@@ -2790,6 +2799,42 @@ static void handle_registration_reject(nr_ue_nas_t *nas, const byte_array_t *buf
   send_nas_detach_req(nas, false);
 }
 
+/* TS 24.501 5.5.1.2.7 a): the NAS signalling connection is released before REGISTRATION ACCEPT or REJECT. The UE
+ * aborts the initial registration, increments the registration attempt counter and starts T3511 (counter < 5) or
+ * T3502 (counter = 5); it initiates the registration again when the timer expires */
+static void abort_initial_registration(nr_ue_nas_t *nas)
+{
+  nas->fiveGMM_state = FGS_DEREGISTERED;
+  if (nas->registration_attempts < 5)
+    nas->registration_attempts++;
+  const int seconds = nas->registration_attempts < 5 ? 10 : 720; // T3511, T3502 default (TS 24.501 Table 10.2.1)
+  if (nas->registration_retry_timer)
+    timer_remove(nas->registration_retry_timer);
+  timer_setup(seconds, 0, TASK_NAS_NRUE, nas->UE_id, TIMER_ONE_SHOT, NULL, &nas->registration_retry_timer);
+  LOG_W(NAS,
+        "[UE %ld] connection released before registration completed: attempt %d, registration again in %d s (T%s)\n",
+        nas->UE_id,
+        nas->registration_attempts,
+        seconds,
+        nas->registration_attempts < 5 ? "3511" : "3502");
+}
+
+static void registration_retry_timer_expired(nr_ue_nas_t *nas, long timer_id)
+{
+  if (timer_id != nas->registration_retry_timer)
+    return;
+  nas->registration_retry_timer = 0;
+  if (nas->fiveGMM_state != FGS_DEREGISTERED || nas->fiveGMM_mode != FGS_IDLE || nas->termination_procedure)
+    return;
+  as_nas_info_t initialNasMsg = {0};
+  generateRegistrationRequest(&initialNasMsg, nas, false);
+  LOG_I(NAS,
+        "[UE %ld] T3511/T3502 expired: Registration Request sent to RRC (attempt %d)\n",
+        nas->UE_id,
+        nas->registration_attempts + 1);
+  send_nas_initial_ul_transfer_req(nas, &initialNasMsg);
+}
+
 void *nas_nrue(void *args_p)
 {
   UNUSED(args_p);
@@ -2810,6 +2855,10 @@ void *nas_nrue(void *args_p)
         break;
 
       case MESSAGE_TEST:
+        break;
+
+      case TIMER_HAS_EXPIRED:
+        registration_retry_timer_expired(nas, TIMER_HAS_EXPIRED(msg_p).timer_id);
         break;
 
       case NAS_CELL_SELECTION_CNF:
@@ -2931,7 +2980,8 @@ void *nas_nrue(void *args_p)
            If SR incomplete (5GMM-SERVICE-REQUEST-INITIATED) §5.6.1.7 l): abort SR, enter 5GMM-REGISTERED */
         abort_service_request(nas);
         nas->fiveGMM_mode = FGS_IDLE;
-        // TODO handle connection release
+        if (nas->fiveGMM_state == FGS_REGISTERED_INITIATED && !nas->termination_procedure)
+          abort_initial_registration(nas);
         if (nas->termination_procedure && !nas->terminated) {
           nas->terminated = true;
           /* several UEs can run in one process: stop it only when all of them terminated,
