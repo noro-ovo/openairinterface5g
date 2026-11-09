@@ -2890,7 +2890,8 @@ static int collect_ul_candidates(gNB_MAC_INST *mac,
     } else
       cand.sched_srs = 0;
     cand.retx_harq_pid = -1;
-    cand.sched_long_inactivity = long_inactivity;
+    /* a UE with data gets a grant sized for its data, a default grant only when it has none (B == 0) */
+    cand.sched_long_inactivity = long_inactivity && B == 0;
     cand.pending_bytes = B;
     cand.bler = sched_ctrl->ul_bler_stats.bler;
     cand.bler_updated = bler_updated;
