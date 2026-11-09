@@ -1438,6 +1438,12 @@ int get_format0(uint8_t index, uint8_t unpaired, frequency_range_t frequency_ran
   return format;
 }
 
+// SearchSpace nrofCandidates (38.331): ENUMERATED {n0, n1, n2, n3, n4, n5, n6, n8}, the same values at every aggregation level
+static int nr_of_pdcch_candidates(long nrof_candidates)
+{
+  return nrof_candidates == NR_SearchSpace__nrofCandidates__aggregationLevel1_n8 ? 8 : nrof_candidates;
+}
+
 void find_aggregation_candidates(int *aggregation_level, int *nr_of_candidates, const NR_SearchSpace_t *ss, int L)
 {
   AssertFatal(L >= 1 && L <= 16,"L %d not ok\n", L);
@@ -1446,31 +1452,31 @@ void find_aggregation_candidates(int *aggregation_level, int *nr_of_candidates, 
     case 1:
       if (ss->nrofCandidates->aggregationLevel1 != NR_SearchSpace__nrofCandidates__aggregationLevel1_n0) {
         *aggregation_level = 1;
-        *nr_of_candidates = ss->nrofCandidates->aggregationLevel1;
+        *nr_of_candidates = nr_of_pdcch_candidates(ss->nrofCandidates->aggregationLevel1);
       }
       break;
     case 2:
       if (ss->nrofCandidates->aggregationLevel2 != NR_SearchSpace__nrofCandidates__aggregationLevel2_n0) {
         *aggregation_level = 2;
-        *nr_of_candidates = ss->nrofCandidates->aggregationLevel2;
+        *nr_of_candidates = nr_of_pdcch_candidates(ss->nrofCandidates->aggregationLevel2);
       }
       break;
     case 4: 
        if (ss->nrofCandidates->aggregationLevel4 != NR_SearchSpace__nrofCandidates__aggregationLevel4_n0) {
          *aggregation_level = 4;
-         *nr_of_candidates = ss->nrofCandidates->aggregationLevel4;
+         *nr_of_candidates = nr_of_pdcch_candidates(ss->nrofCandidates->aggregationLevel4);
        }
        break;
     case 8:
        if (ss->nrofCandidates->aggregationLevel8 != NR_SearchSpace__nrofCandidates__aggregationLevel8_n0) {
          *aggregation_level = 8;
-         *nr_of_candidates = ss->nrofCandidates->aggregationLevel8;
+         *nr_of_candidates = nr_of_pdcch_candidates(ss->nrofCandidates->aggregationLevel8);
        }
        break;
     case 16:
        if (ss->nrofCandidates->aggregationLevel16 != NR_SearchSpace__nrofCandidates__aggregationLevel16_n0) {
          *aggregation_level = 16;
-         *nr_of_candidates = ss->nrofCandidates->aggregationLevel16;
+         *nr_of_candidates = nr_of_pdcch_candidates(ss->nrofCandidates->aggregationLevel16);
        }
        break;
   } 
