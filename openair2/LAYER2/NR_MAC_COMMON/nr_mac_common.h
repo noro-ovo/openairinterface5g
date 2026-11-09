@@ -343,6 +343,8 @@ uint8_t get_pusch_nb_antenna_ports(NR_PUSCH_Config_t *pusch_Config,
                                    NR_SRS_Config_t *srs_config,
                                    dci_field_t srs_resource_indicator);
 
+bool pucch_uci_fits(uint8_t nr_prbs, int O_uci, NR_PUCCH_MaxCodeRate_t *maxCodeRate, uint8_t Qm, uint8_t n_symb, uint8_t n_re_ctrl);
+
 uint16_t compute_pucch_prb_size(uint8_t nr_prbs,
                                 uint16_t O_csi,
                                 uint16_t O_ack,
