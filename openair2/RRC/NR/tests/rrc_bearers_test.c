@@ -366,6 +366,46 @@ static void test_rrc_qos(void)
   LOG_A(NR_RRC, "QoS test completed successfully\n");
 }
 
+/* Removal of the DRBs a PDU session no longer maps any QoS flow to (PDU Session Modify releasing QoS
+ * flows). DRBs 1..4 belong to PDU session 11; after the release only DRB 1 still carries a flow, so
+ * DRBs 2, 3 and 4 must go, including the last element of the list, and their IDs must be reported. */
+static void test_rrc_remove_unmapped_drbs(void)
+{
+  LOG_I(NR_RRC, "Starting unmapped DRB removal test\n");
+  const int psi = 11;
+  seq_arr_t drbs = {0};
+  seq_arr_init(&drbs, sizeof(drb_t));
+  nr_pdcp_configuration_t pdcp = {.drb.discard_timer = 100, .drb.sn_size = 18, .drb.t_reordering = 50};
+  for (int i = 0; i < 4; i++)
+    AssertFatal(nr_rrc_add_drb(&drbs, psi, &pdcp), "add DRB %d failed\n", i + 1);
+
+  pdusession_t s = {0};
+  s.pdusession_id = psi;
+  seq_arr_init(&s.qos, sizeof(nr_rrc_qos_t));
+  nr_rrc_qos_t q = {.drb_id = 1};
+  seq_arr_push_back(&s.qos, &q, sizeof(q));
+
+  int removed[MAX_DRBS_PER_UE];
+  int n = nr_rrc_remove_unmapped_drbs(&drbs, &s, removed, MAX_DRBS_PER_UE);
+  AssertFatal(n == 3, "removed %d DRBs, expected 3\n", n);
+  bool seen[MAX_DRBS_PER_UE + 1] = {false};
+  for (int i = 0; i < n; i++) {
+    AssertFatal(removed[i] >= 2 && removed[i] <= 4, "reported removed DRB ID %d, expected 2..4\n", removed[i]);
+    AssertFatal(!seen[removed[i]], "DRB ID %d reported twice\n", removed[i]);
+    seen[removed[i]] = true;
+  }
+  AssertFatal(seq_arr_size(&drbs) == 1, "%zu DRBs left, expected 1\n", seq_arr_size(&drbs));
+  AssertFatal(get_drb(&drbs, 1) != NULL, "DRB 1 (still mapped) was removed\n");
+
+  /* nothing left to remove: no change */
+  n = nr_rrc_remove_unmapped_drbs(&drbs, &s, removed, MAX_DRBS_PER_UE);
+  AssertFatal(n == 0 && seq_arr_size(&drbs) == 1, "second pass removed %d DRBs\n", n);
+
+  seq_arr_free(&s.qos, NULL);
+  seq_arr_free(&drbs, free_drb);
+  LOG_A(NR_RRC, "Unmapped DRB removal test passed\n");
+}
+
 int main()
 {
   // Initialize logging system
@@ -378,6 +418,8 @@ int main()
   test_rrc_drb();
   // QoS (including multi-QoS)
   test_rrc_qos();
+  // DRB removal after QoS flow release
+  test_rrc_remove_unmapped_drbs();
   LOG_A(NR_RRC, "All RRC Bearers tests passed successfully!\n");
   return 0;
 }

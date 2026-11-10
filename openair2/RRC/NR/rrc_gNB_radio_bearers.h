@@ -54,6 +54,11 @@ drb_t *find_drb_by_pdusession_id(seq_arr_t *seq, int pdusession_id);
 /// @brief Remove DRB with given @param drb_id from the list
 bool nr_rrc_remove_drb_by_id(seq_arr_t *drb_ptr, const int drb_id);
 
+/// @brief Remove the DRBs of PDU session @param session that no QoS flow of the session maps to.
+/// The IDs of the removed DRBs are written to @param removed (capacity @param max).
+/// @return number of removed DRBs
+int nr_rrc_remove_unmapped_drbs(seq_arr_t *drbs, const pdusession_t *session, int removed[], int max);
+
 /// @brief Add PDU Sessions and DRBs to UE context list
 void nr_rrc_add_bearers(gNB_RRC_INST *rrc, gNB_RRC_UE_t *UE, int n, pdusession_t *sessions);
 
