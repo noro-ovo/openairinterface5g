@@ -1846,6 +1846,8 @@ static void handle_pdu_session_accept(nr_ue_nas_t *nas, uint8_t *pdu_buffer, uin
               "invalid PDU session ID %d\n",
               sm_header.pdu_session_id);
   nas_ue_pdu_tun_t *t = &nas->pdu_tun[sm_header.pdu_session_id];
+  // a new PDU session: no QoS rule of an earlier one with this ID
+  nr_sdap_qos_rules_forget(nas->UE_id, sm_header.pdu_session_id);
 
   // Set QFI before starting UE interface thread to avoid early SDUs using 0-initialized QFI.
   nr_ue_tun_store_qfi(t, msg.qos_rules.rule->qfi);

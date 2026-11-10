@@ -32,16 +32,15 @@ instance_t *N3GTPUInst = NULL;
 
 /** @brief Tear down gNB TUN dataplane for one SDAP entity
  * Skip UE entities: NAS owns the TUN fd so it survives SDAP delete in 5GMM-IDLE
- * (needed for MO Service Request UL and re-bind after UP restore, TS 24.501 clause 5.6.1) */
+ * (needed for MO Service Request UL and re-bind after UP restore, TS 24.501 clause 5.6.1).
+ * The UE's QoS rules are handled by the callers: freed with the PDU session, kept over an RRC release. */
 static void remove_ip_if(nr_sdap_entity_t *entity)
 {
   DevAssert(entity != NULL);
   sdap_tun_endpoint_t *tun = &entity->tun;
 
-  if (!tun->is_gnb) {
-    nr_sdap_qos_rules_free(entity);
+  if (!tun->is_gnb)
     return; /* UE: NAS owns the TUN fd, do not close/destroy */
-  }
   if (tun->sock < 0)
     return;
 
@@ -608,6 +607,76 @@ static void nr_sdap_ue_qfi2drb_map_update(nr_sdap_entity_t *entity, const sdap_c
   nr_sdap_qfi2drb_map_update(entity, sdap);
 }
 
+/* UE: the authorized QoS rules of a PDU session belong to its 5GSM context, which stays while the UE is in CM-IDLE
+ * (TS 24.501 6.1.1, 6.4.1); the SDAP entities go with the RRC connection. The rules of an entity deleted at RRC
+ * release are kept here and handed to the entity of the same PDU session created on the next connection. */
+typedef struct kept_qos_rules_s {
+  ue_id_t ue_id;
+  int pdusession_id;
+  seq_arr_t rules;
+  bool use_packet_filters;
+  struct kept_qos_rules_s *next;
+} kept_qos_rules_t;
+static kept_qos_rules_t *kept_qos_rules;
+static pthread_mutex_t kept_lock = PTHREAD_MUTEX_INITIALIZER;  /* NAS (forget) and RRC (release, new entity) threads */
+
+static kept_qos_rules_t **kept_find(ue_id_t ue_id, int pdusession_id)
+{
+  kept_qos_rules_t **pp = &kept_qos_rules;
+  while (*pp && ((*pp)->ue_id != ue_id || (*pp)->pdusession_id != pdusession_id))
+    pp = &(*pp)->next;
+  return pp;
+}
+
+static void kept_free(kept_qos_rules_t **pp)
+{
+  kept_qos_rules_t *k = *pp;
+  *pp = k->next;
+  nr_sdap_entity_t tmp = {.qos_rules = k->rules};
+  pthread_mutex_init(&tmp.qos_rules_lock, NULL);
+  nr_sdap_qos_rules_free(&tmp);
+  free(k);
+}
+
+static void kept_forget_locked(ue_id_t ue_id, int pdusession_id)
+{
+  kept_qos_rules_t **pp = kept_find(ue_id, pdusession_id);
+  if (*pp) {
+    LOG_I(SDAP, "UE %ld PDU session %d: QoS rules kept from the previous connection dropped\n", ue_id, pdusession_id);
+    kept_free(pp);
+  }
+}
+
+void nr_sdap_qos_rules_forget(ue_id_t ue_id, int pdusession_id)
+{
+  pthread_mutex_lock(&kept_lock);
+  kept_forget_locked(ue_id, pdusession_id);
+  pthread_mutex_unlock(&kept_lock);
+}
+
+/* UE: an entity goes with the RRC connection, its QoS rules stay (a previous set of the same session is replaced) */
+static void nr_sdap_ue_keep_qos_rules(nr_sdap_entity_t *entity)
+{
+  pthread_mutex_lock(&kept_lock);
+  kept_forget_locked(entity->tun.ue_id, entity->tun.pdusession_id);
+  if (seq_arr_size(&entity->qos_rules) == 0) {
+    pthread_mutex_unlock(&kept_lock);
+    nr_sdap_qos_rules_free(entity);
+    return;
+  }
+  kept_qos_rules_t *k = calloc_or_fail(1, sizeof(*k));
+  k->ue_id = entity->tun.ue_id;
+  k->pdusession_id = entity->tun.pdusession_id;
+  memcpy(&k->rules, &entity->qos_rules, sizeof(k->rules));  /* seq_arr_t has const members */
+  k->use_packet_filters = entity->use_packet_filters;
+  k->next = kept_qos_rules;
+  kept_qos_rules = k;
+  pthread_mutex_unlock(&kept_lock);
+  pthread_mutex_destroy(&entity->qos_rules_lock);
+  LOG_I(SDAP, "UE %ld PDU session %d: %ld QoS rules kept over the RRC release\n", k->ue_id, k->pdusession_id,
+        (long)seq_arr_size(&k->rules));
+}
+
 /**
  * @brief   add a new SDAP entity according to 5.1.1. of 3GPP TS 37.324
  * @note    there is one SDAP entity per PDU session
@@ -641,9 +710,23 @@ static void nr_sdap_add_entity(const int is_gnb, const ue_id_t ue_id, const sdap
   sdap_entity->qfi2drb_map = nr_sdap_qfi2drb;
   sdap_entity->tun.sock = -1;
 
-  // Initialize QoS rules for UL packet filter matching at UE
-  if (!is_gnb)
+  // Initialize QoS rules for UL packet filter matching at UE, with those the PDU session had before the RRC release
+  if (!is_gnb) {
     nr_sdap_qos_rules_init(sdap_entity);
+    pthread_mutex_lock(&kept_lock);
+    kept_qos_rules_t **pp = kept_find(ue_id, sdap->pdusession_id);
+    kept_qos_rules_t *k = *pp;
+    if (k)
+      *pp = k->next;
+    pthread_mutex_unlock(&kept_lock);
+    if (k) {
+      seq_arr_free(&sdap_entity->qos_rules, NULL);
+      memcpy(&sdap_entity->qos_rules, &k->rules, sizeof(k->rules));
+      sdap_entity->use_packet_filters = k->use_packet_filters;
+      LOG_I(SDAP, "UE %ld PDU session %d: %ld QoS rules restored\n", ue_id, sdap->pdusession_id, (long)seq_arr_size(&k->rules));
+      free(k);
+    }
+  }
 
   // set default DRB
   if (sdap->defaultDRB) {
@@ -781,6 +864,8 @@ bool nr_sdap_delete_entity(ue_id_t ue_id, int pdusession_id)
       continue;
     *pp = entity->next_entity;
     remove_ip_if(entity);
+    if (!entity->tun.is_gnb)
+      nr_sdap_qos_rules_free(entity);  /* the PDU session itself goes */
     free(entity);
     LOG_D(SDAP, "Successfully deleted SDAP entity for UE %lx and PDU Session id %d\n", ue_id, pdusession_id);
     return true;
@@ -807,6 +892,8 @@ bool nr_sdap_delete_ue_entities(ue_id_t ue_id)
     }
     *pp = entity->next_entity;
     remove_ip_if(entity);
+    if (!entity->tun.is_gnb)
+      nr_sdap_ue_keep_qos_rules(entity);  /* RRC release: the PDU sessions stay */
     free(entity);
     LOG_I(SDAP, "Successfully deleted SDAP entity for UE %ld\n", ue_id);
     ret = true;
