@@ -441,7 +441,7 @@ static bool schedule_ue(gNB_MAC_INST *mac, nr_cell_sched_t *cell, post_process_p
   } else {
     s.mcs = mcs;
     /* what the UE statistics print */
-    sc->dl_bler_stats.mcs = mcs;
+    cand->UE->mac_stats.dl.mcs = mcs;
     s.Qm = nr_get_Qm_dl(mcs, bwp->mcsTableIdx);
     s.R = nr_get_code_rate_dl(mcs, bwp->mcsTableIdx);
     s.tb_size = tbs_bits / 8;
