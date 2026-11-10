@@ -1903,15 +1903,18 @@ static bool nr_generate_Msg2(gNB_MAC_INST *nr_mac,
     const int abs_now = n_slots_frame * frameP + slotP;
     if ((n_slots_frame * 1024 + abs_now - abs_rach) % (n_slots_frame * 1024) > get_response_window(rrc_ra_ResponseWindow))
       continue; // out of its window: released by the RA loop
-    if (!get_feasible_msg3_tda(scc,
+    int o_bwp_start, o_bwp_size;
+    get_msg3_bwp(other, &o_bwp_start, &o_bwp_size);
+    if (!get_feasible_msg3_tda(cell,
                                get_delta_for_k2(other->current_UL_BWP.scs),
                                other->current_UL_BWP.tdaList_Common,
                                frameP,
                                slotP,
                                ora,
-                               &cell->beam_info,
                                other->UE_beam_index,
-                               &cell->frame_structure)
+                               max(8, cell->min_grant_prb), // as nr_get_Msg3alloc()
+                               o_bwp_start,
+                               o_bwp_size)
         || ora->Msg3_tda_id > 15)
       continue;
     if (!nr_get_Msg3alloc(cell, slotP, frameP, other)) {

@@ -489,7 +489,7 @@ static bool schedule_ue(gNB_MAC_INST *mac,
     nr_ul_apply_retransmission(mac, cell, pp, cand, scc, c.tda, &c.info, rballoc_mask, bi, sched_frame, sched_slot);
   } else {
     cand->sched_pusch.mcs = mcs;
-    sc->ul_bler_stats.mcs = mcs;
+    cand->UE->mac_stats.ul.mcs = mcs;
     /* the TPMI chosen by mac->ul_ri_tpmi_select belongs to its rank: when transform precoding brings the
      * rank down to 1, TPMI 0 */
     const int layers = ul_layers(cand);
