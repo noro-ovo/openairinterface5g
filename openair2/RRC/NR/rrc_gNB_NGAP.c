@@ -1017,31 +1017,24 @@ static void nr_rrc_send_e1_after_qos_update(gNB_RRC_UE_t *UE,
   // Find or create PDU session entry in e1_req
   pdu_session_to_mod_t *pdu_mod = find_or_add_pdu_session_mod(e1_req, dst->pdusession_id);
 
-  // Check if any remaining QoS for this PDU session still references the same DRB
+  // Remove the DRBs no remaining QoS flow of this PDU session maps to, and add them to e1_req
+  int removed[MAX_DRBS_PER_UE];
+  const int n_removed = nr_rrc_remove_unmapped_drbs(&UE->drbs, dst, removed, MAX_DRBS_PER_UE);
+  for (int i = 0; i < n_removed; i++) {
+    LOG_I(NR_RRC,
+          "UE %d: removed DRB ID %d for PDU session %d (no remaining QoS flows mapped)\n",
+          UE->rrc_ue_id,
+          removed[i],
+          dst->pdusession_id);
+    DevAssert(pdu_mod->n_drb_to_remove < E1AP_MAX_NUM_DRBS);
+    drb_to_remove_t *rem = &pdu_mod->drbs_to_remove[pdu_mod->n_drb_to_remove++];
+    rem->id = removed[i];
+  }
+
+  // Refresh the flow mapping of the changed DRBs that are still used
   FOR_EACH_SEQ_ARR (drb_t *, drb, &UE->drbs) {
     if (drb->pdusession_id != dst->pdusession_id)
       continue;
-    bool drb_still_used = false;
-    FOR_EACH_SEQ_ARR (nr_rrc_qos_t *, qos, &dst->qos) {
-      if (qos->drb_id == drb->drb_id) {
-        drb_still_used = true;
-        break;
-      }
-    }
-    if (!drb_still_used) {
-      if (nr_rrc_remove_drb_by_id(&UE->drbs, drb->drb_id)) {
-        LOG_I(NR_RRC,
-              "UE %d: removed DRB ID %d for PDU session %d (no remaining QoS flows mapped)\n",
-              UE->rrc_ue_id,
-              drb->drb_id,
-              dst->pdusession_id);
-      }
-      // Add DRB to remove directly to e1_req
-      DevAssert(pdu_mod->n_drb_to_remove < E1AP_MAX_NUM_DRBS);
-      drb_to_remove_t *rem = &pdu_mod->drbs_to_remove[pdu_mod->n_drb_to_remove++];
-      rem->id = drb->drb_id;
-      continue;
-    }
 
     /** For changed DRBs that are still used, refresh Flow Mapping Information in DRB-To-Modify
      * 3GPP TS 38.463 9.3.3.11: overrides previous mapping information. */
