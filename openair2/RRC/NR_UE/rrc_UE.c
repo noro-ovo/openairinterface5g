@@ -389,7 +389,7 @@ static void nr_rrc_ue_prepare_RRCSetupRequest(NR_UE_RRC_INST_t *rrc)
   long cause = rrc->setup_cause == AS_EST_MT_ACCESS ? NR_EstablishmentCause_mt_Access
                : rrc->setup_cause == AS_EST_MO_DATA ? NR_EstablishmentCause_mo_Data
                                                      : NR_EstablishmentCause_mo_Signalling;
-  rrc->setup_cause = AS_EST_MO_SIGNALLING;
+  /* kept until the RRCSetup: the request is prepared again for Msg3 (NR_RRC_MAC_MSG3_IND) */
   uint8_t buf[1024];
   int len = do_RRCSetupRequest(buf, sizeof(buf), rv, rrc->fiveG_S_TMSI, cause);
 
@@ -2420,6 +2420,7 @@ static void nr_rrc_rrcsetup_fallback(NR_UE_RRC_INST_t *rrc)
 
 static void nr_rrc_process_rrcsetup(NR_UE_RRC_INST_t *rrc, const NR_RRCSetup_t *rrcSetup)
 {
+  rrc->setup_cause = AS_EST_MO_SIGNALLING;  /* the cause NAS asked for served this connection */
   // if the RRCSetup is received in response to an RRCReestablishmentRequest
   // or RRCResumeRequest or RRCResumeRequest1
   if (rrc->ra_trigger == RRC_CONNECTION_REESTABLISHMENT || rrc->ra_trigger == RRC_RESUME_REQUEST)
@@ -3535,7 +3536,8 @@ void *rrc_nrue(void *notUsed)
       if (rrc->nrRrcState == RRC_STATE_IDLE_NR) {
         RA_trigger_t prev_trigger = rrc->ra_trigger;
         rrc->ra_trigger = RRC_CONNECTION_SETUP;
-        nr_rrc_ue_prepare_RRCSetupRequest(rrc);
+        /* the RRCSetupRequest is prepared when MAC asks for the Msg3 payload at RA start (NR_RRC_MAC_MSG3_IND):
+         * preparing it here too left a second, stale SDU on SRB0 for the next connection */
         nr_rrc_trigger_mac_ra(rrc, NR_MAC_RA_START_SETUP);
         RRCLOG_I("Triggering MAC RA for RRCSetupComplete pending NAS (prev_trigger=%d)\n", prev_trigger);
       }
