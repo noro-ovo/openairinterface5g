@@ -2028,7 +2028,8 @@ void nr_rrc_mac_config_req_paging_ue_id(module_id_t module_id, uint64_t fiveG_S_
   AssertFatal(!ret, "mutex failed %d\n", ret);
   /* TS 38.304 §7.1: UE_ID = 5G-S-TMSI mod 1024, or 0 when no 5G-S-TMSI is allocated. */
   mac->paging_cfg.ue_id = (fiveG_S_TMSI == UINT64_MAX) ? 0 : fiveG_S_TMSI % 1024;
-  LOG_I(NR_MAC, "[UE %d] paging UE_ID=%u\n", mac->ue_id, mac->paging_cfg.ue_id);
+  mac->paging_cfg.has_tmsi = fiveG_S_TMSI != UINT64_MAX;
+  LOG_I(NR_MAC, "[UE %d] paging UE_ID=%u%s\n", mac->ue_id, mac->paging_cfg.ue_id, mac->paging_cfg.has_tmsi ? "" : " (no 5G-S-TMSI)");
   pthread_mutex_unlock(&mac->if_mutex);
 }
 

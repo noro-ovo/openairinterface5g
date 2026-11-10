@@ -449,13 +449,13 @@ static bool monitor_paging_dci(const NR_SearchSpace_t *paging_ss,
     return false;
 
   /* TODO Short Messages support (TS 38.212 §7.3.1.2.1, TS 38.331 Table 6.5-1)
-   * UE_ID = 0 is the spec-mandated fallback (no 5G-S-TMSI yet, or 5G-S-TMSI mod 1024 == 0; TS 38.304 §7.1):
-   * UE-specific paging cannot succeed (no TMSI to match against pagingRecordList), the specs then expects
-   * the UE to still receive broadcast Short Messages in DCI 1_0 with P-RNTI for systemInfoModification,
-   * ETWS, CMAS and stopPagingMonitoring. */
-  if (ue_id == 0) {
+   * Without a 5G-S-TMSI (UE_ID = 0 by default, TS 38.304 §7.1) UE-specific paging cannot succeed: no TMSI to
+   * match against pagingRecordList; the specs then expect the UE to still receive broadcast Short Messages in
+   * DCI 1_0 with P-RNTI. With a 5G-S-TMSI whose value mod 1024 is 0, UE_ID 0 is an ordinary UE_ID and the
+   * paging records are matched as for any other. */
+  if (!paging_cfg->has_tmsi) {
     LOG_W(NR_MAC,
-          "[UE %d] PF match at %04d.%02d with UE_ID=0 (no 5G-S-TMSI yet, or 5G-S-TMSI mod 1024 == 0): skipping P-RNTI monitoring\n",
+          "[UE %d] PF match at %04d.%02d with no 5G-S-TMSI: skipping P-RNTI monitoring\n",
           mac->ue_id,
           frame,
           slot);

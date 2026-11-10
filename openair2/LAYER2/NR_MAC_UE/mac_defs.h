@@ -562,6 +562,8 @@ typedef struct {
   uint16_t first_mo_of_po[NR_PCCH_MAX_PO];
   // UE_ID for paging PF/PO (TS 38.304 §7.1)
   uint16_t ue_id;
+  // a 5G-S-TMSI is allocated: UE-specific paging can be matched (UE_ID may still be 0: 5G-S-TMSI mod 1024 == 0)
+  bool has_tmsi;
 } nr_ue_paging_cfg_t;
 
 /*!\brief Top level UE MAC structure */
