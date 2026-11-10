@@ -700,7 +700,7 @@ byte_array_t do_RRCReconfiguration(const nr_rrc_reconfig_param_t *params)
   return msg;
 }
 
-int do_RRCSetupRequest(uint8_t *buffer, size_t buffer_size, uint8_t *rv, uint64_t fiveG_S_TMSI)
+int do_RRCSetupRequest(uint8_t *buffer, size_t buffer_size, uint8_t *rv, uint64_t fiveG_S_TMSI, long establishment_cause)
 {
   NR_UL_CCCH_Message_t ul_ccch_msg = {0};
   ul_ccch_msg.message.present           = NR_UL_CCCH_MessageType_PR_c1;
@@ -738,7 +738,7 @@ int do_RRCSetupRequest(uint8_t *buffer, size_t buffer_size, uint8_t *rv, uint64_
     str->buf[4] = (fiveG_S_TMSI_part1 << 1) & 0xff;
   }
 
-  rrcSetupRequest->rrcSetupRequest.establishmentCause = NR_EstablishmentCause_mo_Signalling; //EstablishmentCause_mo_Data;
+  rrcSetupRequest->rrcSetupRequest.establishmentCause = establishment_cause;
   rrcSetupRequest->rrcSetupRequest.spare.buf = CALLOC(1, 1);
   rrcSetupRequest->rrcSetupRequest.spare.buf[0] = 0; // spare not used
   rrcSetupRequest->rrcSetupRequest.spare.size=1;

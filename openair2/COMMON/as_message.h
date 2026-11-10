@@ -400,10 +400,14 @@ typedef struct nas_5gmm_ind_s {
  * NAS requests the AS to transfer uplink information to the NAS that
  * operates at the network side.
  */
+/* RRC establishment cause asked by NAS for an initial NAS message (TS 24.501 Annex D, TS 38.331 EstablishmentCause) */
+typedef enum { AS_EST_MO_SIGNALLING = 0, AS_EST_MO_DATA, AS_EST_MT_ACCESS } as_est_cause_t;
+
 typedef struct ul_info_transfer_req_s {
   uint32_t UEid;      /* UE lower layer identifier        */
   as_stmsi_t s_tmsi;      /* UE identity              */
   as_nas_info_t nasMsg;   /* Uplink NAS message           */
+  as_est_cause_t est_cause; /* initial NAS message only: RRC establishment cause */
 } ul_info_transfer_req_t;
 
 /*

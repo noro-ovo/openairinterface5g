@@ -266,6 +266,7 @@ typedef struct NR_UE_RRC_INST_s {
   notifiedFIFO_t *mac_input_nf;
   /* NAS PDU deferred until UL-DCCH exists: consumed in RRCSetupComplete/RRCResumeComplete dedicatedNAS-Message */
   as_nas_info_t pending_initial_nas;
+  as_est_cause_t setup_cause;  /* establishment cause of the next RRCSetupRequest (NAS, initial NAS message) */
 } NR_UE_RRC_INST_t;
 
 #define RRCLOG_D(f, ...) LOG_D(NR_RRC, "[UE %ld] RNTI 0x%04x " f, rrc->ue_id, rrc->rnti __VA_OPT__(, ) __VA_ARGS__)

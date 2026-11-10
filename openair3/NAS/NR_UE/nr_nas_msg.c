@@ -1045,7 +1045,7 @@ void generateRegistrationRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas,
   }
 }
 
-void generateServiceRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas, bool mo_ul_data)
+void generateServiceRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas, bool mo_ul_data, uint8_t service_type)
 {
   LOG_I(NAS, "Generate initial NAS message: Service Request\n");
   int size = 0;
@@ -1060,7 +1060,7 @@ void generateServiceRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas, bool
   // Set plain FGMM Service Request
   fgs_service_request_msg_t *mm_msg = &plain.mm_msg.service_request;
   // Service Type
-  mm_msg->serviceType = SERVICE_TYPE_DATA;
+  mm_msg->serviceType = service_type;
   // NAS key set identifier
   mm_msg->naskeysetidentifier.tsc = NAS_KEY_SET_IDENTIFIER_NATIVE;
   mm_msg->naskeysetidentifier.naskeysetidentifier = set_fgs_ksi(nas);
@@ -2344,19 +2344,21 @@ static void generatePduSessionEstablishRequest(nr_ue_nas_t *nas, as_nas_info_t *
 
 /** Send initial NAS to RRC as NAS_INITIAL_UL_TRANSFER_REQ (e.g. paging Service Request, TS 24.501 §5.6.1).
  *  RRC buffers for RRCSetupComplete dedicatedNAS when no SRB (TS 38.331 §5.3.3.4). */
-static void send_nas_initial_ul_transfer_req(nr_ue_nas_t *nas, const as_nas_info_t *initial_nas_msg)
+static void send_nas_initial_ul_transfer_req(nr_ue_nas_t *nas, const as_nas_info_t *initial_nas_msg, as_est_cause_t cause)
 {
   MessageDef *msg = itti_alloc_new_message(TASK_NAS_NRUE, nas->UE_id, NAS_INITIAL_UL_TRANSFER_REQ);
   ul_info_transfer_req_t *req = &NAS_INITIAL_UL_TRANSFER_REQ(msg);
   req->UEid = nas->UE_id;
   req->nasMsg.nas_data = (uint8_t *)initial_nas_msg->nas_data;
   req->nasMsg.length = initial_nas_msg->length;
+  req->est_cause = cause;
   itti_send_msg_to_task(TASK_RRC_NRUE, nas->UE_id, msg);
 }
 
 /** @brief Initiate Service Request and send it as initial NAS UL to RRC
- * Used for MT paging and MO UL-data indication */
-static bool initiate_service_request(nr_ue_nas_t *nas, bool mo_ul_data)
+ * Used for MT paging (service type "mobile terminated services", RRC cause mt-Access) and MO UL-data indication
+ * (service type "data", mo-Data): TS 24.501 5.6.1.2, 9.11.3.50, Annex D */
+static bool initiate_service_request(nr_ue_nas_t *nas, bool mo_ul_data, bool paging)
 {
   if (!nas->guti) {
     LOG_W(NAS, "[UE %ld] no GUTI available, cannot generate Service Request\n", nas->UE_id);
@@ -2382,14 +2384,14 @@ static bool initiate_service_request(nr_ue_nas_t *nas, bool mo_ul_data)
   }
 
   as_nas_info_t initialNasMsg = {0};
-  generateServiceRequest(&initialNasMsg, nas, mo_ul_data);
+  generateServiceRequest(&initialNasMsg, nas, mo_ul_data, paging ? SERVICE_TYPE_MT_SERVICES : SERVICE_TYPE_DATA);
   if (initialNasMsg.length <= 0) {
     LOG_E(NAS, "[UE %ld] Failed to generate Service Request\n", nas->UE_id);
     return false;
   }
   /* TS 24.501 §5.6.1.2: send SERVICE REQUEST, enter 5GMM-SERVICE-REQUEST-INITIATED (§5.1.3.2.1.2.6) */
   nas->fiveGMM_state = FGS_SERVICE_REQUEST_INITIATED;
-  send_nas_initial_ul_transfer_req(nas, &initialNasMsg);
+  send_nas_initial_ul_transfer_req(nas, &initialNasMsg, paging ? AS_EST_MT_ACCESS : AS_EST_MO_DATA);
   LOG_I(NAS, "[UE %ld] Service Request (%u B) sent to RRC (NAS_INITIAL_UL_TRANSFER_REQ)\n", nas->UE_id, initialNasMsg.length);
   return true;
 }
@@ -2725,7 +2727,7 @@ void *nas_nrue(void *args_p)
          *  - Add explicit "suspend indication" handling for the 5GMM-IDLE-with-suspend case
          *    as per TS 24.501 §5.6.2.2.1 ("proceed as specified in subclause 5.3.1.5") */
         LOG_I(NAS, "[UE %ld] Paging: initiate Service Request\n", nas->UE_id);
-        initiate_service_request(nas, false);
+        initiate_service_request(nas, false, true);
         break;
       }
 
@@ -2733,7 +2735,7 @@ void *nas_nrue(void *args_p)
         /** MO Service Request for pending UL user data (TS 24.501 clause 5.6.1 case d)
          * initiate Service Request and include Uplink data status */
         LOG_D(NAS, "[UE %ld] MO UL data: request Service Request\n", nas->UE_id);
-        initiate_service_request(nas, true);
+        initiate_service_request(nas, true, false);
         break;
       }
 

@@ -22,7 +22,9 @@
 #define NAS_INTEGRITY_SIZE 4
 
 /* 3GPP TS 24.501: 9.11.3.50 Service type */
+#define SERVICE_TYPE_SIGNALLING 0x0
 #define SERVICE_TYPE_DATA 0x1
+#define SERVICE_TYPE_MT_SERVICES 0x2
 
 typedef enum fgs_mm_state_e {
   FGS_DEREGISTERED,
@@ -87,7 +89,7 @@ typedef struct {
 
 nr_ue_nas_t *get_ue_nas_info(module_id_t module_id);
 void generateRegistrationRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas, bool is_security_mode);
-void generateServiceRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas, bool mo_ul_data);
+void generateServiceRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas, bool mo_ul_data, uint8_t service_type);
 void *nas_nrue_task(void *args_p);
 void *nas_nrue(void *args_p);
 void nas_init_nrue(int num_ues);

@@ -385,8 +385,13 @@ static void nr_rrc_ue_prepare_RRCSetupRequest(NR_UE_RRC_INST_t *rrc)
 #endif
   }
 
+  /* the cause NAS asked for its initial NAS message (paging: mt-Access, UL data: mo-Data), else mo-Signalling */
+  long cause = rrc->setup_cause == AS_EST_MT_ACCESS ? NR_EstablishmentCause_mt_Access
+               : rrc->setup_cause == AS_EST_MO_DATA ? NR_EstablishmentCause_mo_Data
+                                                     : NR_EstablishmentCause_mo_Signalling;
+  rrc->setup_cause = AS_EST_MO_SIGNALLING;
   uint8_t buf[1024];
-  int len = do_RRCSetupRequest(buf, sizeof(buf), rv, rrc->fiveG_S_TMSI);
+  int len = do_RRCSetupRequest(buf, sizeof(buf), rv, rrc->fiveG_S_TMSI, cause);
 
   nr_rlc_srb_recv_sdu(rrc->ue_id, 0, buf, len);
 }
@@ -3523,6 +3528,7 @@ void *rrc_nrue(void *notUsed)
       free(rrc->pending_initial_nas.nas_data);
       rrc->pending_initial_nas.nas_data = req->nasMsg.nas_data;
       rrc->pending_initial_nas.length = req->nasMsg.length;
+      rrc->setup_cause = req->est_cause;
       RRCLOG_I("Initial NAS UL: no SRB yet; buffered %u B for RRCSetupComplete dedicatedNAS (RRC state=%d)\n",
                req->nasMsg.length,
                rrc->nrRrcState);
