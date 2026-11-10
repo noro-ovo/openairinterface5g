@@ -865,6 +865,7 @@ static int nr_ue_process_dci_dl_10_p_rnti(NR_UE_MAC_INST_t *mac,
   const float factor[] = {1, 0.5, 0.25, 0};
   dlsch_pdu->scaling_factor_S = factor[dci->tb_scaling];
   dlsch_pdu->k1_feedback = 0;
+  dlsch_pdu->harq_feedback_disabled = false;
   return 0;
 }
 
@@ -1261,6 +1262,8 @@ static int nr_ue_process_dci_dl_10(NR_UE_MAC_INST_t *mac,
         feedback_ti);
 
   dlsch_pdu->k1_feedback = feedback_ti;
+  dlsch_pdu->harq_feedback_disabled = rnti_type != TYPE_RA_RNTI_ && rnti_type != TYPE_SI_RNTI_
+                                      && get_FeedbackDisabled(mac->sc_info.downlinkHARQ_FeedbackDisabled_r17, dci->harq_pid.val);
 
   LOG_D(MAC, "(nr_ue_procedures.c) pdu_type=%d\n", dl_conf_req->pdu_type);
 
@@ -1676,6 +1679,7 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
 
   // send the ack/nack slot number to phy to indicate tx thread to wait for DLSCH decoding
   dlsch_pdu->k1_feedback = feedback_ti;
+  dlsch_pdu->harq_feedback_disabled = get_FeedbackDisabled(mac->sc_info.downlinkHARQ_FeedbackDisabled_r17, dci->harq_pid.val);
 
   // TBS_LBRM according to section 5.4.2.1 of 38.212
   int nl_tbslbrm = max_mimo_layers < 4 ? max_mimo_layers : 4;
