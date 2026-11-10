@@ -252,6 +252,38 @@ bool nr_rrc_remove_drb_by_id(seq_arr_t *drb_ptr, const int drb_id)
   return true;
 }
 
+/** @brief Remove the DRBs of a PDU session that no QoS flow of the session maps to
+ *  @param drbs UE DRB list
+ *  @param session PDU session whose QoS flows are the reference
+ *  @param removed IDs of the removed DRBs (output)
+ *  @param max capacity of @p removed
+ *  @return number of removed DRBs */
+int nr_rrc_remove_unmapped_drbs(seq_arr_t *drbs, const pdusession_t *session, int removed[], int max)
+{
+  DevAssert(drbs);
+  DevAssert(session);
+  int n = 0;
+  FOR_EACH_SEQ_ARR (drb_t *, drb, drbs) {
+    if (drb->pdusession_id != session->pdusession_id)
+      continue;
+    bool used = false;
+    FOR_EACH_SEQ_ARR (nr_rrc_qos_t *, qos, &session->qos) {
+      if (qos->drb_id == drb->drb_id) {
+        used = true;
+        break;
+      }
+    }
+    if (!used) {
+      DevAssert(n < max);
+      removed[n++] = drb->drb_id;
+    }
+  }
+  // remove only after the scan: erasing shifts the array under the iterator
+  for (int i = 0; i < n; i++)
+    nr_rrc_remove_drb_by_id(drbs, removed[i]);
+  return n;
+}
+
 /** @brief Removes a PDU Session from the list by ID
  *  Also removes all associated DRBs for this PDU session.
  *  @return true if successfully removed, false if not found */
