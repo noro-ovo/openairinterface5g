@@ -28,6 +28,7 @@ static void nr_sdap_notify_mo_ul_data(ue_id_t ue_id, int pdusession_id)
     return;
   }
   LOG_D(SDAP, "UE %ld PDU session %d: MO UL pending -> NAS_MO_UL_DATA_IND to RRC\n", ue_id, pdusession_id);
+  NAS_MO_UL_DATA_IND(msg).pdusession_id = pdusession_id;
   itti_send_msg_to_task(TASK_RRC_NRUE, ue_id, msg);
 }
 

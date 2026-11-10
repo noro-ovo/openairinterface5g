@@ -3577,8 +3577,18 @@ void *rrc_nrue(void *notUsed)
   }
 
   case NAS_MO_UL_DATA_IND: {
-    nr_rrc_ue_tun_stop_readers(rrc->ue_id);
+    const int psi = NAS_MO_UL_DATA_IND(msg_p).pdusession_id;
+    if (rrc->nrRrcState == RRC_STATE_CONNECTED_NR) {
+      /* RRC connected, this PDU session without user plane: only its idle listener stops, the other sessions keep
+       * their user-plane readers */
+      nr_ue_nas_t *nas = get_ue_nas_info(rrc->ue_id);
+      if (psi > 0 && psi < MAX_NUM_PSI && nas->pdu_tun[psi].sock >= 0)
+        nr_sdap_tun_stop_reader(&nas->pdu_tun[psi].reader_thread);
+    } else {
+      nr_rrc_ue_tun_stop_readers(rrc->ue_id);
+    }
     MessageDef *nas_msg = itti_alloc_new_message(TASK_RRC_NRUE, rrc->ue_id, NAS_MO_UL_DATA_IND);
+    NAS_MO_UL_DATA_IND(nas_msg).pdusession_id = psi;
     itti_send_msg_to_task(TASK_NAS_NRUE, rrc->ue_id, nas_msg);
     break;
   }

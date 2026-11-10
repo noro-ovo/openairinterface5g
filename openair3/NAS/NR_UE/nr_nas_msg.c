@@ -1181,6 +1181,60 @@ void generateServiceRequest(as_nas_info_t *initialNasMsg, nr_ue_nas_t *nas, bool
   }
 }
 
+/** @brief Service Request in 5GMM-CONNECTED mode (TS 24.501 5.6.1.1 case b): a PDU session without user-plane
+ * resources has UL data. Sent in an UL NAS TRANSPORT over the RRC connection, integrity protected and ciphered
+ * like any NAS message of the connection (no NAS message container, no new KgNB: AS security is running), with
+ * the Uplink data status of that session and the PDU session status. */
+static void generateConnectedServiceRequest(nr_ue_nas_t *nas, as_nas_info_t *msg, int ul_psi)
+{
+  fgmm_nas_msg_security_protected_t sp = {0};
+  sp.header.protocol_discriminator = FGS_MOBILITY_MANAGEMENT_MESSAGE;
+  sp.header.security_header_type = INTEGRITY_PROTECTED_AND_CIPHERED;
+  sp.header.sequence_number = nas->security.nas_count_ul & 0xff;
+  int size = sizeof(sp.header);
+  sp.plain.header = set_mm_header(FGS_SERVICE_REQUEST, PLAIN_5GS_MSG);
+  size += sizeof(sp.plain.header);
+  fgs_service_request_msg_t *mm = &sp.plain.mm_msg.service_request;
+  mm->serviceType = SERVICE_TYPE_DATA;
+  mm->naskeysetidentifier.tsc = NAS_KEY_SET_IDENTIFIER_NATIVE;
+  mm->naskeysetidentifier.naskeysetidentifier = set_fgs_ksi(nas);
+  size += 1;
+  size += fill_fgstmsi(&mm->fiveg_s_tmsi, nas->guti);
+  for (int psi = 1; psi < MAX_NUM_PSI; psi++) {
+    if (nas->psi_status[psi] == PDU_SESSION_INACTIVE)
+      continue;
+    mm->has_pdu_session_status = true;
+    mm->pdu_session_status[psi] = PDU_SESSION_ACTIVE;
+  }
+  mm->has_uplink_data_status = true;
+  mm->uplink_data_status[ul_psi] = PDU_SESSION_ACTIVE;
+  size += 2 * (MIN_PDU_SESSION_CONTENTS_LEN + 2);
+
+  msg->nas_data = calloc_or_fail(size, sizeof(*msg->nas_data));
+  int hl = nas_protected_security_header_encode(msg->nas_data, &sp.header, size);
+  msg->length = hl + mm_msg_encode(&sp.plain, msg->nas_data + hl, size - hl);
+
+  nas_stream_cipher_t sc = {0};
+  uint8_t buf[msg->length - 7];
+  sc.context = nas->security_container->ciphering_context;
+  AssertFatal(nas->security.nas_count_ul <= 0xffffff, "fatal: NAS COUNT UL too big (todo: fix that)\n");
+  sc.count = nas->security.nas_count_ul;
+  sc.bearer = 1;
+  sc.direction = 0;
+  sc.message = msg->nas_data + 7;
+  sc.blength = (msg->length - 7) << 3;
+  stream_compute_encrypt(nas->security_container->ciphering_algorithm, &sc, buf);
+  memcpy(sc.message, buf, msg->length - 7);
+
+  sc.context = nas->security_container->integrity_context;
+  sc.count = nas->security.nas_count_ul++;
+  sc.message = msg->nas_data + 6;
+  sc.blength = (msg->length - 6) << 3;
+  uint8_t mac[NAS_INTEGRITY_SIZE];
+  stream_compute_integrity(nas->security_container->integrity_algorithm, &sc, mac);
+  memcpy(msg->nas_data + 2, mac, NAS_INTEGRITY_SIZE);
+}
+
 /** @brief Build Identity Response according to requested identity type (8.2.22 of 3GPP TS 24.501) */
 static void generateIdentityResponse(const nr_ue_nas_t *nas, as_nas_info_t *initialNasMsg, uint8_t identitytype)
 {
@@ -2358,7 +2412,7 @@ static void send_nas_initial_ul_transfer_req(nr_ue_nas_t *nas, const as_nas_info
 /** @brief Initiate Service Request and send it as initial NAS UL to RRC
  * Used for MT paging (service type "mobile terminated services", RRC cause mt-Access) and MO UL-data indication
  * (service type "data", mo-Data): TS 24.501 5.6.1.2, 9.11.3.50, Annex D */
-static bool initiate_service_request(nr_ue_nas_t *nas, bool mo_ul_data, bool paging)
+static bool initiate_service_request(nr_ue_nas_t *nas, bool mo_ul_data, bool paging, int ul_psi)
 {
   if (!nas->guti) {
     LOG_W(NAS, "[UE %ld] no GUTI available, cannot generate Service Request\n", nas->UE_id);
@@ -2377,10 +2431,19 @@ static bool initiate_service_request(nr_ue_nas_t *nas, bool mo_ul_data, bool pag
     return false;
   }
 
-  /* If UE is 5GMM-CONNECTED, Service Request is not needed (TS 24.501 §5.6.2.2.1) */
   if (nas->fiveGMM_mode != FGS_IDLE) {
-    LOG_W(NAS, "[UE %ld] UE already in 5GMM-CONNECTED (mode=%d), dropping Service Request\n", nas->UE_id, nas->fiveGMM_mode);
-    return false;
+    /* 5GMM-CONNECTED: no Service Request for paging (TS 24.501 5.6.2.2.1); for UL data of a PDU session without
+     * user-plane resources, a Service Request over the connection (5.6.1.1 case b) */
+    if (!mo_ul_data || ul_psi <= 0 || ul_psi >= MAX_NUM_PSI || nas->psi_status[ul_psi] == PDU_SESSION_INACTIVE) {
+      LOG_W(NAS, "[UE %ld] UE already in 5GMM-CONNECTED (mode=%d), no Service Request\n", nas->UE_id, nas->fiveGMM_mode);
+      return false;
+    }
+    as_nas_info_t sr = {0};
+    generateConnectedServiceRequest(nas, &sr, ul_psi);
+    nas->fiveGMM_state = FGS_SERVICE_REQUEST_INITIATED;
+    send_nas_uplink_data_req(nas, &sr);
+    LOG_I(NAS, "[UE %ld] Service Request in 5GMM-CONNECTED for PDU session %d (UL data, %u B)\n", nas->UE_id, ul_psi, sr.length);
+    return true;
   }
 
   as_nas_info_t initialNasMsg = {0};
@@ -2727,7 +2790,7 @@ void *nas_nrue(void *args_p)
          *  - Add explicit "suspend indication" handling for the 5GMM-IDLE-with-suspend case
          *    as per TS 24.501 §5.6.2.2.1 ("proceed as specified in subclause 5.3.1.5") */
         LOG_I(NAS, "[UE %ld] Paging: initiate Service Request\n", nas->UE_id);
-        initiate_service_request(nas, false, true);
+        initiate_service_request(nas, false, true, 0);
         break;
       }
 
@@ -2735,7 +2798,7 @@ void *nas_nrue(void *args_p)
         /** MO Service Request for pending UL user data (TS 24.501 clause 5.6.1 case d)
          * initiate Service Request and include Uplink data status */
         LOG_D(NAS, "[UE %ld] MO UL data: request Service Request\n", nas->UE_id);
-        initiate_service_request(nas, true, false);
+        initiate_service_request(nas, true, false, NAS_MO_UL_DATA_IND(msg_p).pdusession_id);
         break;
       }
 

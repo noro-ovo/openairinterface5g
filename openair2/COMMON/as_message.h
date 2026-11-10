@@ -468,7 +468,7 @@ typedef struct nas_pdu_session_req_s {
  * Distinct from paging: NAS may start Service Request (TS 24.501 §5.6.1)
  */
 typedef struct nas_mo_ul_data_ind_s {
-  char dummy;
+  int pdusession_id;  /* the PDU session without user plane that has UL data */
 } nas_mo_ul_data_ind_t;
 
 /* NAS->RRC - UE TUN reader lifecycle for a NAS-provided PSI list
