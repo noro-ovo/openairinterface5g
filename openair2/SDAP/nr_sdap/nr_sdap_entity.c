@@ -652,6 +652,9 @@ void nr_sdap_qos_rules_forget(ue_id_t ue_id, int pdusession_id)
   pthread_mutex_lock(&kept_lock);
   kept_forget_locked(ue_id, pdusession_id);
   pthread_mutex_unlock(&kept_lock);
+  /* the entity of the new connection may already exist with the kept rules restored (RRC handles the
+   * RadioBearerConfig before NAS gets the Accept): a new PDU session starts without dedicated rules */
+  nr_sdap_qos_rules_clear(ue_id, pdusession_id);
 }
 
 /* UE: an entity goes with the RRC connection, its QoS rules stay (a previous set of the same session is replaced) */

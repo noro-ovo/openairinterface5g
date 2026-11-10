@@ -37,6 +37,21 @@ void nr_sdap_qos_rules_init(nr_sdap_entity_t *entity)
   entity->use_packet_filters = false;
 }
 
+void nr_sdap_qos_rules_clear(ue_id_t ue_id, int pdusession_id)
+{
+  nr_sdap_entity_t *entity = nr_sdap_get_entity(ue_id, pdusession_id);
+  if (entity == NULL || entity->tun.is_gnb)
+    return;
+  pthread_mutex_lock(&entity->qos_rules_lock);
+  long n = (long)seq_arr_size(&entity->qos_rules);
+  seq_arr_free(&entity->qos_rules, free_qos_rule);
+  seq_arr_init(&entity->qos_rules, sizeof(nr_sdap_qos_rule_t));
+  entity->use_packet_filters = false;
+  pthread_mutex_unlock(&entity->qos_rules_lock);
+  if (n)
+    LOG_I(SDAP, "UE %ld PDU session %d: %ld QoS rules of the previous PDU session removed\n", ue_id, pdusession_id, n);
+}
+
 void nr_sdap_qos_rules_free(nr_sdap_entity_t *entity)
 {
   pthread_mutex_destroy(&entity->qos_rules_lock);

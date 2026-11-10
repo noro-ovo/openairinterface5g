@@ -15,7 +15,10 @@ struct nr_sdap_entity_s;
 
 void nr_sdap_qos_rules_init(struct nr_sdap_entity_s *entity);
 void nr_sdap_qos_rules_free(struct nr_sdap_entity_s *entity);
-/** @brief UE: forget the QoS rules kept for a PDU session over RRC release (a new PDU session with this ID) */
+/** @brief UE: remove every QoS rule of the live entity of a PDU session (a new PDU session with this ID) */
+void nr_sdap_qos_rules_clear(ue_id_t ue_id, int pdusession_id);
+/** @brief UE: forget the QoS rules of a PDU session (a new PDU session with this ID): those kept over an RRC release
+ * and those of its live entity */
 void nr_sdap_qos_rules_forget(ue_id_t ue_id, int pdusession_id);
 uint8_t nr_sdap_match_ul_packet(struct nr_sdap_entity_s *entity, const uint8_t *ip_pkt, size_t pkt_len);
 
