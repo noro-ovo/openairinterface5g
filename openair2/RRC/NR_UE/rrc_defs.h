@@ -267,6 +267,9 @@ typedef struct NR_UE_RRC_INST_s {
   /* NAS PDU deferred until UL-DCCH exists: consumed in RRCSetupComplete/RRCResumeComplete dedicatedNAS-Message */
   as_nas_info_t pending_initial_nas;
   as_est_cause_t setup_cause;  /* establishment cause of the next RRCSetupRequest (NAS, initial NAS message) */
+  /* user-plane start NAS asked for (Service Accept) before the DRB of the PDU session existed: done when its SDAP
+   * entity is created (the AMF may send the Service Accept ahead of the PDU Session Resource Setup) */
+  nas_tun_psi_t up_pending[NAS_TUN_LIST_MAX];
 } NR_UE_RRC_INST_t;
 
 #define RRCLOG_D(f, ...) LOG_D(NR_RRC, "[UE %ld] RNTI 0x%04x " f, rrc->ue_id, rrc->rnti __VA_OPT__(, ) __VA_ARGS__)

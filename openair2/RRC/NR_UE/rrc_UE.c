@@ -759,13 +759,22 @@ static void nr_rrc_ue_tun_start_idle_listeners(ue_id_t ue_id)
 /** @brief Start the user-plane TUN UL reader for one PDU session
  * Stop any prior reader on reader_thread, bind sock and qfi onto the SDAP entity, then start the reader
  * @note reader_thread is NAS pdu_tun state, start/stop only through RRC */
-static void nr_rrc_ue_tun_start_user_plane(ue_id_t ue_id, int pdusession_id, int sock, int qfi, pthread_t *reader_thread)
+static void nr_rrc_ue_tun_start_user_plane(NR_UE_RRC_INST_t *rrc, int pdusession_id, int sock, int qfi, pthread_t *reader_thread)
 {
-  DevAssert(pdusession_id > 0 && pdusession_id < MAX_NUM_PSI);
+  const ue_id_t ue_id = rrc->ue_id;
+  DevAssert(pdusession_id > 0 && pdusession_id < MAX_NUM_PSI && pdusession_id < NAS_TUN_LIST_MAX);
   DevAssert(sock >= 0);
   DevAssert(reader_thread != NULL);
   nr_sdap_entity_t *entity = nr_sdap_get_entity(ue_id, pdusession_id);
   if (!entity) {
+    if (rrc->nrRrcState == RRC_STATE_CONNECTED_NR) {
+      /* the DRB of this PDU session comes with a later RRCReconfiguration (Service Accept ahead of the PDU Session
+       * Resource Setup): start once its SDAP entity exists (rrc_ue_add_bearer) */
+      rrc->up_pending[pdusession_id] =
+          (nas_tun_psi_t){.pdusession_id = pdusession_id, .sock = sock, .qfi = qfi, .reader_thread = reader_thread};
+      LOG_I(NR_RRC, "[UE %ld] PDU session %d: user plane started when its DRB is added\n", ue_id, pdusession_id);
+      return;
+    }
     // NAS queued the request before the RRC connection was released, which removed the bearers: the next service
     // accept starts the user plane again
     LOG_W(NR_RRC,
@@ -774,6 +783,7 @@ static void nr_rrc_ue_tun_start_user_plane(ue_id_t ue_id, int pdusession_id, int
           pdusession_id);
     return;
   }
+  rrc->up_pending[pdusession_id].reader_thread = NULL;
   nr_sdap_tun_stop_reader(reader_thread);
   nr_sdap_tun_bind(entity, sock, qfi);
   char name[64];
@@ -782,8 +792,9 @@ static void nr_rrc_ue_tun_start_user_plane(ue_id_t ue_id, int pdusession_id, int
 }
 
 /** @brief Add bearer in PDCP/SDAP for 5GC association (SA) */
-static void rrc_ue_add_bearer(const int ue_id, const NR_DRB_ToAddMod_t *drb, const nr_pdcp_entity_security_keys_and_algos_t *sp)
+static void rrc_ue_add_bearer(NR_UE_RRC_INST_t *rrc, const NR_DRB_ToAddMod_t *drb, const nr_pdcp_entity_security_keys_and_algos_t *sp)
 {
+  const ue_id_t ue_id = rrc->ue_id;
   DevAssert(drb->cnAssociation);
   DevAssert(drb->cnAssociation->present != NR_DRB_ToAddMod__cnAssociation_PR_NOTHING);
   // get SDAP config
@@ -804,6 +815,11 @@ static void rrc_ue_add_bearer(const int ue_id, const NR_DRB_ToAddMod_t *drb, con
   nr_sdap_addmod_entity(GNB_FLAG_NO, ue_id, &sdap);
   // add PDCP entity
   nr_pdcp_add_drb(GNB_FLAG_NO, ue_id, drb->pdcp_Config, &sdap, sp);
+  // a user-plane start that waited for this PDU session's DRB
+  if (sdap.pdusession_id > 0 && sdap.pdusession_id < NAS_TUN_LIST_MAX && rrc->up_pending[sdap.pdusession_id].reader_thread) {
+    nas_tun_psi_t p = rrc->up_pending[sdap.pdusession_id];
+    nr_rrc_ue_tun_start_user_plane(rrc, p.pdusession_id, p.sock, p.qfi, p.reader_thread);
+  }
 }
 
 /**
@@ -907,7 +923,7 @@ static void nr_rrc_ue_process_RadioBearerConfig(NR_UE_RRC_INST_t *rrc, NR_RadioB
         }
       } else {
         set_DRB_status(rrc, DRB_id, RB_ESTABLISHED);
-        rrc_ue_add_bearer(rrc->ue_id, radioBearerConfig->drb_ToAddModList->list.array[cnt], &security_up_parameters);
+        rrc_ue_add_bearer(rrc, radioBearerConfig->drb_ToAddModList->list.array[cnt], &security_up_parameters);
       }
     }
   } // drb_ToAddModList //
@@ -2410,6 +2426,7 @@ static void nr_rrc_rrcsetup_fallback(NR_UE_RRC_INST_t *rrc)
   // stop UE TUN readers before SDAP delete (connected reader holds entity pointer)
   nr_rrc_ue_tun_stop_readers(rrc->ue_id);
   nr_sdap_delete_ue_entities(rrc->ue_id);
+  memset(rrc->up_pending, 0, sizeof(rrc->up_pending));  /* the bearers went with the connection */
 
   // indicate to upper layers fallback of the RRC connection
   // TODO
@@ -3565,7 +3582,7 @@ void *rrc_nrue(void *notUsed)
     if (req->action == NAS_TUN_START_USER_PLANE) {
       for (int i = 0; i < req->n_psi; i++) {
         const nas_tun_psi_t *p = &req->psi[i];
-        nr_rrc_ue_tun_start_user_plane(rrc->ue_id, p->pdusession_id, p->sock, p->qfi, p->reader_thread);
+        nr_rrc_ue_tun_start_user_plane(rrc, p->pdusession_id, p->sock, p->qfi, p->reader_thread);
       }
     } else if (req->action == NAS_TUN_START_IDLE_LISTENER) {
       nr_rrc_ue_tun_stop_readers(rrc->ue_id);
@@ -3813,6 +3830,7 @@ void nr_rrc_going_to_IDLE(NR_UE_RRC_INST_t *rrc,
   // then start idle listeners so MO UL can trigger Service Request while CM-IDLE
   nr_rrc_ue_tun_stop_readers(rrc->ue_id);
   nr_sdap_delete_ue_entities(rrc->ue_id);
+  memset(rrc->up_pending, 0, sizeof(rrc->up_pending));  /* the bearers went with the connection */
   if (rrc->nrRrcState != RRC_STATE_DETACH_NR)
     nr_rrc_ue_tun_start_idle_listeners(rrc->ue_id);
 
