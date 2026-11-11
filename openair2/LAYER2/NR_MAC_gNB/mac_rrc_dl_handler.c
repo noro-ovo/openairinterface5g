@@ -394,8 +394,8 @@ static int handle_ue_context_drbs_release(NR_UE_info_t *UE,
 {
   DevAssert(req_drbs != NULL && cellGroupConfig != NULL);
   instance_t f1inst = get_f1_gtp_instance();
-  cellGroupConfig->rlc_BearerToReleaseList = calloc(1, sizeof(*cellGroupConfig->rlc_BearerToReleaseList));
-  AssertFatal(cellGroupConfig->rlc_BearerToReleaseList != NULL, "out of memory\n");
+  if (!cellGroupConfig->rlc_BearerToReleaseList)
+    cellGroupConfig->rlc_BearerToReleaseList = calloc_or_fail(1, sizeof(*cellGroupConfig->rlc_BearerToReleaseList));
 
   for (int i = 0; i < drbs_len; i++) {
     const f1ap_drb_to_release_t *drb = &req_drbs[i];
@@ -419,7 +419,15 @@ static int handle_ue_context_drbs_release(NR_UE_info_t *UE,
       *plcid = lcid;
       int ret = ASN_SEQUENCE_ADD(&cellGroupConfig->rlc_BearerToReleaseList->list, plcid);
       DevAssert(ret == 0);
+    } else {
+      LOG_W(NR_MAC, "UE %04x: DRB %d to release has no RLC bearer (already released?)\n", UE->rnti, drb->id);
     }
+  }
+  /* rlc-BearerToReleaseList is SIZE(1..maxLC_ID): an empty list cannot be encoded */
+  if (cellGroupConfig->rlc_BearerToReleaseList->list.count == 0) {
+    asn_sequence_empty(&cellGroupConfig->rlc_BearerToReleaseList->list);
+    free(cellGroupConfig->rlc_BearerToReleaseList);
+    cellGroupConfig->rlc_BearerToReleaseList = NULL;
   }
   return drbs_len;
 }
