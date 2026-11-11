@@ -732,14 +732,14 @@ static void nr_rrc_process_dedicatedNAS_MessageList(NR_UE_RRC_INST_t *rrc, NR_RR
   }
 }
 
-/** @brief RRC notifies SDAP to stop the reader for all active PSI
- * @note Fetch pdu_tun from NAS */
+/** @brief RRC notifies SDAP to stop the reader for all PSI
+ * @note Fetch pdu_tun from NAS; a PSI NAS has just released may still have its reader (NAS_TUN_REQ queued) */
 static void nr_rrc_ue_tun_stop_readers(ue_id_t ue_id)
 {
   nr_ue_nas_t *nas = get_ue_nas_info(ue_id);
   for (int psi = 1; psi < MAX_NUM_PSI; psi++) {
     nas_ue_pdu_tun_t *t = &nas->pdu_tun[psi];
-    if (nas->psi_status[psi] != PDU_SESSION_INACTIVE && t->sock >= 0)
+    if (t->sock >= 0)
       nr_sdap_tun_stop_reader(&t->reader_thread);
   }
 }
@@ -788,6 +788,36 @@ static void nr_rrc_ue_tun_start_user_plane(NR_UE_RRC_INST_t *rrc, int pdusession
   char name[64];
   snprintf(name, sizeof(name), "ue_tun_read_%ld_p%d", ue_id, pdusession_id);
   nr_sdap_tun_start_reader(entity, reader_thread, name);
+}
+
+/** @brief True if a DRB of this UE is still mapped in the SDAP entity */
+static bool nr_rrc_ue_sdap_has_drb(const NR_UE_RRC_INST_t *rrc, const nr_sdap_entity_t *entity)
+{
+  int drb = entity->default_drb.drb_id;
+  if (drb > 0 && drb <= MAX_DRBS_PER_UE && get_DRB_status(rrc, drb) != RB_NOT_PRESENT)
+    return true;
+  for (int qfi = 0; qfi < SDAP_MAX_QFI; qfi++) {
+    drb = entity->qfi2drb_table[qfi].drb_id;
+    if (drb > 0 && drb <= MAX_DRBS_PER_UE && get_DRB_status(rrc, drb) != RB_NOT_PRESENT)
+      return true;
+  }
+  return false;
+}
+
+/** @brief The SDAP entity of a PDU session released by NAS goes once no DRB of the UE is mapped in it (TS 38.331
+ * 5.3.5.6.4, TS 37.324 5.1.2): a new PDU session with this ID starts with a new entity (default DRB, QoS rules)
+ * @note the DRBs are released by the RRCReconfiguration carrying the PDU SESSION RELEASE COMMAND, before NAS gets it */
+static void nr_rrc_ue_sdap_release_pdu_session(NR_UE_RRC_INST_t *rrc, int psi)
+{
+  nr_ue_nas_t *nas = get_ue_nas_info(rrc->ue_id);
+  if (nas->psi_status[psi] != PDU_SESSION_INACTIVE)
+    return;
+  nr_sdap_entity_t *entity = nr_sdap_get_entity(rrc->ue_id, psi);
+  if (!entity || nr_rrc_ue_sdap_has_drb(rrc, entity))
+    return;
+  nr_sdap_tun_stop_reader(&nas->pdu_tun[psi].reader_thread);
+  nr_sdap_delete_entity(rrc->ue_id, psi);
+  LOG_I(NR_RRC, "[UE %ld] PDU session %d released: its SDAP entity is deleted\n", rrc->ue_id, psi);
 }
 
 /** @brief Add bearer in PDCP/SDAP for 5GC association (SA) */
@@ -890,6 +920,8 @@ static void nr_rrc_ue_process_RadioBearerConfig(NR_UE_RRC_INST_t *rrc, NR_RadioB
         set_DRB_status(rrc, *DRB_id, RB_NOT_PRESENT);
       }
     }
+    for (int psi = 1; psi < MAX_NUM_PSI; psi++)
+      nr_rrc_ue_sdap_release_pdu_session(rrc, psi);
   }
 
   /**
@@ -3595,6 +3627,19 @@ void *rrc_nrue(void *notUsed)
     } else if (req->action == NAS_TUN_START_IDLE_LISTENER) {
       nr_rrc_ue_tun_stop_readers(rrc->ue_id);
       nr_rrc_ue_tun_start_idle_listeners(rrc->ue_id);
+    } else if (req->action == NAS_TUN_RELEASE_PDU_SESSION) {
+      /* PDU session released by the network (TS 24.501 6.3.3.3): its reader (user plane or idle listener) stops,
+       * no packet queued on its TUN goes to a later PDU session with this ID, its SDAP entity goes if no DRB is left */
+      nr_ue_nas_t *nas = get_ue_nas_info(rrc->ue_id);
+      for (int i = 0; i < req->n_psi; i++) {
+        const nas_tun_psi_t *p = &req->psi[i];
+        DevAssert(p->pdusession_id > 0 && p->pdusession_id < MAX_NUM_PSI && p->pdusession_id < NAS_TUN_LIST_MAX);
+        rrc->up_pending[p->pdusession_id] = false;
+        nr_sdap_tun_stop_reader(p->reader_thread);
+        nr_ue_tun_flush(&nas->pdu_tun[p->pdusession_id]);
+        nr_rrc_ue_sdap_release_pdu_session(rrc, p->pdusession_id);
+        LOG_I(NR_RRC, "[UE %ld] PDU session %d released: TUN reader stopped\n", rrc->ue_id, p->pdusession_id);
+      }
     } else {
       AssertFatal(false, "unknown NAS_TUN_REQ action %d\n", req->action);
     }

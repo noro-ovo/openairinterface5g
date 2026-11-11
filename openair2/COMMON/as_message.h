@@ -485,6 +485,7 @@ typedef struct nas_tun_psi_s {
 typedef enum {
   NAS_TUN_START_USER_PLANE = 0,
   NAS_TUN_START_IDLE_LISTENER,
+  NAS_TUN_RELEASE_PDU_SESSION, /* PDU sessions of the list released: stop their reader, flush their TUN queue */
 } nas_tun_req_action_t;
 
 typedef struct nas_tun_req_s {

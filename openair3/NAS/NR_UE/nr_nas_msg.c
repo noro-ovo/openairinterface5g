@@ -1947,22 +1947,31 @@ static void send_nas_uplink_data_req(nr_ue_nas_t *nas, const as_nas_info_t *init
   itti_send_msg_to_task(TASK_RRC_NRUE, nas->UE_id, msg);
 }
 
-static void generatePduSessionModificationComplete(nr_ue_nas_t *nas,
-                                                   as_nas_info_t *responseMsg,
-                                                   uint8_t pdu_session_id,
-                                                   uint8_t pti)
+/** @brief UL NAS TRANSPORT (5GSM container, PDU session ID IE) of a 5GSM message: header, then ies_len octets of IEs
+ * (PDU SESSION MODIFICATION COMPLETE, PDU SESSION RELEASE COMPLETE, 5GSM STATUS) */
+static void generate5gsmUplinkMsg(nr_ue_nas_t *nas,
+                                  as_nas_info_t *responseMsg,
+                                  uint8_t pdu_session_id,
+                                  uint8_t pti,
+                                  uint8_t msg_type,
+                                  const uint8_t *ies,
+                                  uint16_t ies_len)
 {
   int size = 0;
 
-  // Setup PDU session modification complete message
-  uint16_t req_length = 4;
+  // 5GSM message: EPD, PDU session ID, PTI, message type (TS 24.501 8.3), IEs
+  fgsm_msg_header_t sm_header = {.ex_protocol_discriminator = FGS_SESSION_MANAGEMENT_MESSAGE,
+                                 .pdu_session_id = pdu_session_id,
+                                 .pti = pti,
+                                 .message_type = msg_type};
+  uint16_t req_length = sizeof(sm_header) + ies_len;
   uint8_t *req_buffer = malloc_or_fail(req_length);
-  pdu_session_modification_complete_msg pdu_session_mod_complete;
-  pdu_session_mod_complete.protocoldiscriminator = FGS_SESSION_MANAGEMENT_MESSAGE;
-  pdu_session_mod_complete.pdusessionid = pdu_session_id;
-  pdu_session_mod_complete.pti = pti;
-  pdu_session_mod_complete.pdusessionmodificationcompletemsgtype = FGS_PDU_SESSION_MODIFICATION_COMPLETE;
-  encode_pdu_session_modification_complete(&pdu_session_mod_complete, req_buffer, req_length);
+  req_buffer[0] = sm_header.ex_protocol_discriminator;
+  req_buffer[1] = sm_header.pdu_session_id;
+  req_buffer[2] = sm_header.pti;
+  req_buffer[3] = sm_header.message_type;
+  if (ies_len)
+    memcpy(req_buffer + sizeof(sm_header), ies, ies_len);
 
   nas_stream_cipher_t stream_cipher = {0};
   uint8_t mac[NAS_INTEGRITY_SIZE];
@@ -2200,9 +2209,191 @@ static void handle_pdu_session_modification_command(nr_ue_nas_t *nas, uint8_t *p
 
   // Send PDU Session Modification Complete response
   as_nas_info_t response_msg = {0};
-  generatePduSessionModificationComplete(nas, &response_msg, sm_header.pdu_session_id, sm_header.pti);
+  generate5gsmUplinkMsg(nas, &response_msg, sm_header.pdu_session_id, sm_header.pti, FGS_PDU_SESSION_MODIFICATION_COMPLETE, NULL, 0);
   send_nas_uplink_data_req(nas, &response_msg);
   LOG_I(NAS, "Send NAS_UPLINK_DATA_REQ message(PduSessionModificationComplete)\n");
+}
+
+/* 5GSM cause values (TS 24.501 9.11.4.2) of a PDU SESSION RELEASE COMMAND (6.3.3.2) */
+#define FGSM_CAUSE_REACTIVATION_REQUESTED 39
+#define FGSM_CAUSE_INVALID_PDU_SESSION_ID 43
+
+static const char *fgsm_release_cause_txt(uint8_t cause)
+{
+  switch (cause) {
+    case 8: return "operator determined barring";
+    case 26: return "insufficient resources";
+    case 29: return "user authentication or authorization failed";
+    case 36: return "regular deactivation";
+    case 39: return "reactivation requested";
+    case 46: return "out of LADN service area";
+    case 67: return "insufficient resources for specific slice and DNN";
+    case 69: return "insufficient resources for specific slice";
+    default: return "other";
+  }
+}
+
+/** @brief Ask RRC to stop the TUN reader of a released PDU session and flush its TUN queue */
+static void send_nas_tun_release(nr_ue_nas_t *nas, int pdusession_id)
+{
+  DevAssert(pdusession_id > 0 && pdusession_id < MAX_NUM_PSI);
+  MessageDef *msg = itti_alloc_new_message(TASK_NAS_NRUE, nas->UE_id, NAS_TUN_REQ);
+  nas_tun_req_t *req = &NAS_TUN_REQ(msg);
+  req->action = NAS_TUN_RELEASE_PDU_SESSION;
+  req->n_psi = 1;
+  nas_tun_psi_set(&req->psi[0], pdusession_id, &nas->pdu_tun[pdusession_id]);
+  itti_send_msg_to_task(TASK_RRC_NRUE, nas->UE_id, msg);
+}
+
+/** @brief The UE considers the PDU session released (TS 24.501 6.3.3.3): its 5GSM context and QoS rules go, its
+ * TUN interface goes down and stays allocated (same fd and name) for a new PDU session with this ID */
+static void release_pdu_session_locally(nr_ue_nas_t *nas, int psi)
+{
+  nas_ue_pdu_tun_t *t = &nas->pdu_tun[psi];
+  nas->psi_status[psi] = PDU_SESSION_INACTIVE;
+  t->qfi = -1;
+  nr_sdap_qos_rules_forget(nas->UE_id, psi);
+  nr_ue_tun_set_down(t);
+  send_nas_tun_release(nas, psi);
+  LOG_I(NAS, "[UE %ld] PDU session %d released locally (interface %s kept down)\n", nas->UE_id, psi, t->sock >= 0 ? t->ifname : "none");
+}
+
+/** @brief Skip the optional IEs of a 5GSM message (TS 24.007 11.2.4, TS 24.501 9.1.1): type 1/2 TV (IEI bit 8 set),
+ * TLV-E (IEI 0x7-), TLV otherwise
+ * @return false if an IE overruns the message */
+static bool fgsm_skip_optional_ies(const uint8_t *buf, uint32_t len)
+{
+  uint32_t i = 0;
+  while (i < len) {
+    const uint8_t iei = buf[i];
+    uint32_t ie_len;
+    if (iei & 0x80) {
+      ie_len = 1;
+    } else if ((iei & 0xf0) == 0x70) {
+      if (i + 3 > len)
+        return false;
+      ie_len = 3 + ((buf[i + 1] << 8) | buf[i + 2]);
+    } else {
+      if (i + 2 > len)
+        return false;
+      ie_len = 2 + buf[i + 1];
+    }
+    if (i + ie_len > len)
+      return false;
+    LOG_D(NAS, "PDU Session Release Command: optional IE 0x%02x (%u B) skipped\n", iei, ie_len);
+    i += ie_len;
+  }
+  return true;
+}
+
+/**
+ * @brief Handle PDU Session Release Command (TS 24.501 6.3.3, 8.3.14)
+ */
+static void handle_pdu_session_release_command(nr_ue_nas_t *nas, uint8_t *pdu_buffer, uint32_t msg_length)
+{
+  int size = 0;
+  int decoded = 0;
+
+  // Security protected NAS header (7 bytes)
+  fgs_nas_message_security_header_t sec_nas_hdr = {0};
+  if ((decoded = decode_5gs_security_protected_header(&sec_nas_hdr, pdu_buffer, msg_length)) < 0) {
+    LOG_E(NAS, "decode_5gs_security_protected_header failure in PDU Session Release Command decoding\n");
+    return;
+  }
+  size += decoded;
+
+  // decode plain 5GMM message header
+  fgmm_msg_header_t mm_header = {0};
+  if ((decoded = decode_5gmm_msg_header(&mm_header, pdu_buffer + size, msg_length - size)) < 0) {
+    LOG_E(NAS, "decode_5gmm_msg_header failure in PDU Session Release Command decoding\n");
+    return;
+  }
+  size += decoded;
+
+  /* Process container (5GSM message) */
+  // Payload container type and spare (1 octet), payload container length (2 octets)
+  if (size + 3 > msg_length) {
+    LOG_E(NAS, "PDU Session Release Command too short (%u B)\n", msg_length);
+    return;
+  }
+  size++;
+  uint16_t iei_len = 0;
+  GET_SHORT(pdu_buffer + size, iei_len);
+  size += sizeof(iei_len);
+  if (size + iei_len > msg_length) {
+    LOG_E(NAS, "Invalid payload container length %u in PDU Session Release Command (%u B)\n", iei_len, msg_length);
+    return;
+  }
+  // decode plain 5GSM message header
+  fgsm_msg_header_t sm_header = {0};
+  if ((decoded = decode_5gsm_msg_header(&sm_header, pdu_buffer + size, iei_len)) < 0) {
+    LOG_E(NAS, "decode_5gsm_msg_header failure in PDU Session Release Command decoding\n");
+    return;
+  }
+  size += decoded;
+  // mandatory 5GSM cause (V, 1 octet), then the optional IEs
+  if (iei_len < decoded + 1) {
+    LOG_E(NAS, "PDU Session Release Command without 5GSM cause\n");
+    return;
+  }
+  const uint8_t cause = pdu_buffer[size];
+  if (!fgsm_skip_optional_ies(pdu_buffer + size + 1, iei_len - decoded - 1))
+    LOG_W(NAS, "PDU Session Release Command: malformed optional IE ignored\n");
+
+  const int psi = sm_header.pdu_session_id;
+  LOG_A(NAS,
+        "[UE %ld] Received PDU Session Release Command: PDU session %d PTI %d 5GSM cause #%d (%s)\n",
+        nas->UE_id,
+        psi,
+        sm_header.pti,
+        cause,
+        fgsm_release_cause_txt(cause));
+  // TS 24.501 7.3.2 a): unassigned or reserved PDU session ID: ignore the message
+  if (psi <= 0 || psi >= MAX_NUM_PSI) {
+    LOG_W(NAS, "PDU Session Release Command for invalid PDU session ID %d ignored\n", psi);
+    return;
+  }
+
+  if (nas->fiveGMM_mode == FGS_IDLE)
+    LOG_W(NAS, "[UE %ld] PDU Session Release Command while in 5GMM-IDLE: answer sent, RRC drops it without SRB\n", nas->UE_id);
+
+  as_nas_info_t response_msg = {0};
+  if (nas->psi_status[psi] == PDU_SESSION_INACTIVE) {
+    // TS 24.501 7.3.2 b): PDU session in state PDU SESSION INACTIVE: 5GSM STATUS #43 "invalid PDU session identity"
+    const uint8_t status_cause = FGSM_CAUSE_INVALID_PDU_SESSION_ID;
+    generate5gsmUplinkMsg(nas, &response_msg, psi, sm_header.pti, FGS_5GSM_STATUS, &status_cause, 1);
+    send_nas_uplink_data_req(nas, &response_msg);
+    LOG_W(NAS, "[UE %ld] PDU session %d is inactive: Send NAS_UPLINK_DATA_REQ message(5GSM Status #43)\n", nas->UE_id, psi);
+    return;
+  }
+
+  release_pdu_session_locally(nas, psi);
+
+  // TS 24.501 6.3.3.3: PDU SESSION RELEASE COMPLETE, same PDU session ID and PTI
+  generate5gsmUplinkMsg(nas, &response_msg, psi, sm_header.pti, FGS_PDU_SESSION_RELEASE_COMPLETE, NULL, 0);
+  send_nas_uplink_data_req(nas, &response_msg);
+  LOG_A(NAS, "[UE %ld] Send NAS_UPLINK_DATA_REQ message(PduSessionReleaseComplete) PDU session %d\n", nas->UE_id, psi);
+
+  if (cause != FGSM_CAUSE_REACTIVATION_REQUESTED)
+    return;
+  /* TS 24.501 6.3.3.3: #39 "reactivation requested": after the release, the UE re-initiates the UE-requested PDU session
+   * establishment (6.4.1, request type "initial request") with the PDU session type, DNN and S-NSSAI of the released one:
+   * those of its configuration */
+  for (const pdu_session_config_t *pdu = nas->uicc->pdu_sessions; pdu < nas->uicc->pdu_sessions + nas->uicc->n_pdu_sessions; ++pdu) {
+    if (pdu->id != psi)
+      continue;
+    LOG_A(NAS,
+          "[UE %ld] 5GSM cause #39 reactivation requested: re-establish PDU session %d type %d NSSAI %d.%d DNN %s\n",
+          nas->UE_id,
+          psi,
+          pdu->type,
+          pdu->nssai.sst,
+          pdu->nssai.sd,
+          pdu->dnn);
+    request_pdusession(nas, pdu);
+    return;
+  }
+  LOG_E(NAS, "[UE %ld] 5GSM cause #39 for PDU session %d: not in the configured PDU sessions, not re-established\n", nas->UE_id, psi);
 }
 
 /**
@@ -2221,6 +2412,8 @@ void handleDownlinkNASTransport(nr_ue_nas_t *nas, uint8_t *pdu_buffer, int pdu_l
   } else if (msg_type == FGS_PDU_SESSION_MODIFICATION_COMMAND) {
     LOG_A(NAS, "Received PDU Session Modification Command in DL NAS Transport\n");
     handle_pdu_session_modification_command(nas, pdu_buffer, pdu_length);
+  } else if (msg_type == FGS_PDU_SESSION_RELEASE_COMMAND) {
+    handle_pdu_session_release_command(nas, pdu_buffer, pdu_length);
   } else {
     LOG_E(NAS, "Received unexpected message in DLinformationTransfer %d\n", msg_type);
   }
@@ -2852,6 +3045,8 @@ void *nas_nrue(void *args_p)
           handle_service_accept(nas, &ba);
         } else if (msg_type == FGS_PDU_SESSION_MODIFICATION_COMMAND) {
           handle_pdu_session_modification_command(nas, ba.buf, ba.len);
+        } else if (msg_type == FGS_PDU_SESSION_RELEASE_COMMAND) {
+          handle_pdu_session_release_command(nas, ba.buf, ba.len);
         }
 
         // Free NAS buffer memory after use (coming from RRC)
@@ -2965,6 +3160,9 @@ void *nas_nrue(void *args_p)
             break;
           case FGS_PDU_SESSION_MODIFICATION_COMMAND:
             handle_pdu_session_modification_command(nas, pdu_buffer, pdu_length);
+            break;
+          case FGS_PDU_SESSION_RELEASE_COMMAND:
+            handle_pdu_session_release_command(nas, pdu_buffer, pdu_length);
             break;
           case FGS_REGISTRATION_REJECT:
             handle_registration_reject(nas, &buffer);
