@@ -1148,11 +1148,22 @@ static void cuup_notify_reestablishment(gNB_RRC_INST *rrc, gNB_RRC_UE_t *ue_p)
   bool um_on_default_drb = rrc->configuration.um_on_default_drb;
   /* loop through active DRBs */
   FOR_EACH_SEQ_ARR(drb_t *, drb, &ue_p->drbs) {
+    /* A PDU session being released has its DRBs already torn down in the CU-UP and the DU:
+     * nothing to re-establish; its release completes with the RRCReconfiguration. */
+    const rrc_pdu_session_param_t *session = find_pduSession(&ue_p->pduSessions, drb->pdusession_id);
+    if (session
+        && (session->status == PDU_SESSION_STATUS_TORELEASE || session->status == PDU_SESSION_STATUS_NOTIFYONRELEASE))
+      continue;
     bearer_context_pdcp_config_t pdcp = set_bearer_context_pdcp_config(drb->pdcp_config, um_on_default_drb, ue_p->redcap_cap);
     DRB_nGRAN_to_mod_t drb_e1 = get_e1_drb_mod_reestablishment(drb, &pdcp);
     if (!append_e1_drb_mod_req(&req, ue_p, drb->drb_id, &drb_e1)) {
       LOG_W(NR_RRC, "UE %d: Failed to append E1 DRB mod for reestablishment (DRB=%d)\n", ue_p->rrc_ue_id, drb->drb_id);
     }
+  }
+
+  if (req.numPDUSessionsMod == 0) {
+    free_e1ap_context_mod_request(&req);
+    return;
   }
 
   /* During reestablishment, for DRB integrity protection security keys change (KgNB* is derived),
