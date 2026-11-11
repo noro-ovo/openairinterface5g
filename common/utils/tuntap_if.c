@@ -220,36 +220,44 @@ bool tun_config(const char* ifname, const char *ipv4, const char *ipv6)
     return false;
   }
 
-  bool success = true;
+  /* each address family on its own: an IPv6 address the kernel refuses (IPv6 disabled on the interface) must not
+   * leave the IPv4 address of an IPv4v6 PDU session on a link that never comes up */
+  bool ok4 = ipv4 == NULL, ok6 = ipv6 == NULL;
   if (ipv4 != NULL)
-    success = setInterfaceParameter(sock_fd, ifname, AF_INET, ipv4, SIOCSIFADDR);
-  // set the machine network mask for IPv4
-  if (success && ipv4 != NULL)
-    success = setInterfaceParameter(sock_fd, ifname, AF_INET, "255.255.255.0", SIOCSIFNETMASK);
+    ok4 = setInterfaceParameter(sock_fd, ifname, AF_INET, ipv4, SIOCSIFADDR)
+          && setInterfaceParameter(sock_fd, ifname, AF_INET, "255.255.255.0", SIOCSIFNETMASK);  // IPv4 netmask
 
   if (ipv6 != NULL) {
     // for setting the IPv6 address, we need an IPv6 socket. For setting IPv4,
     // we need an IPv4 socket. So do all operations using IPv4 socket, except
     // for setting the IPv6
-    int sock_fd = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (sock_fd < 0) {
+    int sock6_fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (sock6_fd < 0)
       LOG_E(UTIL, "Failed creating socket for interface management: %d, %s\n", errno, strerror(errno));
-      success = false;
-    }
-    success = success && setInterfaceParameter(sock_fd, ifname, AF_INET6, ipv6, SIOCSIFADDR);
-    close(sock_fd);
+    else
+      ok6 = setInterfaceParameter(sock6_fd, ifname, AF_INET6, ipv6, SIOCSIFADDR);
+    if (sock6_fd >= 0)
+      close(sock6_fd);
+    if (!ok6 && ipv4 != NULL)
+      LOG_W(OIP, "Interface %s: IPv6 address %s not set, the link carries IPv4 %s only\n", ifname, ipv6, ipv4);
   }
 
-  if (success) {
+  /* the link comes up as soon as one requested address family is configured */
+  bool up = (ipv4 != NULL && ok4) || (ipv6 != NULL && ok6);
+  if (up) {
     const short flags = tuntap_set_up(ifname, sock_fd);
-    success = flags >= 0 && set_if_flags(sock_fd, ifname, (flags | IFF_NOARP | IFF_POINTOPOINT) & ~IFF_MULTICAST);
+    up = flags >= 0 && set_if_flags(sock_fd, ifname, (flags | IFF_NOARP | IFF_POINTOPOINT) & ~IFF_MULTICAST);
   }
+  const bool success = up && ok4 && ok6;
 
   // Note: only the link-local IPv6 address is available at this point.
   // The global IPv6 address is assigned after receiving a Router Advertisement, which triggers SLAAC
   // (3GPP TS 23.501, Section 5.8.2.2.3; IETF RFC 4862).
   if (success)
     LOG_A(OIP, "TUN Interface %s successfully configured, IPv4 %s, IPv6 %s\n", ifname, ipv4, ipv6);
+  else if (up)
+    LOG_W(OIP, "TUN Interface %s up with part of its addresses (IPv4 %s %s, IPv6 %s %s)\n", ifname, ipv4,
+          ok4 ? "set" : "NOT set", ipv6, ok6 ? "set" : "NOT set");
   else
     LOG_E(OIP, "Interface %s couldn't be configured (IPv4 %s, IPv6 %s)\n", ifname, ipv4, ipv6);
 
