@@ -59,6 +59,10 @@ bool nr_rrc_remove_drb_by_id(seq_arr_t *drb_ptr, const int drb_id);
 /// @return number of removed DRBs
 int nr_rrc_remove_unmapped_drbs(seq_arr_t *drbs, const pdusession_t *session, int removed[], int max);
 
+/// @brief Set @param xid for the PDU sessions of @param ue_p that take part in a reconfiguration
+/// and return the RRC action of that reconfiguration. @param n_drb_rel = DRBs to release in it.
+rrc_action_t nr_rrc_pdu_session_action(gNB_RRC_UE_t *ue_p, int xid, int n_drb_rel, bool is_reestablishment);
+
 /// @brief Add PDU Sessions and DRBs to UE context list
 void nr_rrc_add_bearers(gNB_RRC_INST *rrc, gNB_RRC_UE_t *UE, int n, pdusession_t *sessions);
 

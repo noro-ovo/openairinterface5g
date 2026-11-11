@@ -715,3 +715,59 @@ void nr_rrc_add_bearers(gNB_RRC_INST *rrc, gNB_RRC_UE_t *UE, int n, pdusession_t
     }
   }
 }
+
+#define ASSERT_PDU_ACTION_SINGLE(action, expected) DevAssert((action) == RRC_ACTION_NONE || (action) == (expected))
+
+/** @brief Set xid for all PDU sessions and derive RRC transaction action from
+ * session statuses. At most one active status (NEW, TOMODIFY, TORELEASE,
+ * NOTIFYONRELEASE). On the first reconfiguration after a reestablishment, a
+ * pending status means the UE re-established before completing that procedure:
+ * this reconfiguration carries it, so its action is the procedure's action;
+ * without a pending status, it is RRC_REESTABLISH_COMPLETE.
+ * Status vs procedures (F1AP UE Context Setup/Modification Response only):
+ * - NEW: Initial Context Setup or PDU Session Resource Setup Request;
+ *   E1 then F1 Setup/Modification.
+ * - TORELEASE: NGAP PDU Session Release Command -> E1 Bearer Context
+ *   Modification (release) -> F1 Modification (release DRBs).
+ * - NOTIFYONRELEASE: N3 GTP-U Error Indication (TS 23.527) -> same teardown chain
+     (E1/F1) -> PDU Session Resource Notify.
+ * - ESTABLISHED: Bystander when adding/releasing others.
+ * - TOMODIFY: NGAP PDU Session Modify Request -> E1 Bearer Context
+ *   Modification (if CU-UP) -> F1 Modification Response.
+ * - FAILED: Bystander. Cleaned up in modify response */
+rrc_action_t nr_rrc_pdu_session_action(gNB_RRC_UE_t *ue_p, int xid, int n_drb_rel, bool is_reestablishment)
+{
+  rrc_action_t action = RRC_ACTION_NONE;
+  FOR_EACH_SEQ_ARR (rrc_pdu_session_param_t *, item, &ue_p->pduSessions) {
+    /* Only sessions that participate in this transaction get the current xid. */
+    if (item->status != PDU_SESSION_STATUS_FAILED && item->status != PDU_SESSION_STATUS_ESTABLISHED) {
+      item->xid = xid;
+    }
+    if (item->status == PDU_SESSION_STATUS_TOMODIFY) {
+      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_MODIFY);
+      LOG_I(NR_RRC,
+            "UE %d: PDU Session Modify: status to TOMODIFY for PDU Session %d\n",
+            ue_p->rrc_ue_id,
+            item->param.pdusession_id);
+      action = RRC_PDUSESSION_MODIFY;
+    } else if (item->status == PDU_SESSION_STATUS_NEW) {
+      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_ESTABLISH);
+      LOG_I(NR_RRC, "PDU Session New: status to ESTABLISH for PDU Session %d \n", item->param.pdusession_id);
+      action = RRC_PDUSESSION_ESTABLISH;
+    } else if (item->status == PDU_SESSION_STATUS_TORELEASE) {
+      DevAssert(n_drb_rel > 0);
+      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_RELEASE);
+      LOG_I(NR_RRC, "PDU Session Release: setting PDU Session status to TORELEASE for PDU Session %d\n", item->param.pdusession_id);
+      action = RRC_PDUSESSION_RELEASE;
+    } else if (item->status == PDU_SESSION_STATUS_NOTIFYONRELEASE) {
+      DevAssert(n_drb_rel > 0);
+      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_RESOURCE_NOTIFY);
+      LOG_I(NR_RRC, "Released PDU Session %d to be notified (NOTIFYONRELEASE)\n", item->param.pdusession_id);
+      action = RRC_PDUSESSION_RESOURCE_NOTIFY;
+    }
+    /* ESTABLISHED and FAILED do not drive transaction action */
+  }
+  if (is_reestablishment && action == RRC_ACTION_NONE)
+    action = RRC_REESTABLISH_COMPLETE;
+  return action;
+}
