@@ -406,6 +406,41 @@ static void test_rrc_remove_unmapped_drbs(void)
   LOG_A(NR_RRC, "Unmapped DRB removal test passed\n");
 }
 
+static void test_rrc_reestablishment_pending_session(void)
+{
+  LOG_I(NR_RRC, "Starting reestablishment with a pending PDU session test\n");
+  gNB_RRC_UE_t ue = {.rrc_ue_id = 2};
+  seq_arr_init(&ue.pduSessions, sizeof(rrc_pdu_session_param_t));
+  pdusession_t in = {.pdusession_id = 2};
+  seq_arr_init(&in.qos, sizeof(nr_rrc_qos_t));
+  rrc_pdu_session_param_t *s = add_pduSession(&ue.pduSessions, &in);
+  AssertFatal(s != NULL, "add PDU session failed\n");
+
+  /* no pending session: plain reestablishment */
+  s->status = PDU_SESSION_STATUS_ESTABLISHED;
+  rrc_action_t a = nr_rrc_pdu_session_action(&ue, 1, 0, true);
+  AssertFatal(a == RRC_REESTABLISH_COMPLETE, "action %d, expected RRC_REESTABLISH_COMPLETE\n", a);
+
+  /* setup not completed when the UE re-established: the reconfiguration after it completes the setup */
+  s->status = PDU_SESSION_STATUS_NEW;
+  a = nr_rrc_pdu_session_action(&ue, 2, 0, true);
+  AssertFatal(a == RRC_PDUSESSION_ESTABLISH, "action %d, expected RRC_PDUSESSION_ESTABLISH\n", a);
+  AssertFatal(s->xid == 2, "xid %d, expected 2\n", s->xid);
+
+  /* same for a modification */
+  s->status = PDU_SESSION_STATUS_TOMODIFY;
+  a = nr_rrc_pdu_session_action(&ue, 3, 0, true);
+  AssertFatal(a == RRC_PDUSESSION_MODIFY, "action %d, expected RRC_PDUSESSION_MODIFY\n", a);
+
+  /* and a release */
+  s->status = PDU_SESSION_STATUS_TORELEASE;
+  a = nr_rrc_pdu_session_action(&ue, 0, 1, true);
+  AssertFatal(a == RRC_PDUSESSION_RELEASE, "action %d, expected RRC_PDUSESSION_RELEASE\n", a);
+
+  seq_arr_free(&ue.pduSessions, free_pdusession);
+  LOG_A(NR_RRC, "Reestablishment with a pending PDU session test passed\n");
+}
+
 int main()
 {
   // Initialize logging system
@@ -420,6 +455,8 @@ int main()
   test_rrc_qos();
   // DRB removal after QoS flow release
   test_rrc_remove_unmapped_drbs();
+  // Reestablishment while a PDU session procedure is pending
+  test_rrc_reestablishment_pending_session();
   LOG_A(NR_RRC, "All RRC Bearers tests passed successfully!\n");
   return 0;
 }
