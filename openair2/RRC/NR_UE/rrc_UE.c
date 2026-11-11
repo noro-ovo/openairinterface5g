@@ -770,8 +770,7 @@ static void nr_rrc_ue_tun_start_user_plane(NR_UE_RRC_INST_t *rrc, int pdusession
     if (rrc->nrRrcState == RRC_STATE_CONNECTED_NR) {
       /* the DRB of this PDU session comes with a later RRCReconfiguration (Service Accept ahead of the PDU Session
        * Resource Setup): start once its SDAP entity exists (rrc_ue_add_bearer) */
-      rrc->up_pending[pdusession_id] =
-          (nas_tun_psi_t){.pdusession_id = pdusession_id, .sock = sock, .qfi = qfi, .reader_thread = reader_thread};
+      rrc->up_pending[pdusession_id] = true;
       LOG_I(NR_RRC, "[UE %ld] PDU session %d: user plane started when its DRB is added\n", ue_id, pdusession_id);
       return;
     }
@@ -783,7 +782,7 @@ static void nr_rrc_ue_tun_start_user_plane(NR_UE_RRC_INST_t *rrc, int pdusession
           pdusession_id);
     return;
   }
-  rrc->up_pending[pdusession_id].reader_thread = NULL;
+  rrc->up_pending[pdusession_id] = false;
   nr_sdap_tun_stop_reader(reader_thread);
   nr_sdap_tun_bind(entity, sock, qfi);
   char name[64];
@@ -815,10 +814,18 @@ static void rrc_ue_add_bearer(NR_UE_RRC_INST_t *rrc, const NR_DRB_ToAddMod_t *dr
   nr_sdap_addmod_entity(GNB_FLAG_NO, ue_id, &sdap);
   // add PDCP entity
   nr_pdcp_add_drb(GNB_FLAG_NO, ue_id, drb->pdcp_Config, &sdap, sp);
-  // a user-plane start that waited for this PDU session's DRB
-  if (sdap.pdusession_id > 0 && sdap.pdusession_id < NAS_TUN_LIST_MAX && rrc->up_pending[sdap.pdusession_id].reader_thread) {
-    nas_tun_psi_t p = rrc->up_pending[sdap.pdusession_id];
-    nr_rrc_ue_tun_start_user_plane(rrc, p.pdusession_id, p.sock, p.qfi, p.reader_thread);
+}
+
+/** @brief After an RRCReconfiguration is applied and confirmed: the user-plane starts that waited for a DRB of
+ * their PDU session, with the TUN state NAS holds now */
+static void nr_rrc_ue_start_pending_user_plane(NR_UE_RRC_INST_t *rrc)
+{
+  nr_ue_nas_t *nas = get_ue_nas_info(rrc->ue_id);
+  for (int psi = 1; psi < NAS_TUN_LIST_MAX && psi < MAX_NUM_PSI; psi++) {
+    nas_ue_pdu_tun_t *t = &nas->pdu_tun[psi];
+    if (!rrc->up_pending[psi] || !nr_sdap_get_entity(rrc->ue_id, psi) || t->sock < 0)
+      continue;
+    nr_rrc_ue_tun_start_user_plane(rrc, psi, t->sock, t->qfi, &t->reader_thread);
   }
 }
 
@@ -2962,6 +2969,7 @@ static int nr_rrc_ue_decode_dcch(NR_UE_RRC_INST_t *rrc,
           }
           nr_rrc_ue_process_rrcReconfiguration(rrc, gNB_indexP, c1->choice.rrcReconfiguration);
           nr_rrc_ue_generate_RRCReconfigurationComplete(rrc, Srb_id, c1->choice.rrcReconfiguration->rrc_TransactionIdentifier);
+          nr_rrc_ue_start_pending_user_plane(rrc);
         } break;
 
         case NR_DL_DCCH_MessageType__c1_PR_rrcResume:
