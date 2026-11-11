@@ -1001,63 +1001,6 @@ byte_array_t rrc_gNB_encode_RRCReconfiguration(gNB_RRC_UE_t *UE, nr_rrc_reconfig
 /* Forward declaration */
 static void cuup_notify_reestablishment(gNB_RRC_INST *rrc, gNB_RRC_UE_t *ue_p);
 
-#define ASSERT_PDU_ACTION_SINGLE(action, expected)                    \
-  do {                                                                \
-    DevAssert((action) != RRC_REESTABLISH_COMPLETE);                  \
-    DevAssert((action) == RRC_ACTION_NONE || (action) == (expected)); \
-  } while (0)
-
-/** @brief Set xid for all PDU sessions and derive RRC transaction action from
- * session statuses. At most one active status (NEW, TOMODIFY, TORELEASE,
- * NOTIFYONRELEASE) or reestablishment.
- * Status vs procedures (F1AP UE Context Setup/Modification Response only):
- * - NEW: Initial Context Setup or PDU Session Resource Setup Request;
- *   E1 then F1 Setup/Modification.
- * - TORELEASE: NGAP PDU Session Release Command -> E1 Bearer Context
- *   Modification (release) -> F1 Modification (release DRBs).
- * - NOTIFYONRELEASE: N3 GTP-U Error Indication (TS 23.527) -> same teardown chain
-     (E1/F1) -> PDU Session Resource Notify.
- * - ESTABLISHED: Bystander when adding/releasing others.
- * - TOMODIFY: NGAP PDU Session Modify Request -> E1 Bearer Context
- *   Modification (if CU-UP) -> F1 Modification Response.
- * - FAILED: Bystander. Cleaned up in modify response */
-static rrc_action_t rrc_gNB_action_from_pdusession_status(gNB_RRC_UE_t *ue_p,
-                                                          const nr_rrc_reconfig_param_t *params,
-                                                          bool is_reestablishment)
-{
-  rrc_action_t action = is_reestablishment ? RRC_REESTABLISH_COMPLETE : RRC_ACTION_NONE;
-  FOR_EACH_SEQ_ARR (rrc_pdu_session_param_t *, item, &ue_p->pduSessions) {
-    /* Only sessions that participate in this transaction get the current xid. */
-    if (item->status != PDU_SESSION_STATUS_FAILED && item->status != PDU_SESSION_STATUS_ESTABLISHED) {
-      item->xid = params->transaction_id;
-    }
-    if (item->status == PDU_SESSION_STATUS_TOMODIFY) {
-      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_MODIFY);
-      LOG_I(NR_RRC,
-            "UE %d: PDU Session Modify: status to TOMODIFY for PDU Session %d\n",
-            ue_p->rrc_ue_id,
-            item->param.pdusession_id);
-      action = RRC_PDUSESSION_MODIFY;
-    } else if (item->status == PDU_SESSION_STATUS_NEW) {
-      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_ESTABLISH);
-      LOG_I(NR_RRC, "PDU Session New: status to ESTABLISH for PDU Session %d \n", item->param.pdusession_id);
-      action = RRC_PDUSESSION_ESTABLISH;
-    } else if (item->status == PDU_SESSION_STATUS_TORELEASE) {
-      DevAssert(params->n_drb_rel > 0);
-      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_RELEASE);
-      LOG_I(NR_RRC, "PDU Session Release: setting PDU Session status to TORELEASE for PDU Session %d\n", item->param.pdusession_id);
-      action = RRC_PDUSESSION_RELEASE;
-    } else if (item->status == PDU_SESSION_STATUS_NOTIFYONRELEASE) {
-      DevAssert(params->n_drb_rel > 0);
-      ASSERT_PDU_ACTION_SINGLE(action, RRC_PDUSESSION_RESOURCE_NOTIFY);
-      LOG_I(NR_RRC, "Released PDU Session %d to be notified (NOTIFYONRELEASE)\n", item->param.pdusession_id);
-      action = RRC_PDUSESSION_RESOURCE_NOTIFY;
-    }
-    /* ESTABLISHED and FAILED do not drive transaction action */
-  }
-  return action;
-}
-
 /** @brief Generate and send RRC Reconfiguration message.
  * Handles both normal reconfiguration and first reconfiguration after re-establishment.
  * @param rrc RRC instance
@@ -1073,7 +1016,7 @@ static void rrc_gNB_generate_dedicatedRRCReconfiguration(gNB_RRC_INST *rrc, gNB_
   bool drb_reestablish = is_reestablishment;
   nr_rrc_reconfig_param_t params = get_RRCReconfiguration_params(rrc, ue_p, srb_reest_bitmap, drb_reestablish);
 
-  ue_p->xids[params.transaction_id] = rrc_gNB_action_from_pdusession_status(ue_p, &params, is_reestablishment);
+  ue_p->xids[params.transaction_id] = nr_rrc_pdu_session_action(ue_p, params.transaction_id, params.n_drb_rel, is_reestablishment);
 
   byte_array_t msg = rrc_gNB_encode_RRCReconfiguration(ue_p, params);
   if (msg.len <= 0) {
