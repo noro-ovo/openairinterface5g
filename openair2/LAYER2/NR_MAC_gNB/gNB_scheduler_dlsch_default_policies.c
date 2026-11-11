@@ -152,7 +152,8 @@ void nr_dl_mcs_select_default(const nr_cell_sched_t *cell, nr_dl_candidate_t *ca
     } else if (bo->harq_round_max == 1) {
       mcs = max(bo->min_mcs, min(bo->max_mcs, cand->max_mcs));
     } else if (!cand->bler_updated) {
-      mcs = cand->current_mcs;
+      /* the limit can be lower than when the MCS was chosen: switch to the 256QAM table (max 27) */
+      mcs = max(bo->min_mcs, min(cand->current_mcs, cand->max_mcs));
     } else {
       mcs = nr_adapt_mcs_from_bler(cand->current_mcs,
                                    bo->min_mcs,
