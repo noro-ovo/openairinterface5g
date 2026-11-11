@@ -259,7 +259,8 @@ void nr_ul_mcs_select_default(const nr_cell_sched_t *cell, nr_ul_candidate_t *ca
       mcs = get_mcs_from_SINRx10(cand->mcs_table, cand->snrx10, cand->sched_pusch.nrOfLayers);
       mcs = max(bo->min_mcs, min(bo->max_mcs, min(cand->max_mcs, mcs)));
     } else if (!cand->bler_updated) {
-      mcs = cand->current_mcs;
+      /* the limit can be lower than when the MCS was chosen: switch to the 256QAM table (max 27) */
+      mcs = max(bo->min_mcs, min(cand->current_mcs, cand->max_mcs));
     } else {
       mcs = nr_adapt_mcs_from_bler(cand->current_mcs,
                                    bo->min_mcs,
