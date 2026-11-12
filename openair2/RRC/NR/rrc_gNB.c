@@ -951,9 +951,9 @@ nr_rrc_reconfig_param_t get_RRCReconfiguration_params(gNB_RRC_INST *rrc, gNB_RRC
     pdusession_t *session = &item->param;
     // Collect NAS PDUs
     if (session->nas_pdu.len > 0) {
-      params.dedicated_NAS_msg_list[params.num_nas_msg++] = session->nas_pdu;
-      session->nas_pdu.buf = NULL;
-      session->nas_pdu.len = 0;
+      /* A copy: the session keeps its NAS PDU until the RRCReconfigurationComplete of its transaction, so the
+       * RRCReconfiguration after a reestablishment carries it again if the first one was lost. */
+      params.dedicated_NAS_msg_list[params.num_nas_msg++] = copy_byte_array(session->nas_pdu);
       LOG_D(NR_RRC, "Transfer NAS info with size %ld to RRCReconfiguration params\n", session->nas_pdu.len);
     }
     // Collect DRBs to release for PDU sessions marked for release
@@ -1192,6 +1192,24 @@ static void rrc_gNB_generate_RRCReestablishment(rrc_gNB_ue_context_t *ue_context
   gNB_RRC_UE_t *ue_p = &ue_context_pP->ue_context;
   uint8_t buffer[NR_RRC_BUF_SIZE] = {0};
   uint8_t xid = rrc_gNB_get_next_transaction_identifier(module_id);
+  /* TS 38.331 5.3.7.2: the UE discards an ongoing RRCReconfiguration when it starts a reestablishment, so no
+   * Complete will come for those transactions. Their procedures are completed by the RRCReconfiguration after the
+   * reestablishment, which gets a new transaction ID. */
+  for (int i = 0; i < NR_RRC_TRANSACTION_IDENTIFIER_NUMBER; i++) {
+    switch (ue_p->xids[i]) {
+      case RRC_PDUSESSION_ESTABLISH:
+      case RRC_PDUSESSION_MODIFY:
+      case RRC_PDUSESSION_RELEASE:
+      case RRC_PDUSESSION_RESOURCE_NOTIFY:
+      case RRC_DEDICATED_RECONF:
+      case RRC_REESTABLISH_COMPLETE:
+        LOG_I(NR_RRC, "UE %d: transaction %d (action %d) superseded by the reestablishment\n", ue_p->rrc_ue_id, i, ue_p->xids[i]);
+        ue_p->xids[i] = RRC_ACTION_NONE;
+        break;
+      default:
+        break;
+    }
+  }
   ue_p->xids[xid] = RRC_REESTABLISH;
 
   nr_rrc_cell_container_t *pcell = rrc_get_pcell_for_ue(rrc, ue_p);
@@ -2178,6 +2196,11 @@ static void handle_rrcSetupComplete(gNB_RRC_INST *rrc, gNB_RRC_UE_t *UE, const N
 static void handle_rrcReconfigurationComplete(gNB_RRC_INST *rrc, gNB_RRC_UE_t *UE, const NR_RRCReconfigurationComplete_t *reconfig_complete)
 {
   uint8_t xid = reconfig_complete->rrc_TransactionIdentifier;
+  /* the NAS PDUs of this transaction reached the UE */
+  FOR_EACH_SEQ_ARR (rrc_pdu_session_param_t *, item, &UE->pduSessions) {
+    if (item->xid == xid)
+      FREE_AND_ZERO_BYTE_ARRAY(item->param.nas_pdu);
+  }
   UE->ue_reconfiguration_counter++;
   UE->ongoing_reconfiguration = false;
 
