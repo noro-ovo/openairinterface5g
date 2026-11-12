@@ -1227,7 +1227,11 @@ static void process_reestablishment(gNB_MAC_INST *mac, uint32_t new_dl_rrc_id, u
    * reconfigCellGroup was saved by the first reestablishment and
    * CellGroup.spCellConfig is already NULL — don't overwrite. */
   if (!oldUE->reestablish_rlc) {
-    asn_copy(&asn_DEF_NR_CellGroupConfig, (void **)&oldUE->reconfigCellGroup, oldUE->CellGroup);
+    /* A reconfiguration still pending (not acknowledged by the UE, e.g. the DRBs of a new PDU session) is the DU's
+     * current configuration: keep it, the RRCReconfiguration after the reestablishment configures it. Only without
+     * one is the applied configuration saved. */
+    if (!oldUE->reconfigCellGroup)
+      asn_copy(&asn_DEF_NR_CellGroupConfig, (void **)&oldUE->reconfigCellGroup, oldUE->CellGroup);
     ASN_STRUCT_FREE(asn_DEF_NR_SpCellConfig, oldUE->CellGroup->spCellConfig);
     oldUE->CellGroup->spCellConfig = NULL;
     reset_sc_info(&oldUE->sc_info);
