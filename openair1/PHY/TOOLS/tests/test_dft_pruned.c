@@ -3,7 +3,7 @@
  */
 
 /* Pruned DFT/IDFT test: the used bins of dft_pruned() must be bit-identical to dft() (natural layout)
- * and to dft() + fftshift (packed layout); idft_pruned() must be bit-identical to idft() of the input
+ * and to dft() + FFT shift (packed layout); idft_pruned() must be bit-identical to idft() of the input
  * with zero guard bins (packed layout: the guard bins of the input are zero, as in the NR transmit
  * buffers; natural layout: they hold garbage and must not be used). Writes must stay inside the N-sample
  * output buffer. Inputs are also passed at an odd sample offset (not vector aligned),
@@ -227,7 +227,7 @@ static void full_dft_fftshift(int N, c16_t *in, c16_t *out, int nbins)
   memcpy(out, tmp, half * sizeof(c16_t));
 }
 
-/* What the NR transmit path does without pruning: fftshift_inverse into a zero-guard buffer + full IDFT. */
+/* The transmit side without pruning: the band moved to natural FFT order in a zero-guard buffer + full IDFT. */
 static void ifftshift_full_idft(int N, c16_t *in, c16_t *nat, c16_t *out, int nbins)
 {
   const int half = nbins / 2;
