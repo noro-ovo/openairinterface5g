@@ -9,7 +9,9 @@
 #error "oai_dfts_common.h is included only by oai_dfts.c"
 #endif
 
-static pthread_mutex_t sr_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Every twiddle table is built once, by a constructor of this kind, when the library is loaded. The transforms then
+ * read the tables directly, with no readiness check or lock in the real-time path. */
+#define DFT_TABLE_BUILDER __attribute__((constructor(101), cold))
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -134,6 +136,33 @@ static __attribute__((noinline)) void radix5_pack_children_nogather_generic(cons
   if (n < M) {
     for (int br = 0; br < 5; br++)
       simde_mm_store_si128((simde__m128i *)(packed + br * M + n), load4_complex_strided_c16(src + br, 5, n));
+  }
+}
+
+/* Stores the first `valid` (0..8) complex lanes of v at dst with plain 16/8/4-byte stores. A masked store
+ * (vpmaskmovd to memory) is microcoded on AMD Zen 2..4 and costs tens of cycles; these stores are not. */
+static __attribute__((always_inline)) inline void store_complex_lanes_256(c16_t *dst, simde__m256i v, int valid)
+{
+  if (valid >= 8) {
+    simde_mm256_storeu_si256((simde__m256i *)dst, v);
+    return;
+  }
+  simde__m128i part = simde_mm256_castsi256_si128(v);
+  if (valid >= 4) {
+    simde_mm_storeu_si128((simde__m128i *)dst, part);
+    part = simde_mm256_extracti128_si256(v, 1);
+    dst += 4;
+    valid -= 4;
+  }
+  if (valid >= 2) {
+    simde_mm_storel_epi64((simde__m128i *)dst, part);
+    part = simde_mm_srli_si128(part, 8);
+    dst += 2;
+    valid -= 2;
+  }
+  if (valid) {
+    const int32_t w = simde_mm_cvtsi128_si32(part);
+    memcpy(dst, &w, sizeof(w));
   }
 }
 
@@ -476,11 +505,9 @@ static void dft1024_radix16(const c16_t *src, c16_t *dst, dft_dir_t dir);
 static size_t dft_power2_mixed_large_work_len(int N);
 static void dft_power2_mixed_large_core(const c16_t *src, c16_t *dst, int N, dft_dir_t dir, c16_t *work);
 static void dft_radix3_pow2(const c16_t *src, c16_t *dst, int N, dft_dir_t dir);
-static void power2_leaf_twiddles_init(void);
 
 typedef struct {
   int r3_q15_blocks;
-  unsigned char r3_q15_ready;
   simde__m128i *r3_q15_storage;
   /* Same layout with unit magnitude (no 1/sqrt(3)); only for N <= R3_UNIT_MAX_N,
    * where the table is the second-stage table of a radix-9 parent. */
@@ -491,7 +518,6 @@ typedef struct {
 
 typedef struct {
   int r5_q15_blocks;
-  unsigned char r5_q15_ready;
   simde__m128i *r5_q15_storage;
 } r5_twiddle_t;
 
@@ -524,7 +550,6 @@ typedef struct {
 
 typedef struct {
   int q15_blocks;
-  unsigned char q15_ready;
   simde__m256i *q15_re;
   simde__m256i *q15_im;
   simde__m256i *q15_im_inv;
@@ -603,7 +628,6 @@ static inline r3_twiddle_t *r3_twiddle_slot(int N)
       return NULL;
   }
 }
-#undef R3_TWIDDLE_SIZES
 
 static inline r5_twiddle_t *r5_twiddle_slot(int N)
 {
@@ -617,7 +641,6 @@ static inline r5_twiddle_t *r5_twiddle_slot(int N)
       return NULL;
   }
 }
-#undef R5_TWIDDLE_SIZES
 
 static inline power2_twiddle_t *power2_twiddle_slot(int N)
 {
@@ -631,7 +654,6 @@ static inline power2_twiddle_t *power2_twiddle_slot(int N)
       return NULL;
   }
 }
-#undef POWER2_TWIDDLE_SIZES
 
 /* Twiddle packers for 4-lane (SSE) and 8-lane (AVX2) vectors: W_N^(mul*k) * scale, re/re and -im/im pairs. */
 #define DEFINE_SCALED_TWIDDLE_PACKERS(RE_FN, IM_FN, VEC, LENGTH, LANES, ATTR, FIRST_INDEX, LOAD) \
@@ -781,63 +803,43 @@ static int r5_twiddle_create_extra(r5_twiddle_t *table, int N)
   return 1;
 }
 
-static pthread_mutex_t twiddle_component_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define R3_TWIDDLE_BUILD(N_)                                                                                         \
+  AssertFatal(r3_twiddle_create_q15_simd(&g_r3_twiddle_##N_, N_) && r3_twiddle_create_extra(&g_r3_twiddle_##N_, N_), \
+              "radix-3 twiddles for N=%d: allocation failed\n",                                                      \
+              N_);
+#define R5_TWIDDLE_BUILD(N_)                                                                                         \
+  AssertFatal(r5_twiddle_create_q15_simd(&g_r5_twiddle_##N_, N_) && r5_twiddle_create_extra(&g_r5_twiddle_##N_, N_), \
+              "radix-5 twiddles for N=%d: allocation failed\n",                                                      \
+              N_);
 
-#define DEFINE_COMPONENT_TWIDDLE_ENSURE_Q15(RADIX)                                                       \
-  static int r##RADIX##_twiddle_ensure_q15(r##RADIX##_twiddle_t *table, int N)                           \
-  {                                                                                                      \
-    if (__builtin_expect(__atomic_load_n(&table->r##RADIX##_q15_ready, __ATOMIC_ACQUIRE), 1))            \
-      return 1;                                                                                          \
-                                                                                                         \
-    pthread_mutex_lock(&twiddle_component_mutex);                                                        \
-    if (!__atomic_load_n(&table->r##RADIX##_q15_ready, __ATOMIC_RELAXED)) {                              \
-      if (!r##RADIX##_twiddle_create_q15_simd(table, N) || !r##RADIX##_twiddle_create_extra(table, N)) { \
-        pthread_mutex_unlock(&twiddle_component_mutex);                                                  \
-        return 0;                                                                                        \
-      }                                                                                                  \
-      __atomic_store_n(&table->r##RADIX##_q15_ready, 1, __ATOMIC_RELEASE);                               \
-    }                                                                                                    \
-    pthread_mutex_unlock(&twiddle_component_mutex);                                                      \
-    return 1;                                                                                            \
-  }
-
-DEFINE_COMPONENT_TWIDDLE_ENSURE_Q15(3)
-
-DEFINE_COMPONENT_TWIDDLE_ENSURE_Q15(5)
-
-#define DEFINE_COMPONENT_TWIDDLE_GET(RADIX)                                                                      \
-  static const r##RADIX##_twiddle_t *r##RADIX##_twiddle_get(int N)                                               \
-  {                                                                                                              \
-    r##RADIX##_twiddle_t *table = r##RADIX##_twiddle_slot(N);                                                    \
-    AssertFatal(table && r##RADIX##_twiddle_ensure_q15(table, N), "No radix-" #RADIX " twiddles for N=%d\n", N); \
-    return table;                                                                                                \
-  }
-
-DEFINE_COMPONENT_TWIDDLE_GET(3)
-
-DEFINE_COMPONENT_TWIDDLE_GET(5)
-
-static pthread_mutex_t mixed_power2_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static int power2_twiddle_ensure_q15(power2_twiddle_t *table, int N, int radix)
+// clang-format off
+static DFT_TABLE_BUILDER void component_twiddles_build(void)
 {
-  if (radix != 8 && radix != 16)
-    return 0;
+  R3_TWIDDLE_SIZES(R3_TWIDDLE_BUILD)
+  R5_TWIDDLE_SIZES(R5_TWIDDLE_BUILD)
+}
+// clang-format on
+#undef R3_TWIDDLE_BUILD
+#undef R5_TWIDDLE_BUILD
+#undef R3_TWIDDLE_SIZES
+#undef R5_TWIDDLE_SIZES
 
-  if (__builtin_expect(__atomic_load_n(&table->q15_ready, __ATOMIC_ACQUIRE), 1))
-    return 1;
-
-  pthread_mutex_lock(&mixed_power2_twiddle_mutex);
-  if (__atomic_load_n(&table->q15_ready, __ATOMIC_RELAXED)) {
-    pthread_mutex_unlock(&mixed_power2_twiddle_mutex);
-    return 1;
+/* The table of size N, built at load; N is a constant at the call sites, so this is a direct address. */
+#define DEFINE_COMPONENT_TWIDDLE_GET(RADIX)                                                              \
+  static __attribute__((always_inline)) inline const r##RADIX##_twiddle_t *r##RADIX##_twiddle_get(int N) \
+  {                                                                                                      \
+    const r##RADIX##_twiddle_t *table = r##RADIX##_twiddle_slot(N);                                      \
+    AssertFatal(table, "No radix-" #RADIX " twiddles for N=%d\n", N);                                    \
+    return table;                                                                                        \
   }
 
+DEFINE_COMPONENT_TWIDDLE_GET(3) DEFINE_COMPONENT_TWIDDLE_GET(5)
+
+    static int power2_twiddle_build(power2_twiddle_t *table, int N, int radix)
+{
   const int size = N / radix;
-  if (size < 8 || (size & 7)) {
-    pthread_mutex_unlock(&mixed_power2_twiddle_mutex);
+  if ((radix != 8 && radix != 16) || size < 8 || (size & 7))
     return 0;
-  }
 
   const int blocks = size / 8;
   const size_t count = (size_t)radix * (size_t)blocks;
@@ -845,16 +847,8 @@ static int power2_twiddle_ensure_q15(power2_twiddle_t *table, int N, int radix)
   table->q15_re = aligned_malloc64(count * sizeof(simde__m256i));
   table->q15_im = aligned_malloc64(count * sizeof(simde__m256i));
   table->q15_im_inv = aligned_malloc64(count * sizeof(simde__m256i));
-  if (!table->q15_re || !table->q15_im || !table->q15_im_inv) {
-    free(table->q15_re);
-    free(table->q15_im);
-    free(table->q15_im_inv);
-    table->q15_re = NULL;
-    table->q15_im = NULL;
-    table->q15_im_inv = NULL;
-    pthread_mutex_unlock(&mixed_power2_twiddle_mutex);
+  if (!table->q15_re || !table->q15_im || !table->q15_im_inv)
     return 0;
-  }
 
   /* The radix-8 stage runs a half-scaled DFT8; the twiddles carry 1/sqrt(2). */
   const float scale = 1.0f / sqrtf(2.0f);
@@ -870,10 +864,18 @@ static int power2_twiddle_ensure_q15(power2_twiddle_t *table, int N, int radix)
   }
 
   table->q15_blocks = blocks;
-  __atomic_store_n(&table->q15_ready, 1, __ATOMIC_RELEASE);
-  pthread_mutex_unlock(&mixed_power2_twiddle_mutex);
   return 1;
 }
+
+#define POWER2_TWIDDLE_BUILD(N_) \
+  AssertFatal(power2_twiddle_build(&g_power2_twiddle_##N_, N_, 8), "radix-8 twiddles for N=%d: allocation failed\n", N_);
+
+static DFT_TABLE_BUILDER void power2_twiddles_build(void)
+{
+  POWER2_TWIDDLE_SIZES(POWER2_TWIDDLE_BUILD)
+}
+#undef POWER2_TWIDDLE_BUILD
+#undef POWER2_TWIDDLE_SIZES
 
 typedef struct {
   int blocks;
@@ -887,8 +889,6 @@ typedef struct {
 
 static sr_twiddle_simd_t sr_twiddles_fwd[SR_TWIDDLE_SLOT_COUNT];
 static sr_twiddle_simd_t sr_twiddles_bwd[SR_TWIDDLE_SLOT_COUNT];
-static unsigned char sr_twiddles_fwd_ready[SR_TWIDDLE_SLOT_COUNT];
-static unsigned char sr_twiddles_bwd_ready[SR_TWIDDLE_SLOT_COUNT];
 
 static int init_sr_twiddle_simd(sr_twiddle_simd_t *tw, int N, dft_dir_t dir)
 {
@@ -953,25 +953,17 @@ static sr_twiddle_simd_t *sr_twiddle_table_create(int N, dft_dir_t dir)
   return tw;
 }
 
-static const sr_twiddle_simd_t *sr_twiddle_table_get(int N, dft_dir_t dir)
+/* N = 16384 is the only split-radix size (dft16384_split_radix). */
+static DFT_TABLE_BUILDER void sr_twiddles_build(void)
 {
-  AssertFatal(N >= (1 << SR_MIN_LOG2) && is_power_of_two_int(N), "Invalid split-radix twiddle size N=%d\n", N);
+  AssertFatal(sr_twiddle_table_create(16384, DFT_DIR_FORWARD) && sr_twiddle_table_create(16384, DFT_DIR_INVERSE),
+              "Split-radix twiddles: allocation failed\n");
+}
+
+static __attribute__((always_inline)) inline const sr_twiddle_simd_t *sr_twiddle_table_get(int N, dft_dir_t dir)
+{
   const int idx = log2_int((unsigned int)N) - SR_MIN_LOG2;
-  AssertFatal(idx < SR_TWIDDLE_SLOT_COUNT, "Split-radix N=%d exceeds the supported maximum %d\n", N, 1 << SR_MAX_LOG2);
-
-  sr_twiddle_simd_t *tw = (dir == DFT_DIR_FORWARD) ? &sr_twiddles_fwd[idx] : &sr_twiddles_bwd[idx];
-  unsigned char *ready = (dir == DFT_DIR_FORWARD) ? &sr_twiddles_fwd_ready[idx] : &sr_twiddles_bwd_ready[idx];
-
-  if (__builtin_expect(__atomic_load_n(ready, __ATOMIC_ACQUIRE), 1))
-    return tw;
-
-  pthread_mutex_lock(&sr_twiddle_mutex);
-  if (!__atomic_load_n(ready, __ATOMIC_RELAXED)) {
-    AssertFatal(sr_twiddle_table_create(N, dir), "Split-radix twiddle allocation failed N=%d\n", N);
-    __atomic_store_n(ready, 1, __ATOMIC_RELEASE);
-  }
-  pthread_mutex_unlock(&sr_twiddle_mutex);
-  return tw;
+  return dir == DFT_DIR_FORWARD ? &sr_twiddles_fwd[idx] : &sr_twiddles_bwd[idx];
 }
 
 #define DFT_MIXED_POWER2_MAX_N 65536
@@ -1022,8 +1014,7 @@ static inline simde__m128i inv_sqrt3_q15_128(simde__m128i x)
   return simde_mm_mulhrs_epi16(x, simde_mm_set1_epi16(Q15_INV_SQRT3));
 }
 
-/* Called by the library constructor in oai_dfts.c, before the twiddle tables are built. */
-static void dft_c16_library_init(void)
+static DFT_TABLE_BUILDER void fixed_64_128_twiddles_build(void)
 {
   fixed_64_128_twiddles_init(64);
   fixed_64_128_twiddles_init(128);

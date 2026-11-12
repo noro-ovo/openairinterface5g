@@ -129,15 +129,12 @@ int nr_slot_fep(PHY_VARS_NR_UE *ue,
   return 0;
 }
 
-/* nbins == 0: natural-order output (dft()); nbins > 0: fftshifted output for nbins used subcarriers,
- * identical to dft() followed by fftshift_inplace(rxdataF, nbins, N) */
-static void nr_symbol_fep_ul_layout(const NR_DL_FRAME_PARMS *fp,
-                                    const c16_t *rxdata,
-                                    c16_t *rxdataF,
-                                    unsigned char symbol,
-                                    unsigned char slot,
-                                    int sample_offset,
-                                    int nbins)
+void nr_symbol_fep_ul_shifted(const NR_DL_FRAME_PARMS *fp,
+                              const c16_t *rxdata,
+                              c16_t *rxdataF,
+                              unsigned char symbol,
+                              unsigned char slot,
+                              int sample_offset)
 {
   dft_size_idx_t dftsize = get_dft(fp->ofdm_symbol_size);
   // This is for misalignment issues
@@ -169,31 +166,8 @@ static void nr_symbol_fep_ul_layout(const NR_DL_FRAME_PARMS *fp,
     rxdata_ptr = (int16_t *)&rxdata[rxdata_offset];
   }
 
-  if (nbins)
-    dft_pruned(dftsize, rxdata_ptr, (int16_t *)rxdataF, fp->ofdm_symbol_size - nbins / 2, nbins, DFT_PRUNE_PACKED);
-  else
-    dft(dftsize, rxdata_ptr, (int16_t *)rxdataF, 1);
-}
-
-int nr_symbol_fep_ul(const NR_DL_FRAME_PARMS *fp,
-                     const c16_t *rxdata,
-                     c16_t *rxdataF,
-                     unsigned char symbol,
-                     unsigned char slot,
-                     int sample_offset)
-{
-  nr_symbol_fep_ul_layout(fp, rxdata, rxdataF, symbol, slot, sample_offset, 0);
-  return 0;
-}
-
-void nr_symbol_fep_ul_shifted(const NR_DL_FRAME_PARMS *fp,
-                              const c16_t *rxdata,
-                              c16_t *rxdataF,
-                              unsigned char symbol,
-                              unsigned char slot,
-                              int sample_offset)
-{
-  nr_symbol_fep_ul_layout(fp, rxdata, rxdataF, symbol, slot, sample_offset, fp->N_RB_UL * NR_NB_SC_PER_RB);
+  const int nbins = fp->N_RB_UL * NR_NB_SC_PER_RB;
+  dft_pruned(dftsize, rxdata_ptr, (int16_t *)rxdataF, fp->ofdm_symbol_size - nbins / 2, nbins, DFT_PRUNE_PACKED);
 }
 
 void apply_nr_rotation_symbol_fftshifted_RX(const int symbols_per_slot,

@@ -22,31 +22,13 @@
 /* DFT3072 keeps only the six final DFT64x8 inputs. The R24 results at child
  * indices k and k+64 are paired in registers and immediately passed through
  * the DFT128 R2; no R24 parent result is materialized in the working sets. */
-static pthread_mutex_t dft3072_r24_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int dft3072_r24_ready;
 static simde__m256i dft3072_r24_re[16][23] __attribute__((aligned(64)));
 static simde__m256i dft3072_r24_im[16][23] __attribute__((aligned(64))); /* forward; inverse negates */
 static uint32_t dft3072_r2_re[64] __attribute__((aligned(64)));
 static uint32_t dft3072_r2_im[2][64] __attribute__((aligned(64)));
 
-/* Cold initialization shares locking; coefficient construction stays local. */
-#define DEFINE_COLD_Q15_INITIALIZER(FN, READY, MUTEX, ...) \
-  static __attribute__((noinline, cold)) void FN(void)     \
-  {                                                        \
-    pthread_mutex_lock(&MUTEX);                            \
-    if (__atomic_load_n(&READY, __ATOMIC_RELAXED)) {       \
-      pthread_mutex_unlock(&MUTEX);                        \
-      return;                                              \
-    }                                                      \
-                                                           \
-    __VA_ARGS__                                            \
-    __atomic_store_n(&READY, 1, __ATOMIC_RELEASE);         \
-    pthread_mutex_unlock(&MUTEX);                          \
-  }
-
-DEFINE_COLD_Q15_INITIALIZER(
-    dft3072_r24_init_slow, dft3072_r24_ready, dft3072_r24_mtx, const float s24 = 1.0f / sqrtf(3.0f);
-    for (int bl = 0; bl < 16; bl++) {
+DEFINE_Q15_TABLE_INITIALIZER(
+    dft3072_r24_init, const float s24 = 1.0f / sqrtf(3.0f); for (int bl = 0; bl < 16; bl++) {
       const int off = 8 * bl;
       for (int br = 1; br < 24; br++) {
         dft3072_r24_re[bl][br - 1] = pack8_twiddle_q15_re_re_scaled(off, br, 3072, s24);
@@ -54,7 +36,7 @@ DEFINE_COLD_Q15_INITIALIZER(
       }
     }
 
-    const float s2 = sqrtf(2.0f);
+                                                            const float s2 = sqrtf(2.0f);
     for (int k = 0; k < 64; k++) {
       const float theta = 2.0f * (float)M_PI * (float)k / 128.0f;
       const int16_t raw_re = q15_from_float(cosf(theta));
@@ -69,16 +51,6 @@ DEFINE_COLD_Q15_INITIALIZER(
       }
     })
 
-#define DEFINE_Q15_READY_FAST_PATH(FN, READY, SLOW)                     \
-  static __attribute__((always_inline)) inline void FN(void)            \
-  {                                                                     \
-    if (__builtin_expect(__atomic_load_n(&READY, __ATOMIC_ACQUIRE), 1)) \
-      return;                                                           \
-    SLOW();                                                             \
-  }
-
-DEFINE_Q15_READY_FAST_PATH(dft3072_r24_init, dft3072_r24_ready, dft3072_r24_init_slow)
-
 static __attribute__((always_inline)) inline void dft3072_r24_r2_to_batches(const c16_t *src,
                                                                            const dft_band_t *pin,
                                                                            simde__m256i work[3][2][64],
@@ -87,7 +59,6 @@ static __attribute__((always_inline)) inline void dft3072_r24_r2_to_batches(cons
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
   const simde__m256i s24 = simde_mm256_set1_epi16(Q15_INV_SQRT3);
   const simde__m256i s2 = simde_mm256_set1_epi16(Q15_INV_SQRT2);
-  dft3072_r24_init();
 
   for (int block = 0; block < 8; block++) {
     const int k0 = 8 * block;
@@ -132,27 +103,17 @@ static inline void dft3072_dft64x8_pair_store(simde__m256i x[2][64], c16_t *dst,
 static void dft3072_r24_dft128x8(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   simde__m256i work[3][2][64] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   dft3072_r24_r2_to_batches(src, NULL, work, dir);
   for (int group = 0; group < 3; group++)
     dft3072_dft64x8_pair_store(work[group], dst, 8 * group, dir);
 }
 
 #define DEFINE_R24_PARENT_TABLES(TAG, NVAL, BLOCKS)                                                \
-  static pthread_mutex_t TAG##_mtx = PTHREAD_MUTEX_INITIALIZER;                                    \
-  static int TAG##_ready;                                                                          \
   static simde__m256i TAG##_re[BLOCKS][24] __attribute__((aligned(64)));                           \
   /* forward direction only: the inverse negates it (twiddle_im_dir_256) */                        \
   static simde__m256i TAG##_im[BLOCKS][24] __attribute__((aligned(64)));                           \
-  static void TAG##_init(void)                                                                     \
+  static DFT_TABLE_BUILDER void TAG##_init(void)                                                   \
   {                                                                                                \
-    if (__builtin_expect(__atomic_load_n(&TAG##_ready, __ATOMIC_ACQUIRE), 1))                      \
-      return;                                                                                      \
-    pthread_mutex_lock(&TAG##_mtx);                                                                \
-    if (__atomic_load_n(&TAG##_ready, __ATOMIC_RELAXED)) {                                         \
-      pthread_mutex_unlock(&TAG##_mtx);                                                            \
-      return;                                                                                      \
-    }                                                                                              \
     const float sc = 1.0f / sqrtf(3.0f);                                                           \
     for (int bl = 0; bl < BLOCKS; bl++) {                                                          \
       const int off = 8 * bl;                                                                      \
@@ -161,14 +122,11 @@ static void dft3072_r24_dft128x8(const c16_t *src, c16_t *dst, dft_dir_t dir)
         TAG##_im[bl][br] = pack8_twiddle_q15_im_signed_scaled(off, br, NVAL, sc, DFT_DIR_FORWARD); \
       }                                                                                            \
     }                                                                                              \
-    __atomic_store_n(&TAG##_ready, 1, __ATOMIC_RELEASE);                                           \
-    pthread_mutex_unlock(&TAG##_mtx);                                                              \
   }
 
 #define DEFINE_R24_PARENT_STAGE(TAG, MVAL)                                                                                      \
   static void TAG##_stage(const c16_t *src, c16_t *b, dft_dir_t dir)                                                            \
   {                                                                                                                             \
-    TAG##_init();                                                                                                               \
     for (int off = 0; off < MVAL; off += 8) {                                                                                   \
       simde__m256i z[24];                                                                                                       \
       raw_radix24_pfa8_q15_256(src, MVAL, off, z, dir);                                                                         \
@@ -189,15 +147,11 @@ DEFINE_R24_PARENT_STAGE(r24_12288_parent, 512)
 /* DFT6144-specific DFT256x8 child.  A vector lane is one R24
  * branch, so the R16 parent and DFT16 leaves below advance eight
  * independent DFT256 transforms together. */
-static pthread_mutex_t dft6144_leaf256_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int dft6144_leaf256_ready;
 static uint32_t dft6144_leaf256_re[16][16] __attribute__((aligned(64)));
 static uint32_t dft6144_leaf256_im[2][16][16] __attribute__((aligned(64)));
 
-DEFINE_COLD_Q15_INITIALIZER(
-    dft6144_leaf256_init_slow,
-    dft6144_leaf256_ready,
-    dft6144_leaf256_mtx,
+DEFINE_Q15_TABLE_INITIALIZER(
+    dft6144_leaf256_init,
     /* The DFT16 children are unitary, so these twiddles have unit magnitude. */
     const float s8 = 1.0f;
     for (int r = 0; r < 16; r++) {
@@ -213,15 +167,12 @@ DEFINE_COLD_Q15_INITIALIZER(
       }
     })
 
-DEFINE_Q15_READY_FAST_PATH(dft6144_leaf256_init, dft6144_leaf256_ready, dft6144_leaf256_init_slow)
-
 static __attribute__((always_inline)) inline void dft6144_r24_parent_to_batches(const c16_t *src,
                                                                                const dft_band_t *pin,
                                                                                simde__m256i work[3][16][16],
                                                                                dft_dir_t dir)
 {
   const simde__m256i s24 = simde_mm256_set1_epi16(Q15_INV_SQRT3);
-  r24_6144_parent_init();
 
   for (int off = 0; off < 256; off += 8) {
     simde__m256i z[24];
@@ -285,8 +236,6 @@ static __attribute__((always_inline)) inline void dft6144_dft256x8_store(simde__
 static void dft6144_r24_leaf256(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   simde__m256i work[3][16][16] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
-  dft6144_leaf256_init();
   dft6144_r24_parent_to_batches(src, NULL, work, dir);
   for (int group = 0; group < 3; group++)
     dft6144_dft256x8_store(work[group], dst, 8 * group, NULL, dir);
@@ -295,15 +244,11 @@ static void dft6144_r24_leaf256(const c16_t *src, c16_t *dst, dft_dir_t dir)
 /* A vector lane holds one of eight independent R24 children throughout the
  * R8 parent and its DFT64 leaves. Keeping that layout between the stages
  * avoids sequential DFT512 calls and a final 8x8 output transpose. */
-static pthread_mutex_t dft12288_leaf512x8_mtx = PTHREAD_MUTEX_INITIALIZER;
-static int dft12288_leaf512x8_ready;
 static uint32_t dft12288_leaf512x8_re[8][64] __attribute__((aligned(64)));
 static uint32_t dft12288_leaf512x8_im[2][8][64] __attribute__((aligned(64)));
 
-DEFINE_COLD_Q15_INITIALIZER(
-    dft12288_leaf512x8_init_slow,
-    dft12288_leaf512x8_ready,
-    dft12288_leaf512x8_mtx,
+DEFINE_Q15_TABLE_INITIALIZER(
+    dft12288_leaf512x8_init,
     /* The DFT8 below is half-scaled, so these twiddles carry 1/sqrt(2). */
     const float s8 = 1.0f / sqrtf(2.0f);
     for (int r = 0; r < 8; r++) {
@@ -319,16 +264,11 @@ DEFINE_COLD_Q15_INITIALIZER(
       }
     })
 
-DEFINE_Q15_READY_FAST_PATH(dft12288_leaf512x8_init, dft12288_leaf512x8_ready, dft12288_leaf512x8_init_slow)
-
 static void dft12288_leaf512x8_store(const c16_t *b, c16_t *dst, int first, dft_dir_t dir)
 {
   enum { R = 24, M = 512, LEAF_M = 64 };
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
   simde__m256i leaf[8][LEAF_M] __attribute__((aligned(64)));
-
-  power2_leaf_twiddles_init();
-  dft12288_leaf512x8_init();
 
   for (int n0 = 0; n0 < LEAF_M; n0 += 8) {
     simde__m256i input[8][8] __attribute__((aligned(64)));
