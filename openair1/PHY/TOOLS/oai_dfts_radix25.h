@@ -244,8 +244,6 @@ static __attribute__((noinline)) void dft1800_radix25_pack4(const c16_t *src, c1
   enum { N = 1800, M = 72, R = 25, BLOCKS = M / 8 };
   simde__m256i leafv[BLOCKS][R] __attribute__((aligned(64)));
 
-  dft2160_twiddles_init();
-
   dft72x8_strided_to_block_major_1800(src, &leafv[0][0], 0, 8, dir);
   dft72x8_strided_to_block_major_1800(src, &leafv[0][0], 8, 8, dir);
   dft72x8_strided_to_block_major_1800(src, &leafv[0][0], 16, 8, dir);

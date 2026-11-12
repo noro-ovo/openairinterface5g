@@ -1485,8 +1485,6 @@ static inline void dft16_q15_128_strided(const c16_t *src, int stride, c16_t *ds
   dft16_q15_128_from_regs(x0, x1, x2, x3, dst, dir);
 }
 
-static pthread_mutex_t power2_leaf_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int power2_leaf_twiddles_ready;
 static simde__m256i w16_re[8] __attribute__((aligned(64)));
 static simde__m256i w16_im[2][8] __attribute__((aligned(64)));
 /* W16 coefficients with the R16 1/sqrt(2) factor folded in.
@@ -1518,20 +1516,11 @@ static inline simde__m256i twiddle_im_vec(int16_t wi)
   return simde_mm256_setr_epi16(-wi, wi, -wi, wi, -wi, wi, -wi, wi, -wi, wi, -wi, wi, -wi, wi, -wi, wi);
 }
 
-/* Shared table-initialization protocol; each specialization keeps its own state. */
-#define DEFINE_Q15_TABLE_INITIALIZER(FN, READY, MUTEX, ...)             \
-  static void FN(void)                                                  \
-  {                                                                     \
-    if (__builtin_expect(__atomic_load_n(&READY, __ATOMIC_ACQUIRE), 1)) \
-      return;                                                           \
-    pthread_mutex_lock(&MUTEX);                                         \
-    if (__atomic_load_n(&READY, __ATOMIC_RELAXED)) {                    \
-      pthread_mutex_unlock(&MUTEX);                                     \
-      return;                                                           \
-    }                                                                   \
-    __VA_ARGS__                                                         \
-    __atomic_store_n(&READY, 1, __ATOMIC_RELEASE);                      \
-    pthread_mutex_unlock(&MUTEX);                                       \
+/* A table builder, run once at library load (DFT_TABLE_BUILDER). */
+#define DEFINE_Q15_TABLE_INITIALIZER(FN, ...) \
+  static DFT_TABLE_BUILDER void FN(void)      \
+  {                                           \
+    __VA_ARGS__                               \
   }
 
 #define DFT_SELECTED_CHILD_TABLES(RADIX, BLOCKS, N_FLOAT, TABLE, SCALE)             \
@@ -1555,8 +1544,7 @@ static inline simde__m256i twiddle_im_vec(int16_t wi)
   }
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    power2_leaf_twiddles_init, power2_leaf_twiddles_ready, power2_leaf_twiddle_mutex, const float s2_fold = 1.0f / sqrtf(2.0f);
-    for (int ds = 0; ds < 2; ds++) {
+    power2_leaf_twiddles_init, const float s2_fold = 1.0f / sqrtf(2.0f); for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
 
       for (int q = 0; q < 8; q++) {
@@ -1699,8 +1687,8 @@ static inline void dft64x8_store(const simde__m256i x[64], c16_t *dst, int outpu
   const simde__m256i dc = simde_mm256_packs_epi32(sum_lo, sum_hi);
 
 #define DFT_DC_STORE_FULL(ADDRESS, Q, R, VALUE) simde_mm256_storeu_si256((simde__m256i *)(ADDRESS), VALUE)
-#define DFT_DC_STORE_MASKED(ADDRESS, Q, R, VALUE) simde_mm256_maskstore_epi32((int *)(ADDRESS), lane_mask, VALUE)
-#define DFT_DC_MASK_PARAM simde__m256i lane_mask,
+#define DFT_DC_STORE_MASKED(ADDRESS, Q, R, VALUE) store_complex_lanes_256(ADDRESS, VALUE, valid_lanes)
+#define DFT_DC_MASK_PARAM int valid_lanes,
 #define DEFINE_DFT64X8_DC_STORE(FN, MASK_PARAM, STORE)                           \
   static __attribute__((always_inline)) inline void FN(const simde__m256i x[64], \
                                                        c16_t *dst,               \
@@ -1732,8 +1720,7 @@ static inline void dft64x8_store(const simde__m256i x[64], c16_t *dst, int outpu
       for (int q = 0; q < 8; q++) {                                              \
         if (r == 0 && q == 0)                                                    \
           continue; /* exact DC is stored below */                               \
-        const int k = 8 * q + r;                                                 \
-        STORE(dst + output_radix * k + output_offset, q, r, y[q]);               \
+        STORE(dst + output_radix * (8 * q + r) + output_offset, q, r, y[q]);     \
       }                                                                          \
     }                                                                            \
                                                                                  \
@@ -1767,10 +1754,7 @@ static __attribute__((always_inline)) inline void dft64x6_tail_store_1920(const 
 {
   enum { M = 64, R = 30, FIRST = 24 };
   const simde__m256i zero = simde_mm256_setzero_si256();
-  const simde__m256i mask6 = simde_mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
   simde__m256i leaf[64] __attribute__((aligned(64)));
-
-  power2_leaf_twiddles_init();
 
   for (int n = 0; n < 64; n += 8) {
     simde__m256i z0 = simde_mm256_loadu_si256((const simde__m256i *)(b + (FIRST + 0) * M + n));
@@ -1785,7 +1769,7 @@ static __attribute__((always_inline)) inline void dft64x6_tail_store_1920(const 
     DFT_TRANSPOSE8_TO_ROW(z, leaf, n)
   }
 
-  dft64x8_store_with_dc_masked(leaf, dst, R, FIRST, mask6, dir);
+  dft64x8_store_with_dc_masked(leaf, dst, R, FIRST, 6, dir);
 }
 
 static __attribute__((noinline)) void dft64x8_parent_store_from_branches(const c16_t *b,
@@ -1796,7 +1780,6 @@ static __attribute__((noinline)) void dft64x8_parent_store_from_branches(const c
                                                                          dft_dir_t dir)
 {
   simde__m256i leaf[64] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   for (int n = 0; n < 64; n += 8) {
     simde__m256i z[8];
     for (int br = 0; br < 8; br++)
@@ -1816,7 +1799,6 @@ static __attribute__((always_inline)) inline void dft64x8_branch_major_store_bod
                                                                                   dft_dir_t dir)
 {
   simde__m256i leaf[64] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   for (int n = 0; n < 64; n += 8) {
     simde__m256i z[8];
     for (int br = 0; br < 8; br++)
@@ -1984,7 +1966,6 @@ static __attribute__((always_inline)) inline void dft16x8_prescaled(const simde_
 #define DEFINE_DFT256_RADIX16(FN, CHILD)                                                                      \
   static void FN(const c16_t *src, c16_t *dst, dft_dir_t dir)                                                 \
   {                                                                                                           \
-    power2_leaf_twiddles_init();                                                                              \
     const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;                                                            \
     const simde__m256i s2 = simde_mm256_set1_epi16(Q15_INV_SQRT2);                                            \
     simde__m256i child[2][16] __attribute__((aligned(64)));                                                   \
@@ -2041,7 +2022,6 @@ static __attribute__((always_inline)) inline void dft512_radix8_leaf_inputs(cons
                                                                             simde__m256i leaf[64],
                                                                             dft_dir_t dir)
 {
-  power2_leaf_twiddles_init();
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
   c16_t stage[512] __attribute__((aligned(64)));
 
@@ -2084,7 +2064,6 @@ static __attribute__((always_inline)) inline void dft1024_radix16_leaf_inputs(co
                                                                               simde__m256i leaf[2][64],
                                                                               dft_dir_t dir)
 {
-  power2_leaf_twiddles_init();
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
   const simde__m256i s2 = simde_mm256_set1_epi16(Q15_INV_SQRT2);
 
@@ -2140,8 +2119,8 @@ static __attribute__((always_inline)) inline void dft_power2_radix8_stage_large_
                                                                                      int N,
                                                                                      dft_dir_t dir)
 {
-  power2_twiddle_t *tw = power2_twiddle_slot(N);
-  AssertFatal(tw && power2_twiddle_ensure_q15(tw, N, 8), "No radix-8 twiddles for N=%d\n", N);
+  const power2_twiddle_t *tw = power2_twiddle_slot(N);
+  AssertFatal(tw, "No radix-8 twiddles for N=%d\n", N);
 
   const int M = N / 8;
   const int blocks = tw->q15_blocks;
@@ -2201,7 +2180,6 @@ static __attribute__((noinline)) void dft_power2_radix8_stage_large_band(const c
   c16_t outer_stage[N] __attribute__((aligned(64)));                           \
   simde__m256i ARRAY[ROWS][COLS] __attribute__((aligned(64)));                 \
                                                                                \
-  power2_leaf_twiddles_init();                                                 \
   dft_power2_radix8_stage_large(src, outer_stage, N, dir);
 
 /* DFT2048 up to the sixteen DFT16x8 leaves: child_in[r16] gives bins 128k + 8 r16 + lane. */
@@ -2212,7 +2190,6 @@ static __attribute__((always_inline)) inline void dft2048_radix8x16_leaf_inputs(
 {
   enum { N = 2048, CHILD_N = 256, M = 16 };
   c16_t outer_stage[N] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   if (pin)
     dft_power2_radix8_stage_large_band(pin->in, pin->d, pin->edge_buf, outer_stage, N, dir);
   else
@@ -2275,7 +2252,6 @@ static __attribute__((always_inline)) inline void dft4096_radix8x8_leaf_inputs(c
 {
   enum { N = 4096, CHILD_N = 512, M = 64 };
   c16_t outer_stage[N] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   if (pin)
     dft_power2_radix8_stage_large_band(pin->in, pin->d, pin->edge_buf, outer_stage, N, dir);
   else

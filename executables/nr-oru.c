@@ -958,22 +958,17 @@ static void receive_pusch(ORU_t *oru, int frame, int slot, int symbol, ul_job_t 
     return;
   }
 
-  // CP removal + FFT -> contiguous PRB format sent to the DU (the first nbins entries of rxdataF_fft)
+  // CP removal + FFT -> contiguous PRB format sent to the DU: the band in PRB order at [0, nbins)
   const int nbins = fp->N_RB_UL * NR_NB_SC_PER_RB;
-  c16_t rxdataF_fft[fp->ofdm_symbol_size] __attribute__((aligned(32)));
-  c16_t rxdataF_beam[nbins] __attribute__((aligned(32)));
-  c16_t *rxdataF = rxdataF_fft;
+  c16_t rxdataF[fp->ofdm_symbol_size] __attribute__((aligned(32)));
   if (beamforming) {
-    // UL Rx beamforming: combine the per-antenna FFTs via the codebook, only over the PRBs this job
-    // sends (the rest of the window is zero and never leaves the O-RU), then FFT shift.
-    memset(rxdataF_fft, 0, sizeof(rxdataF_fft));
-    combine_ul_beam_prbs(ant_fft, ru->nb_rx, fp->ofdm_symbol_size, nbins, job->start_prb, job->num_prb, cb, job->beam_id, aarx,
-                         rxdataF_fft);
-    fftshift(rxdataF_fft, rxdataF_beam, nbins, fp->ofdm_symbol_size);
-    rxdataF = rxdataF_beam;
+    // UL Rx beamforming: combine the per-antenna FFTs via the codebook over this job's PRBs only (the rest of
+    // the band is zero and never leaves the O-RU)
+    memset(rxdataF, 0, nbins * sizeof(c16_t));
+    combine_ul_beam_prbs(ant_fft, ru->nb_rx, nbins, job->start_prb, job->num_prb, cb, job->beam_id, aarx, rxdataF);
   } else {
     // No beamforming: FFT of the received antenna's time-domain signal, output fftshifted by the DFT
-    nr_symbol_fep_ul_shifted(fp, (c16_t *)ru->common.rxdata[aarx], rxdataF_fft, symbol, slot, ru->N_TA_offset);
+    nr_symbol_fep_ul_shifted(fp, (c16_t *)ru->common.rxdata[aarx], rxdataF, symbol, slot, ru->N_TA_offset);
   }
 
   // Phase decompensation (conjugate rotation for UL)
@@ -1071,10 +1066,10 @@ static void ul_fft_pool_task(void *args)
   const int nb_rx = ru->nb_rx;
   const int n = fp->ofdm_symbol_size;
 
-  // Window offset, N_TA and frame-boundary wrap all inside nr_symbol_fep_ul().
+  // Window offset, N_TA and frame-boundary wrap all inside nr_symbol_fep_ul_shifted(); its output is the band in
+  // PRB order at [0, N_RB_UL * 12) of each window.
   for (int a = 0; a < nb_rx; a++) {
-    nr_symbol_fep_ul(fp, (c16_t *)ru->common.rxdata[a], &item->ant_fft[a * n], item->symbol, item->slot,
-                     ru->N_TA_offset);
+    nr_symbol_fep_ul_shifted(fp, (c16_t *)ru->common.rxdata[a], &item->ant_fft[a * n], item->symbol, item->slot, ru->N_TA_offset);
   }
 
   item->refs = item->nb_jobs; // plain store: readers only exist after the pushes below

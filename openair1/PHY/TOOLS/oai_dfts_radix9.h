@@ -404,7 +404,8 @@ static inline simde__m256i complex_mul8_bcast_small_q15_256(simde__m256i a, int1
  * The input scaling keeps the first sums of full-scale samples in range.
  *
  * Eight independent leaves are carried in the eight 32-bit complex lanes of
- * one YMM register. Partial final groups use AVX2 mask stores, not XMM tails.
+ * one YMM register. Partial final groups are stored with 16/8/4-byte stores
+ * (store_complex_lanes_256()).
  * ------------------------------------------------------------------------- */
 
 static const int16_t dft8_leaf_twiddle_re[8] = {16383, 11585, 0, -11585, -16383, -11585, 0, 11585};
@@ -507,9 +508,8 @@ static __attribute__((always_inline)) inline void store_batched_leaf_outputs(c16
     return;
   }
 
-  const simde__m256i mask = complex_lane_mask_epi32(valid);
   for (int k = 0; k < leaf_n; k++)
-    simde_mm256_maskstore_epi32((int *)(dst + R * k + first), mask, y[k]);
+    store_complex_lanes_256(dst + R * k + first, y[k], valid);
 }
 
 #define DFT8_FOLDED_LEAF_STAGES(INDEX)                                                                               \
@@ -579,7 +579,6 @@ dft16x8_twiddle_scaled_store_body(const c16_t *b, int M, c16_t *dst, int R, int 
   FIRST4(3, l3, l7, h3, h7);
 #undef FIRST4
 
-  const simde__m256i mask = valid == 8 ? simde_mm256_setzero_si256() : complex_lane_mask_epi32(valid);
   for (int k2 = 0; k2 < 4; k2++) {
     simde__m256i z[4];
     dft4x8_raw_q15_256(a[0][k2], a[1][k2], a[2][k2], a[3][k2], z, dir);
@@ -589,10 +588,7 @@ dft16x8_twiddle_scaled_store_body(const c16_t *b, int M, c16_t *dst, int R, int 
         continue;
       }
       c16_t *out = dst + R * (k2 + 4 * k1) + first;
-      if (valid == 8)
-        simde_mm256_storeu_si256((simde__m256i *)out, z[k1]);
-      else
-        simde_mm256_maskstore_epi32((int *)out, mask, z[k1]);
+      store_complex_lanes_256(out, z[k1], valid);
     }
   }
 }
@@ -684,8 +680,6 @@ static __attribute__((always_inline)) inline void dft32x8_twiddle_scaled_store_b
   FIRST4_32(7, m7, h7);
 #undef FIRST4_32
 
-  const simde__m256i mask = valid == 8 ? simde_mm256_setzero_si256() : complex_lane_mask_epi32(valid);
-
   for (int k2 = 0; k2 < 4; k2++) {
     simde__m256i z0, z1, z2, z3, z4, z5, z6, z7;
     dft8x8_q15_256_dir(a[0][k2],
@@ -714,10 +708,7 @@ static __attribute__((always_inline)) inline void dft32x8_twiddle_scaled_store_b
         continue;
       }
       c16_t *out = dst + R * (k2 + 4 * k1) + first;
-      if (valid == 8)
-        simde_mm256_storeu_si256((simde__m256i *)out, z[k1]);
-      else
-        simde_mm256_maskstore_epi32((int *)out, mask, z[k1]);
+      store_complex_lanes_256(out, z[k1], valid);
     }
   }
 }
@@ -871,9 +862,8 @@ static __attribute__((always_inline)) inline void store_batched_leaf_pointer_out
                                                                                      int leaf_n,
                                                                                      const simde__m256i *y)
 {
-  const simde__m256i mask = complex_lane_mask_epi32(valid);
   for (int k = 0; k < leaf_n; k++)
-    simde_mm256_maskstore_epi32((int *)(dst + R * k + branch), mask, y[k]);
+    store_complex_lanes_256(dst + R * k + branch, y[k], valid);
 }
 static __attribute__((always_inline)) inline void dft12x8_pointer_batch_store(const c16_t *const p[8],
                                                                               c16_t *dst,
@@ -1315,7 +1305,7 @@ static void radix81_terminal_leaf16_w16folded(const c16_t *src, c16_t *dst, dft_
   c16_t *stage2 = work + N;
   c16_t tail[M2] __attribute__((aligned(16)));
 
-  DFT_RADIX81_PARENT_STAGES() power2_leaf_twiddles_init();
+  DFT_RADIX81_PARENT_STAGES()
 
   for (int inner = 0; inner < 9; inner++) {
     DFT_RADIX81_CHILD_VIEWS()
@@ -1414,7 +1404,6 @@ static void dft_radix9_or_radix18(const c16_t *src, c16_t *dst, int N, dft_dir_t
 
     radix9_stage_to_dft64x8_576(src, leaf, branch8, dir, twB, twA, raw_input);
 
-    power2_leaf_twiddles_init();
     dft64x8_store_with_dc(leaf, dst, 9, 0, dir);
 
     dft64_avx(branch8, tail, dir);

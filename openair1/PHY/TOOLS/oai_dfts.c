@@ -302,31 +302,6 @@ FOREACH_IDFTSZ(DEFINE_MIXED_IDFT)
 #undef DEFINE_MIXED_IDFT
 #undef DEFINE_MIXED_TRANSFORM
 
-/* Build every twiddle table when the library is loaded: the tables are otherwise built on the first
- * transform of each size, which would put locking, allocation and trigonometry in a real-time thread.
- * Running each transform once does it for all sizes and directions. */
-__attribute__((constructor)) static void dft_c16_library_load(void)
-{
-  dft_c16_library_init();
-  int max_n = 0;
-  for (int i = 0; i < DFT_SIZE_IDXTABLESIZE; i++)
-    if (dft_ftab[i].size > max_n)
-      max_n = dft_ftab[i].size;
-  for (int i = 0; i < IDFT_SIZE_IDXTABLESIZE; i++)
-    if (idft_ftab[i].size > max_n)
-      max_n = idft_ftab[i].size;
-  c16_t *in = aligned_malloc64(sizeof(c16_t) * max_n);
-  c16_t *out = aligned_malloc64(sizeof(c16_t) * max_n);
-  AssertFatal(in && out, "DFT table initialization: allocation failed\n");
-  memset(in, 0, sizeof(c16_t) * max_n);
-  for (int i = 0; i < DFT_SIZE_IDXTABLESIZE; i++)
-    dft_ftab[i].func((int16_t *)in, (int16_t *)out, 1);
-  for (int i = 0; i < IDFT_SIZE_IDXTABLESIZE; i++)
-    idft_ftab[i].func((int16_t *)in, (int16_t *)out, 1);
-  free(in);
-  free(out);
-}
-
 void dft_implementation(uint8_t sizeidx, int16_t *input, int16_t *output, unsigned char scale_flag)
 {
   AssertFatal(sizeidx < DFT_SIZE_IDXTABLESIZE, "Invalid dft size index %i\n", sizeidx);
@@ -419,7 +394,6 @@ static __attribute__((noinline)) void dft3072_band_forward(const c16_t *src, c16
   const dft_band_t band = dft_band_make(NULL, out, d, edge_buf);
   const dft_band_t *pout = &band;
   simde__m256i work[3][2][64] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   dft3072_r24_r2_to_batches(src, NULL, work, DFT_DIR_FORWARD);
   for (int group = 0; group < 3; group++) {
     dft64x8_store_with_dc_band_body(work[group][0], pout->out, 48, 8 * group, pout, DFT_DIR_FORWARD);
@@ -442,8 +416,6 @@ static __attribute__((noinline)) void dft6144_band_forward(const c16_t *src, c16
   const dft_band_t band = dft_band_make(NULL, out, d, edge_buf);
   const dft_band_t *pout = &band;
   simde__m256i work[3][16][16] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
-  dft6144_leaf256_init();
   dft6144_r24_parent_to_batches(src, NULL, work, DFT_DIR_FORWARD);
   for (int group = 0; group < 3; group++)
     dft6144_dft256x8_store(work[group], pout->out, 8 * group, pout, DFT_DIR_FORWARD);
@@ -523,7 +495,6 @@ static __attribute__((noinline)) void dft3072_band_inverse(const c16_t *in, c16_
 {
   const dft_band_t band = dft_band_make(in, NULL, d, edge_buf);
   simde__m256i work[3][2][64] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   dft3072_r24_r2_to_batches(NULL, &band, work, DFT_DIR_INVERSE);
   for (int group = 0; group < 3; group++)
     dft3072_dft64x8_pair_store(work[group], dst, 8 * group, DFT_DIR_INVERSE);
@@ -533,8 +504,6 @@ static __attribute__((noinline)) void dft6144_band_inverse(const c16_t *in, c16_
 {
   const dft_band_t band = dft_band_make(in, NULL, d, edge_buf);
   simde__m256i work[3][16][16] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
-  dft6144_leaf256_init();
   dft6144_r24_parent_to_batches(NULL, &band, work, DFT_DIR_INVERSE);
   for (int group = 0; group < 3; group++)
     dft6144_dft256x8_store(work[group], dst, 8 * group, NULL, DFT_DIR_INVERSE);
@@ -727,8 +696,6 @@ void idft_pruned_implementation(uint8_t sizeidx, int16_t *input, int16_t *output
 #undef DFT8_ARRAY
 #undef DFT8_SCALE_128
 #undef DFT8_SCALE_256
-#undef DEFINE_COLD_Q15_INITIALIZER
-#undef DEFINE_Q15_READY_FAST_PATH
 #undef DFT_R30_FULL_INPUT
 #undef DFT_R30_PARTIAL_INPUT
 #undef DFT_R30_EIGHT_INPUT

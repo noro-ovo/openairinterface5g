@@ -8,14 +8,13 @@
 #include "common/utils/LOG/log.h"
 //#define DEBUG_OFDM_MOD
 
-/* nbins == 0: txdataF in natural FFT order; nbins > 0: txdataF fftshifted (NR carrier of nbins subcarriers) */
-static void nr_normal_prefix_mod_layout(c16_t *txdataF,
-                                        c16_t *txdata,
-                                        uint8_t nsymb,
-                                        const NR_DL_FRAME_PARMS *frame_parms,
-                                        uint32_t slot,
-                                        bool was_symbol_used[NR_SYMBOLS_PER_SLOT],
-                                        int nbins)
+void nr_normal_prefix_mod_shifted(c16_t *txdataF,
+                                  c16_t *txdata,
+                                  uint8_t nsymb,
+                                  const NR_DL_FRAME_PARMS *frame_parms,
+                                  uint32_t slot,
+                                  bool was_symbol_used[NR_SYMBOLS_PER_SLOT],
+                                  int nbins)
 {
   // This function works only slot wise. For more generic symbol generation refer nr_feptx0()
   if (frame_parms->numerology_index != 0) { // case where numerology != 0
@@ -82,27 +81,6 @@ static void nr_normal_prefix_mod_layout(c16_t *txdataF,
   }
 }
 
-void nr_normal_prefix_mod(c16_t *txdataF,
-                          c16_t *txdata,
-                          uint8_t nsymb,
-                          const NR_DL_FRAME_PARMS *frame_parms,
-                          uint32_t slot,
-                          bool was_symbol_used[NR_SYMBOLS_PER_SLOT])
-{
-  nr_normal_prefix_mod_layout(txdataF, txdata, nsymb, frame_parms, slot, was_symbol_used, 0);
-}
-
-void nr_normal_prefix_mod_shifted(c16_t *txdataF,
-                                  c16_t *txdata,
-                                  uint8_t nsymb,
-                                  const NR_DL_FRAME_PARMS *frame_parms,
-                                  uint32_t slot,
-                                  bool was_symbol_used[NR_SYMBOLS_PER_SLOT],
-                                  int nbins)
-{
-  nr_normal_prefix_mod_layout(txdataF, txdata, nsymb, frame_parms, slot, was_symbol_used, nbins);
-}
-
 /* txdataF is FFT shifted, i.e. the REs of the carrier are contiguous starting at index 0. */
 void apply_nr_rotation_TX(const NR_DL_FRAME_PARMS *fp,
                           c16_t *txdataF,
@@ -130,15 +108,6 @@ void apply_nr_rotation_TX(const NR_DL_FRAME_PARMS *fp,
     rotate_cpx_vector(this_symbol, this_rotation, this_symbol, nb_rb * NR_NB_SC_PER_RB, 15);
   }
 }
-                       
-void fftshift(const c16_t *in, c16_t *out, int nbins, int fft_size)
-{
-  const int half = nbins / 2; // half bw
-  // negative-freq half -> front
-  memcpy(out, in + fft_size - half, half * sizeof(c16_t));
-  // dc + positive-freq half -> next
-  memcpy(out + half, in, half * sizeof(c16_t));
-}
 
 void fftshift_inplace(c16_t *in, int nbins, int fft_size)
 {
@@ -152,27 +121,4 @@ void fftshift_inplace(c16_t *in, int nbins, int fft_size)
   memmove(in + half, in, (fft_size - half) * sizeof(c16_t));
   // place negative bins at the front
   memcpy(in, tmp, half * sizeof(c16_t));
-}
-
-void fftshift_inverse(const c16_t *in, c16_t *out, int nbins, int fft_size)
-{
-  const int half = nbins / 2; // half bw
-  // negative-freq half -> back
-  memcpy(out + fft_size - half, in, half * sizeof(c16_t));
-  // dc + positive-freq half -> front
-  memcpy(out, in + half, half * sizeof(c16_t));
-}
-
-void fftshift_inverse_inplace(c16_t *in, int nbins, int fft_size)
-{
-  const int half = nbins / 2; // # negative-freq bins
-
-  c16_t tmp[half]; // holds the negative half
-
-  // save negative bins (they sit at the tail: indices N-half .. N-1)
-  memcpy(tmp, in, half * sizeof(c16_t));
-  // slide DC + positive (and trailing zeros) to the left by half
-  memmove(in, in + half, (fft_size - half) * sizeof(c16_t));
-  // place negative bins at the back
-  memcpy(in + fft_size - half, tmp, half * sizeof(c16_t));
 }

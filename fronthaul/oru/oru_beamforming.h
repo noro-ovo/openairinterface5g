@@ -55,13 +55,11 @@ void combine_ul_beam_fd(const c16_t *const rxdataF[],
                         int stream_id,
                         c16_t *out);
 
-// combine_ul_beam_fd() over just the PRBs [start_prb, start_prb + num_prb) of an nbins-wide band,
-// with out and fft_data in unshifted FFT layout (fft_size bins). Contiguous RE c sits at bin
-// c < nbins / 2 ? fft_size - nbins / 2 + c : c - nbins / 2 (the inverse of fftshift()), so the range
-// covers at most two bin segments. The range is clamped to the band; other bins are left untouched.
+// combine_ul_beam_fd() over just the PRBs [start_prb, start_prb + num_prb) of an nbins-wide band, with out and
+// fft_data in the fftshifted layout of the band (contiguous RE c at index c). The range is clamped to the band;
+// other entries are left untouched.
 void combine_ul_beam_prbs(const c16_t *const fft_data[],
                           int nb_rx,
-                          int fft_size,
                           int nbins,
                           int start_prb,
                           int num_prb,

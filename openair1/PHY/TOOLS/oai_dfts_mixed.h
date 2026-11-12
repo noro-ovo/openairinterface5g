@@ -206,36 +206,27 @@ static __attribute__((always_inline)) inline void dft9x8_unitary_q15_256(simde__
 
 /* DFT1152: R18 = 2 x 9 PFA, M=64. */
 
-static pthread_mutex_t dft1152_radix18_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft1152_radix18_twiddle_ready;
 static simde__m256i dft1152_radix18_twiddle_re[8][18] __attribute__((aligned(64))),
     dft1152_radix18_twiddle_im[8][18] __attribute__((aligned(64)));
 /* Parent twiddle tables: W_N^(br*n) * 1/sqrt(SCALE_RADIX) for each branch and block of eight n. */
-#define DEFINE_PACKED_PARENT_TWIDDLE_INIT(INIT, TAG, MUTEX, NVAL, RADIX, BLOCKS, SCALE_RADIX)                \
-  DEFINE_Q15_TABLE_INITIALIZER(                                                                              \
-      INIT, TAG##_ready, MUTEX, const float sc = 1.0f / sqrtf(SCALE_RADIX); for (int ds = 0; ds < 2; ds++) { \
-        const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;                                   \
-        for (int bl = 0; bl < BLOCKS; bl++) {                                                                \
-          int off = 8 * bl;                                                                                  \
-          for (int br = 0; br < RADIX; br++) {                                                               \
-            TAG##_re[bl][br] = pack8_twiddle_q15_re_re_scaled(off, br, NVAL, sc);                            \
-            if (ds == 0)                                                                                     \
-              TAG##_im[bl][br] = pack8_twiddle_q15_im_signed_scaled(off, br, NVAL, sc, dir);                 \
-          }                                                                                                  \
-        }                                                                                                    \
+#define DEFINE_PACKED_PARENT_TWIDDLE_INIT(INIT, TAG, NVAL, RADIX, BLOCKS, SCALE_RADIX)       \
+  DEFINE_Q15_TABLE_INITIALIZER(                                                              \
+      INIT, const float sc = 1.0f / sqrtf(SCALE_RADIX); for (int ds = 0; ds < 2; ds++) {     \
+        const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;                   \
+        for (int bl = 0; bl < BLOCKS; bl++) {                                                \
+          int off = 8 * bl;                                                                  \
+          for (int br = 0; br < RADIX; br++) {                                               \
+            TAG##_re[bl][br] = pack8_twiddle_q15_re_re_scaled(off, br, NVAL, sc);            \
+            if (ds == 0)                                                                     \
+              TAG##_im[bl][br] = pack8_twiddle_q15_im_signed_scaled(off, br, NVAL, sc, dir); \
+          }                                                                                  \
+        }                                                                                    \
       })
 
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1152_radix18_twiddles_init,
-                                  dft1152_radix18_twiddle,
-                                  dft1152_radix18_twiddle_mutex,
-                                  1152,
-                                  18,
-                                  8,
-                                  1.0f)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1152_radix18_twiddles_init, dft1152_radix18_twiddle, 1152, 18, 8, 1.0f)
 static inline void dft1152_radix18_stage(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 64 };
-  dft1152_radix18_twiddles_init();
   static const int i0[9] = {0, 10, 2, 12, 4, 14, 6, 16, 8}, i1[9] = {9, 1, 11, 3, 13, 5, 15, 7, 17};
   for (int off = 0; off < M; off += 8) {
     simde__m256i x0[9], x1[9], s0[9], s1[9];
@@ -313,23 +304,14 @@ static inline void raw_radix12_pfa8_q15_256(const c16_t *src, int M, int off, si
 }
 
 /* DFT96: R12 PFA, M=8. */
-static pthread_mutex_t dft96_radix12_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft96_radix12_twiddle_ready;
 static simde__m256i dft96_radix12_twiddle_re[1][12] __attribute__((aligned(64))),
     dft96_radix12_twiddle_im[1][12] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft96_radix12_twiddles_init,
-                                  dft96_radix12_twiddle,
-                                  dft96_radix12_twiddle_mutex,
-                                  96,
-                                  12,
-                                  1,
-                                  (float)1)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft96_radix12_twiddles_init, dft96_radix12_twiddle, 96, 12, 1, (float)1)
 /* Fixed-size PFA parents share one normalized vector stage and packed output layout. */
-#define DEFINE_PACKED_PFA_PARENT(FN, MVAL, RADIX, INIT, RAW, TAG, SCALE)                                                        \
+#define DEFINE_PACKED_PFA_PARENT(FN, MVAL, RADIX, RAW, TAG, SCALE)                                                              \
   static inline void FN(const c16_t *src, c16_t *b, dft_dir_t dir)                                                              \
   {                                                                                                                             \
     enum { M = MVAL };                                                                                                          \
-    INIT();                                                                                                                     \
     for (int off = 0; off < M; off += 8) {                                                                                      \
       simde__m256i z[RADIX];                                                                                                    \
       RAW(src, M, off, z, dir);                                                                                                 \
@@ -343,13 +325,7 @@ DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft96_radix12_twiddles_init,
     }                                                                                                                           \
   }
 
-DEFINE_PACKED_PFA_PARENT(dft96_radix12_stage,
-                         8,
-                         12,
-                         dft96_radix12_twiddles_init,
-                         raw_radix12_pfa8_q15_256,
-                         dft96_radix12_twiddle,
-                         0)
+DEFINE_PACKED_PFA_PARENT(dft96_radix12_stage, 8, 12, raw_radix12_pfa8_q15_256, dft96_radix12_twiddle, 0)
 static void dft96_radix12_pfa_leaf8(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   enum { R = 12, M = 8 };
@@ -389,11 +365,9 @@ static void dft96_radix12_pfa_leaf8(const c16_t *src, c16_t *dst, dft_dir_t dir)
 
 DEFINE_RAW_RADIX15_PFA8(r15_pfa_raw_block_n120)
 
-static pthread_mutex_t dft120_r15p_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft120_r15p_ready;
 static simde__m256i dft120_r15p_re[1][15] __attribute__((aligned(64))), dft120_r15p_im[1][15] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft120_r15p_tw_init, dft120_r15p, dft120_r15p_tw_mutex, 120, 15, 1, 1.0f)
-DEFINE_PACKED_PFA_PARENT(radix15_pfa_stage_120, 8, 15, dft120_r15p_tw_init, r15_pfa_raw_block_n120, dft120_r15p, 0)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft120_r15p_tw_init, dft120_r15p, 120, 15, 1, 1.0f)
+DEFINE_PACKED_PFA_PARENT(radix15_pfa_stage_120, 8, 15, r15_pfa_raw_block_n120, dft120_r15p, 0)
 static void dft120_radix15_pfa(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   enum { R = 15, M = 8 };
@@ -405,21 +379,12 @@ static void dft120_radix15_pfa(const c16_t *src, c16_t *dst, dft_dir_t dir)
 
 /* DFT144: R18 = 2 x 9 PFA, M=8. */
 
-static pthread_mutex_t dft144_radix18_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft144_radix18_twiddle_ready;
 static simde__m256i dft144_radix18_twiddle_re[1][18] __attribute__((aligned(64))),
     dft144_radix18_twiddle_im[1][18] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft144_radix18_twiddles_init,
-                                  dft144_radix18_twiddle,
-                                  dft144_radix18_twiddle_mutex,
-                                  144,
-                                  18,
-                                  1,
-                                  1.0f)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft144_radix18_twiddles_init, dft144_radix18_twiddle, 144, 18, 1, 1.0f)
 static inline void dft144_radix18_stage(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 8 };
-  dft144_radix18_twiddles_init();
   static const int i0[9] = {0, 10, 2, 12, 4, 14, 6, 16, 8}, i1[9] = {9, 1, 11, 3, 13, 5, 15, 7, 17};
   for (int off = 0; off < M; off += 8) {
     simde__m256i x0[9], x1[9], s0[9], s1[9];
@@ -459,24 +424,10 @@ static void dft144_radix18_leaf8(const c16_t *src, c16_t *dst, dft_dir_t dir)
 
 /* DFT192: R12 PFA, M=16. */
 
-static pthread_mutex_t dft192_radix12_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft192_radix12_twiddle_ready;
 static simde__m256i dft192_radix12_twiddle_re[2][12] __attribute__((aligned(64))),
     dft192_radix12_twiddle_im[2][12] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft192_radix12_twiddles_init,
-                                  dft192_radix12_twiddle,
-                                  dft192_radix12_twiddle_mutex,
-                                  192,
-                                  12,
-                                  2,
-                                  (float)1)
-DEFINE_PACKED_PFA_PARENT(dft192_radix12_stage,
-                         16,
-                         12,
-                         dft192_radix12_twiddles_init,
-                         raw_radix12_pfa8_q15_256,
-                         dft192_radix12_twiddle,
-                         0)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft192_radix12_twiddles_init, dft192_radix12_twiddle, 192, 12, 2, (float)1)
+DEFINE_PACKED_PFA_PARENT(dft192_radix12_stage, 16, 12, raw_radix12_pfa8_q15_256, dft192_radix12_twiddle, 0)
 static void dft192_radix12_pfa_leaf16(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   enum { R = 12, M = 16 };
@@ -542,11 +493,9 @@ static __attribute__((always_inline)) inline void raw_radix27x8_input_q15_256(co
   raw_radix27x8_q15_256(src, M, off, y, dir, 1);
 }
 
-static pthread_mutex_t dft216_r27_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft216_r27_ready;
 static simde__m256i dft216_r27_re[1][27] __attribute__((aligned(64))), dft216_r27_im[1][27] __attribute__((aligned(64)));
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft216_r27_tw_init, dft216_r27_ready, dft216_r27_tw_mutex, const float sc = 1.0f; for (int ds = 0; ds < 2; ds++) {
+    dft216_r27_tw_init, const float sc = 1.0f; for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int br = 0; br < 27; br++) {
         dft216_r27_re[0][br] = pack8_twiddle_q15_re_re_scaled(0, br, 216, sc);
@@ -557,7 +506,6 @@ DEFINE_Q15_TABLE_INITIALIZER(
 static inline void radix27_stage_216(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 8 };
-  dft216_r27_tw_init();
   simde__m256i z[27];
   raw_radix27x8_q15_256(src, M, 0, z, dir, 1);
   for (int br = 0; br < 27; br++) {
@@ -613,13 +561,11 @@ radix27_raw_partial8(const c16_t *src, int M, int off, int valid, simde__m256i y
     radix3_butterfly8_q15_256(a[0][k], a[1][k], a[2][k], &y[k], &y[k + 9], &y[k + 18], dir);
 }
 
-static pthread_mutex_t dft324_r27_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft324_r27_ready;
 static simde__m256i dft324_r27_re[2][27] __attribute__((aligned(64)));
 static simde__m256i dft324_r27_im[2][27] __attribute__((aligned(64)));
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft324_r27_tw_init, dft324_r27_ready, dft324_r27_tw_mutex, const float scale = 1.0f; for (int ds = 0; ds < 2; ds++) {
+    dft324_r27_tw_init, const float scale = 1.0f; for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int block = 0; block < 2; block++) {
         const int off = 8 * block;
@@ -634,7 +580,6 @@ DEFINE_Q15_TABLE_INITIALIZER(
 static inline void radix27_stage_324(const c16_t *src, c16_t *branches, dft_dir_t dir, const int raw_input)
 {
   enum { M = 12 };
-  dft324_r27_tw_init();
   for (int off = 0; off < M; off += 8) {
     const int valid = M - off >= 8 ? 8 : 4;
     simde__m256i z[27];
@@ -660,13 +605,11 @@ static void dft324_radix27_leaf12(const c16_t *src, c16_t *dst, dft_dir_t dir)
   }
 }
 
-static pthread_mutex_t dft108_r27_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft108_r27_tw_ready;
 static simde__m256i dft108_r27_re[27] __attribute__((aligned(64)));
 static simde__m256i dft108_r27_im[27] __attribute__((aligned(64)));
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft108_r27_tw_init, dft108_r27_tw_ready, dft108_r27_tw_mutex, const float scale = 1.0f; for (int ds = 0; ds < 2; ds++) {
+    dft108_r27_tw_init, const float scale = 1.0f; for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int br = 0; br < 27; br++) {
         dft108_r27_re[br] = pack8_twiddle_q15_re_re_scaled(0, br, 108, scale);
@@ -712,8 +655,6 @@ static void dft108_radix27_leaf4(const c16_t *src, c16_t *dst, dft_dir_t dir)
   c16_t branches[N] __attribute__((aligned(64)));
   simde__m256i z[R];
 
-  dft108_r27_tw_init();
-
   radix27_raw_partial8(src, M, 0, M, z, dir, 1);
 
   for (int br = 0; br < R; br++) {
@@ -735,11 +676,9 @@ DEFINE_RAW_RADIX15_PFA8(r15_pfa_raw_block_n240)
 
 #undef DEFINE_RAW_RADIX15_PFA8
 
-static pthread_mutex_t dft240_r15p_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft240_r15p_ready;
 static simde__m256i dft240_r15p_re[2][15] __attribute__((aligned(64))), dft240_r15p_im[2][15] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft240_r15p_tw_init, dft240_r15p, dft240_r15p_tw_mutex, 240, 15, 2, 1.0f)
-DEFINE_PACKED_PFA_PARENT(radix15_pfa_stage_240, 16, 15, dft240_r15p_tw_init, r15_pfa_raw_block_n240, dft240_r15p, 0)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft240_r15p_tw_init, dft240_r15p, 240, 15, 2, 1.0f)
+DEFINE_PACKED_PFA_PARENT(radix15_pfa_stage_240, 16, 15, r15_pfa_raw_block_n240, dft240_r15p, 0)
 static void dft240_radix15_pfa(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   enum { R = 15, M = 16 };
@@ -828,10 +767,8 @@ static __attribute__((always_inline)) inline void store_r30_leaf_row8(c16_t *dst
   }
 }
 
-static pthread_mutex_t dft360_r30_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft360_r30_ready;
 static simde__m256i dft360_r30_re[2][30] __attribute__((aligned(64))), dft360_r30_im[2][30] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft360_r30_tw_init, dft360_r30, dft360_r30_tw_mutex, 360, 30, 2, 1.0f)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft360_r30_tw_init, dft360_r30, 360, 30, 2, 1.0f)
 /* DFT6 for radix-30 parents: the radix-2 outputs are scaled by 1/sqrt(15)
  * before the raw radix-3; the radix-5 that follows applies the remaining
  * 1/sqrt(2) before its sums (DFT_R30_RADIX5). This keeps every intermediate
@@ -950,7 +887,6 @@ static __attribute__((always_inline)) inline void dft6_pfa8_r30_prescaled_q15_25
   static inline void FUNCTION(const c16_t *src, c16_t *b, dft_dir_t dir) \
   {                                                                      \
     enum { M = MVAL };                                                   \
-    TAG##_tw_init();                                                     \
                                                                          \
     for (int off = 0; off < M; off += 8) {                               \
       const int valid = M - off >= 8 ? 8 : 4;                            \
@@ -975,13 +911,10 @@ static __attribute__((always_inline)) inline void dft6_pfa8_r30_prescaled_q15_25
 DEFINE_R30_TAIL_STAGE(radix30_stage_360, dft360_r30, 12)
 
 /* DFT384: R24 = 3 x 8 Good-Thomas PFA, M=16. */
-static pthread_mutex_t dft384_r24_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft384_r24_twiddles_ready;
 static simde__m256i dft384_r24_re[2][24] __attribute__((aligned(64)));
 static simde__m256i dft384_r24_im[2][24] __attribute__((aligned(64)));
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft384_r24_twiddles_init, dft384_r24_twiddles_ready, dft384_r24_twiddle_mutex, const float sc = 1.0f / sqrtf(3.0f);
-    for (int ds = 0; ds < 2; ds++) {
+    dft384_r24_twiddles_init, const float sc = 1.0f / sqrtf(3.0f); for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int bl = 0; bl < 2; bl++) {
         int off = 8 * bl;
@@ -1005,7 +938,6 @@ static __attribute__((always_inline)) inline simde__m256i r24_row_load8(const c1
 static __attribute__((always_inline)) inline void radix24_pfa_stage_384(const c16_t *src, const dft_band_t *pin, c16_t *b, dft_dir_t dir)
 {
   enum { M = 16 };
-  dft384_r24_twiddles_init();
   static const int ids[3][8] = {{0, 9, 18, 3, 12, 21, 6, 15}, {16, 1, 10, 19, 4, 13, 22, 7}, {8, 17, 2, 11, 20, 5, 14, 23}};
   for (int off = 0; off < M; off += 8) {
     simde__m256i s[3][8];
@@ -1061,11 +993,9 @@ static void dft384_radix24_pfa(const c16_t *src, c16_t *dst, dft_dir_t dir)
 
 /* DFT432: R27 x DFT16. */
 
-static pthread_mutex_t dft432_r27_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft432_r27_ready;
 static simde__m256i dft432_r27_re[2][27] __attribute__((aligned(64))), dft432_r27_im[2][27] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft432_r27_tw_init, dft432_r27, dft432_r27_tw_mutex, 432, 27, 2, 1.0f)
-DEFINE_PACKED_PFA_PARENT(radix27_stage_432, 16, 27, dft432_r27_tw_init, raw_radix27x8_input_q15_256, dft432_r27, 0)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft432_r27_tw_init, dft432_r27, 432, 27, 2, 1.0f)
+DEFINE_PACKED_PFA_PARENT(radix27_stage_432, 16, 27, raw_radix27x8_input_q15_256, dft432_r27, 0)
 /* Three full x8 groups and one explicitly sized tail, in natural branch order. */
 #define DFT_FOUR_LEAF_BATCHES(LEAF, B, M, DST, R, TAIL) \
   LEAF(B, M, DST, R, 0, 8, dir);                        \
@@ -1083,10 +1013,8 @@ static void dft432_radix27_leaf16(const c16_t *src, c16_t *dst, dft_dir_t dir)
 
 /* DFT600: R30 PFA parent + twiddle-scaled DFT20 leaves (1/sqrt20). */
 
-static pthread_mutex_t dft600_r30_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft600_r30_ready;
 static simde__m256i dft600_r30_re[3][30] __attribute__((aligned(64))), dft600_r30_im[3][30] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft600_r30_tw_init, dft600_r30, dft600_r30_tw_mutex, 600, 30, 3, 1.0f)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft600_r30_tw_init, dft600_r30, 600, 30, 3, 1.0f)
 DEFINE_R30_TAIL_STAGE(radix30_stage_600, dft600_r30, 20)
 
 #undef DEFINE_R30_TAIL_STAGE
@@ -1096,14 +1024,11 @@ DEFINE_R30_TAIL_STAGE(radix30_stage_600, dft600_r30, 20)
 
 /* DFT720: R30 PFA parent + twiddle-scaled DFT24 leaves (1/sqrt24). */
 
-static pthread_mutex_t dft720_r30_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft720_r30_ready;
 static simde__m256i dft720_r30_re[3][30] __attribute__((aligned(64))), dft720_r30_im[3][30] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft720_r30_tw_init, dft720_r30, dft720_r30_tw_mutex, 720, 30, 3, 1.0f)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft720_r30_tw_init, dft720_r30, 720, 30, 3, 1.0f)
 static inline void radix30_stage_720(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 24, PITCH = 32 };
-  dft720_r30_tw_init();
 
   for (int off = 0; off < M; off += 8) {
     simde__m256i s[5][6];
@@ -1144,14 +1069,11 @@ static inline void radix30_stage_720(const c16_t *src, c16_t *b, dft_dir_t dir)
 }
 
 /* DFT768: R24 = 3 x 8 Good-Thomas PFA, M=32. */
-static pthread_mutex_t dft768_r24_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft768_r24_twiddles_ready;
 static simde__m256i dft768_r24_re[4][24] __attribute__((aligned(64)));
 static simde__m256i dft768_r24_im[4][24] __attribute__((aligned(64)));
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft768_r24_twiddles_init, dft768_r24_twiddles_ready, dft768_r24_twiddle_mutex, const float sc = 1.0f / sqrtf(3.0f);
-    for (int ds = 0; ds < 2; ds++) {
+    dft768_r24_twiddles_init, const float sc = 1.0f / sqrtf(3.0f); for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int bl = 0; bl < 4; bl++) {
         const int off = 8 * bl;
@@ -1171,8 +1093,6 @@ static __attribute__((always_inline)) inline void radix24_pfa_stage_768(const c1
       {16, 1, 10, 19, 4, 13, 22, 7},
       {8, 17, 2, 11, 20, 5, 14, 23},
   };
-
-  dft768_r24_twiddles_init();
 
   for (int off = 0; off < M; off += 8) {
     simde__m256i s[3][8];
@@ -1252,11 +1172,9 @@ static void dft768_radix24_pfa_leaf32(const c16_t *src, c16_t *dst, dft_dir_t di
 
 /* DFT864: R27 x DFT32. */
 
-static pthread_mutex_t dft864_r27_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft864_r27_ready;
 static simde__m256i dft864_r27_re[4][27] __attribute__((aligned(64))), dft864_r27_im[4][27] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft864_r27_tw_init, dft864_r27, dft864_r27_tw_mutex, 864, 27, 4, 1.0f)
-DEFINE_PACKED_PFA_PARENT(radix27_stage_864, 32, 27, dft864_r27_tw_init, raw_radix27x8_input_q15_256, dft864_r27, 0)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft864_r27_tw_init, dft864_r27, 864, 27, 4, 1.0f)
+DEFINE_PACKED_PFA_PARENT(radix27_stage_864, 32, 27, raw_radix27x8_input_q15_256, dft864_r27, 0)
 static void dft864_radix27_leaf32(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   enum { R = 27, M = 32 };
@@ -1313,16 +1231,13 @@ static inline void raw_radix24_pfa8_q15_256(const c16_t *src, int M, int off, si
   raw_radix24_pfa8_body(src, NULL, M, off, y, dir);
 }
 
-static pthread_mutex_t dft1536_r24_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft1536_r24_ready;
 static simde__m256i dft1536_r24_re[8][24] __attribute__((aligned(64))), dft1536_r24_im[8][24] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1536_r24_tw_init, dft1536_r24, dft1536_r24_tw_mutex, 1536, 24, 8, (float)3)
-DEFINE_PACKED_PFA_PARENT(radix24_stage_1536, 64, 24, dft1536_r24_tw_init, raw_radix24_pfa8_q15_256, dft1536_r24, Q15_INV_SQRT3)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1536_r24_tw_init, dft1536_r24, 1536, 24, 8, (float)3)
+DEFINE_PACKED_PFA_PARENT(radix24_stage_1536, 64, 24, raw_radix24_pfa8_q15_256, dft1536_r24, Q15_INV_SQRT3)
 /* radix24_stage_1536 reading the NR layout of the pruned API (inverse). */
 static __attribute__((always_inline)) inline void radix24_stage_1536_band(const dft_band_t *pin, c16_t *b, dft_dir_t dir)
 {
   enum { M = 64 };
-  dft1536_r24_tw_init();
   for (int off = 0; off < M; off += 8) {
     simde__m256i z[24];
     raw_radix24_pfa8_body(NULL, pin, M, off, z, dir);
@@ -1345,7 +1260,6 @@ static __attribute__((always_inline)) inline void dft64x8_branch_major_store_ban
   const dft_band_t band_local = *pout;
   pout = &band_local;
   simde__m256i leaf[64] __attribute__((aligned(64)));
-  power2_leaf_twiddles_init();
   for (int n = 0; n < 64; n += 8) {
     simde__m256i z[8];
     for (int br = 0; br < 8; br++)
@@ -1367,11 +1281,9 @@ static void dft1536_radix24_pfa_leaf64(const c16_t *src, c16_t *dst, dft_dir_t d
   dft64x8_branch_major_store(b, M, dst, 24, 16, dir);
 }
 
-static pthread_mutex_t dft1728_r27_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft1728_r27_ready;
 static simde__m256i dft1728_r27_re[8][27] __attribute__((aligned(64))), dft1728_r27_im[8][27] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1728_r27_tw_init, dft1728_r27, dft1728_r27_tw_mutex, 1728, 27, 8, 1.0f)
-DEFINE_PACKED_PFA_PARENT(radix27_stage_1728, 64, 27, dft1728_r27_tw_init, raw_radix27x8_input_q15_256, dft1728_r27, 0)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1728_r27_tw_init, dft1728_r27, 1728, 27, 8, 1.0f)
+DEFINE_PACKED_PFA_PARENT(radix27_stage_1728, 64, 27, raw_radix27x8_input_q15_256, dft1728_r27, 0)
 static void dft1728_radix27_leaf64(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
   enum { R = 27, M = 64 };
@@ -1402,14 +1314,11 @@ static void dft1728_radix27_leaf64(const c16_t *src, c16_t *dst, dft_dir_t dir)
  * The DFT6 scales by 1/sqrt(15) after its radix-2 layer; the remaining
  * 1/sqrt(2) of the unitary 1/sqrt(30) is applied by the radix-5.
  */
-static pthread_mutex_t dft960_r30_pfa_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft960_r30_pfa_twiddles_ready;
 static simde__m256i dft960_r30_pfa_re[4][30] __attribute__((aligned(64)));
 static simde__m256i dft960_r30_pfa_im[4][30] __attribute__((aligned(64)));
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft960_r30_pfa_twiddles_init, dft960_r30_pfa_twiddles_ready, dft960_r30_pfa_twiddle_mutex, const float scale30 = 1.0f;
-    for (int ds = 0; ds < 2; ds++) {
+    dft960_r30_pfa_twiddles_init, const float scale30 = 1.0f; for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int block = 0; block < 4; block++) {
         const int off = 8 * block;
@@ -1455,14 +1364,11 @@ static __attribute__((always_inline)) inline void dft6_pfa8_q15_256(simde__m256i
 
 /* DFT480: R30 x DFT16. The parent uses the same 6 x 5 Good-Thomas mapping
  * and scaling as DFT960. */
-static pthread_mutex_t dft480_r30_twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft480_r30_twiddles_ready;
 static simde__m256i dft480_r30_re[2][30] __attribute__((aligned(64)));
 static simde__m256i dft480_r30_im[2][30] __attribute__((aligned(64)));
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft480_r30_twiddles_init, dft480_r30_twiddles_ready, dft480_r30_twiddle_mutex, const float scale30 = 1.0f;
-    for (int ds = 0; ds < 2; ds++) {
+    dft480_r30_twiddles_init, const float scale30 = 1.0f; for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int block = 0; block < 2; block++) {
         const int off = 8 * block;
@@ -1477,7 +1383,6 @@ DEFINE_Q15_TABLE_INITIALIZER(
 static inline void radix30_pfa_stage_to_branch_major_q15_256_480(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 16 };
-  dft480_r30_twiddles_init();
   for (int off = 0; off < M; off += 8) {
     simde__m256i s[5][6] __attribute__((aligned(64)));
 #define R30_480_DFT6(C, I0, I1, I2, I3, I4, I5)                        \
@@ -1513,16 +1418,13 @@ static void dft480_radix30_pfa(const c16_t *src, c16_t *dst, dft_dir_t dir)
 }
 
 /* DFT1920: R30 PFA, M=64. */
-static pthread_mutex_t dft1920_r30_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft1920_r30_ready;
 static simde__m256i dft1920_r30_re[8][30] __attribute__((aligned(64))), dft1920_r30_im[8][30] __attribute__((aligned(64)));
-DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1920_r30_tw_init, dft1920_r30, dft1920_r30_tw_mutex, 1920, 30, 8, 1.0f)
+DEFINE_PACKED_PARENT_TWIDDLE_INIT(dft1920_r30_tw_init, dft1920_r30, 1920, 30, 8, 1.0f)
 
 #undef DEFINE_PACKED_PARENT_TWIDDLE_INIT
 static inline void radix30_stage_1920(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 64 };
-  dft1920_r30_tw_init();
   for (int off = 0; off < M; off += 8) {
     simde__m256i s[5][6];
 #define D619(C, I0, I1, I2, I3, I4, I5) DFT_R30_LOAD_SIX(DFT_R30_FULL_INPUT, C, I0, I1, I2, I3, I4, I5)
@@ -1556,7 +1458,6 @@ static void dft1920_radix30_pfa(const c16_t *src, c16_t *dst, dft_dir_t dir)
 static inline void radix30_pfa_stage_to_branch_major_q15_256_960(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { N = 960, R = 30, M = 32 };
-  dft960_r30_pfa_twiddles_init();
 
   for (int off = 0; off < M; off += 8) {
     simde__m256i s[5][6] __attribute__((aligned(64)));
@@ -1601,41 +1502,32 @@ static void dft960_radix30_pfa(const c16_t *src, c16_t *dst, dft_dir_t dir)
   DFT_FOUR_LEAF_BATCHES(dft32x8_twiddle_scaled_store, b, M, dst, R, 6)
 }
 
-static pthread_mutex_t dft2160_r30_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft2160_r30_tw_ready;
 static simde__m256i dft2160_r30_re[9][30] __attribute__((aligned(64)));
 static simde__m256i dft2160_r30_im_fwd[9][30] __attribute__((aligned(64)));
 static int16_t dft2160_r9_w72_re[2][24], dft2160_r9_w72_im_fwd[2][24];
 static int16_t dft2160_r9_w24_re[2][8], dft2160_r9_w24_im_fwd[2][8];
 
-static void dft2160_twiddles_init(void)
+static DFT_TABLE_BUILDER void dft2160_twiddles_init(void)
 {
-  if (__builtin_expect(__atomic_load_n(&dft2160_r30_tw_ready, __ATOMIC_ACQUIRE), 1))
-    return;
-  pthread_mutex_lock(&dft2160_r30_tw_mutex);
-  if (!__atomic_load_n(&dft2160_r30_tw_ready, __ATOMIC_RELAXED)) {
-    const float s30 = 1.0f, s3 = 1.0f / sqrtf(3.0f);
-    for (int block = 0; block < 9; block++)
-      for (int br = 0; br < 30; br++) {
-        dft2160_r30_re[block][br] = pack8_twiddle_q15_re_re_scaled(8 * block, br, 2160, s30);
-        dft2160_r30_im_fwd[block][br] = pack8_twiddle_q15_im_signed_scaled(8 * block, br, 2160, s30, DFT_DIR_FORWARD);
-      }
-    for (int mul = 1; mul <= 2; mul++) {
-      for (int k = 0; k < 24; k++) {
-        const float a = 2.0f * (float)M_PI * (float)((mul * k) % 72) / 72.0f;
-        dft2160_r9_w72_re[mul - 1][k] = q15_from_float(cosf(a) * s3);
-        dft2160_r9_w72_im_fwd[mul - 1][k] = q15_from_float(-sinf(a) * s3);
-      }
-      for (int k = 0; k < 8; k++) {
-        const float a = 2.0f * (float)M_PI * (float)((mul * k) % 24) / 24.0f;
-        /* The inputs carry the second 1/sqrt(3), so W24 has unit magnitude. */
-        dft2160_r9_w24_re[mul - 1][k] = q15_from_float(cosf(a));
-        dft2160_r9_w24_im_fwd[mul - 1][k] = q15_from_float(-sinf(a));
-      }
+  const float s30 = 1.0f, s3 = 1.0f / sqrtf(3.0f);
+  for (int block = 0; block < 9; block++)
+    for (int br = 0; br < 30; br++) {
+      dft2160_r30_re[block][br] = pack8_twiddle_q15_re_re_scaled(8 * block, br, 2160, s30);
+      dft2160_r30_im_fwd[block][br] = pack8_twiddle_q15_im_signed_scaled(8 * block, br, 2160, s30, DFT_DIR_FORWARD);
     }
-    __atomic_store_n(&dft2160_r30_tw_ready, 1, __ATOMIC_RELEASE);
+  for (int mul = 1; mul <= 2; mul++) {
+    for (int k = 0; k < 24; k++) {
+      const float a = 2.0f * (float)M_PI * (float)((mul * k) % 72) / 72.0f;
+      dft2160_r9_w72_re[mul - 1][k] = q15_from_float(cosf(a) * s3);
+      dft2160_r9_w72_im_fwd[mul - 1][k] = q15_from_float(-sinf(a) * s3);
+    }
+    for (int k = 0; k < 8; k++) {
+      const float a = 2.0f * (float)M_PI * (float)((mul * k) % 24) / 24.0f;
+      /* The inputs carry the second 1/sqrt(3), so W24 has unit magnitude. */
+      dft2160_r9_w24_re[mul - 1][k] = q15_from_float(cosf(a));
+      dft2160_r9_w24_im_fwd[mul - 1][k] = q15_from_float(-sinf(a));
+    }
   }
-  pthread_mutex_unlock(&dft2160_r30_tw_mutex);
 }
 
 static __attribute__((always_inline)) inline simde__m256i dft2160_r9_tw_mul(simde__m256i x,
@@ -1683,7 +1575,6 @@ static __attribute__((
 {
   simde__m256i x[72], r9[9][8];
   const simde__m256i s3 = simde_mm256_set1_epi16(Q15_INV_SQRT3);
-  const simde__m256i mask = complex_lane_mask_epi32(valid);
   load_batched_leaf_inputs(b, 72, first, valid, 72, x);
 
   DFT72_NORMALIZED_R9_STAGE()
@@ -1692,7 +1583,7 @@ static __attribute__((
     simde__m256i y[8];
     dft2160_unitary_dft8x8(r9[br9], y, dir);
     for (int k8 = 0; k8 < 8; k8++)
-      simde_mm256_maskstore_epi32((int *)(dst + 30 * (9 * k8 + br9) + first), mask, y[k8]);
+      store_complex_lanes_256(dst + 30 * (9 * k8 + br9) + first, y[k8], valid);
   }
 }
 
@@ -1708,7 +1599,6 @@ static __attribute__((noinline)) void dft2160_dft72x8_store(const c16_t *b, c16_
 static inline void dft2160_radix30_stage(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 72 };
-  dft2160_twiddles_init();
   for (int off = 0; off < M; off += 8) {
     simde__m256i s[5][6];
 #define DFT2160_DFT6(C, I0, I1, I2, I3, I4, I5) DFT_R30_LOAD_SIX(DFT_R30_FULL_INPUT, C, I0, I1, I2, I3, I4, I5)
@@ -1739,7 +1629,6 @@ static void dft2160_radix30_leaf72x8(const c16_t *src, c16_t *dst, dft_dir_t dir
 
 static void dft48_radix8_pfa6(const c16_t *src, c16_t *dst, dft_dir_t dir)
 {
-  power2_leaf_twiddles_init();
   const int ds = dir == DFT_DIR_FORWARD ? 0 : 1;
 
   const simde__m256i x0 = simde_mm256_loadu_si256((const simde__m256i *)(src + 0));
@@ -2091,14 +1980,11 @@ DEFINE_STRIDED_DFT12_PARENT(
     dft12_q15_256_batch2_strided(src + 2 * stride, child_stride, tmp + 2 * M, src + 3 * stride, child_stride, tmp + 3 * M, dir);
     dft12_q15_128_strided(src + 4 * stride, child_stride, tmp + 4 * M, dir);)
 
-static pthread_mutex_t dft60_r15p_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft60_r15p_tw_ready;
 static simde__m256i dft60_r15p_re[15] __attribute__((aligned(64)));
 static simde__m256i dft60_r15p_im[15] __attribute__((aligned(64)));
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft60_r15p_tw_init, dft60_r15p_tw_ready, dft60_r15p_tw_mutex, const float sc = 1.0f;
-    const simde__m128i zero = simde_mm_setzero_si128();
+    dft60_r15p_tw_init, const float sc = 1.0f; const simde__m128i zero = simde_mm_setzero_si128();
 
     for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
@@ -2193,7 +2079,6 @@ static void dft60_radix15_pfa_leaf4(const c16_t *src, c16_t *dst, dft_dir_t dir)
   c16_t b[N] __attribute__((aligned(64)));
   simde__m256i z[R];
 
-  dft60_r15p_tw_init();
   dft60_r15_pfa_raw4(src, z, dir);
 
   for (int br = 0; br < R; br++) {
@@ -2208,13 +2093,11 @@ static void dft60_radix15_pfa_leaf4(const c16_t *src, c16_t *dst, dft_dir_t dir)
   dft60_leaf4x4_store(b, dst, 12, 3, dir);
 }
 
-static pthread_mutex_t dft180_r15p_tw_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int dft180_r15p_tw_ready;
 static simde__m256i dft180_r15p_re[2][15] __attribute__((aligned(64)));
 static simde__m256i dft180_r15p_im[2][15] __attribute__((aligned(64)));
 
 DEFINE_Q15_TABLE_INITIALIZER(
-    dft180_r15p_tw_init, dft180_r15p_tw_ready, dft180_r15p_tw_mutex, const float sc = 1.0f; for (int ds = 0; ds < 2; ds++) {
+    dft180_r15p_tw_init, const float sc = 1.0f; for (int ds = 0; ds < 2; ds++) {
       const dft_dir_t dir = ds == 0 ? DFT_DIR_FORWARD : DFT_DIR_INVERSE;
       for (int br = 0; br < 15; br++) {
         dft180_r15p_re[0][br] = pack8_twiddle_q15_re_re_scaled(0, br, 180, sc);
@@ -2238,7 +2121,6 @@ static __attribute__((always_inline)) inline void dft180_r15_raw_block4(const c1
 static inline void dft180_radix15_pfa_stage(const c16_t *src, c16_t *b, dft_dir_t dir)
 {
   enum { M = 12 };
-  dft180_r15p_tw_init();
 
   {
     simde__m256i z[15];
